@@ -128,7 +128,9 @@ integrationTest(NAME testTransientPlacement SRCS transient_placement.cpp)
 integrationTest(NAME testDebugConsole SRCS debug_console_test.cpp)
 integrationTest(NAME testPlasmaSurface SRCS plasma_surface_test.cpp)
 integrationTest(NAME testMaximized SRCS maximize_test.cpp LIBS KDecoration3::KDecoration KF6::Package)
-integrationTest(NAME testXdgShellWindow SRCS xdgshellwindow_test.cpp LIBS KDecoration3::KDecoration)
+integrationTest(NAME testXdgShellWindow
+    SRCS xdgshellwindow_test.cpp ${CMAKE_SOURCE_DIR}/src/tiles/transientplacementwriter.cpp
+    LIBS KDecoration3::KDecoration KF6::ConfigCore)
 integrationTest(NAME testSceneOpenGL SRCS scene_opengl_test.cpp )
 integrationTest(NAME testSceneOpenGLES2 SRCS scene_opengl_test.cpp )
 target_compile_definitions(testSceneOpenGLES2 PRIVATE MESA_GLES_VERSION_OVERRIDE="2.0")
