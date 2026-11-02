@@ -9,6 +9,7 @@
 */
 #include "kwin_wayland_test.h"
 
+#include "core/colorspace.h"
 #include "core/output.h"
 #include "core/outputconfiguration.h"
 #include "decorations/decorationbridge.h"
@@ -177,6 +178,17 @@ private Q_SLOTS:
     void testRequestedGeometrySettlesOnCommit();
     void testRequestedGeometryAfterMappingDestroysWindow();
     void testRequestedGeometryReentrantMove();
+    void testGeometrySupersession_data();
+    void testGeometrySupersession();
+    void testGeometryNotificationHandoff_data();
+    void testGeometryNotificationHandoff();
+    void testGeometryCallbackClose_data();
+    void testGeometryCallbackClose();
+    void testGeometrySameRectangleIntent();
+    void testMoveDuringQueuedResize();
+    void testNestedOutputPropertySync();
+    void testGeometryNotificationNetZero();
+    void testOutputScaleCallbackClose();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -3906,6 +3918,289 @@ void TestXdgShellWindow::testRequestedGeometryReentrantMove()
     QCOMPARE(window->property("requestedGeometry").value<RectF>().topLeft(), second);
     window->move(second);
     QCOMPARE(notifications, 2);
+}
+
+void TestXdgShellWindow::testGeometrySupersession_data()
+{
+    QTest::addColumn<bool>("queuedResize");
+    QTest::addColumn<bool>("partialMove");
+    QTest::newRow("immediate-restore") << false << false;
+    QTest::newRow("queued-restore") << true << false;
+    QTest::newRow("unsubmitted-resize-move") << true << true;
+}
+
+void TestXdgShellWindow::testGeometrySupersession()
+{
+    QFETCH(bool, queuedResize);
+    QFETCH(bool, partialMove);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    const auto original = window->frameGeometry();
+    const RectF outer(QPointF(100, 100), queuedResize ? QSizeF(400, 300) : original.size());
+    const RectF moved(QPointF(150, 150), outer.size());
+    QObject context;
+    bool interrupted = false;
+    connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+        if (!interrupted) {
+            interrupted = true;
+            if (partialMove) {
+                window->move(moved.topLeft());
+            } else {
+                window->moveResize(original);
+            }
+        }
+    });
+    window->moveResize(outer);
+    QVERIFY(interrupted);
+    if (partialMove) {
+        QCOMPARE(window->moveResizeGeometry(), moved);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), moved.size().toSize(), Qt::blue);
+        QTRY_COMPARE(window->frameGeometry(), moved);
+    } else {
+        QCOMPARE(window->moveResizeGeometry(), original);
+        QCOMPARE(window->frameGeometry(), original);
+        QVERIFY(!configure.wait(50));
+        QCOMPARE(configure.count(), 0);
+    }
+}
+
+void TestXdgShellWindow::testGeometryNotificationHandoff_data()
+{
+    QTest::addColumn<bool>("queuedResize");
+    QTest::newRow("immediate-inner") << false;
+    QTest::newRow("queued-inner") << true;
+}
+
+void TestXdgShellWindow::testGeometryNotificationHandoff()
+{
+    QFETCH(bool, queuedResize);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    auto originalOutput = window->output();
+    const auto originalFrame = window->frameGeometry();
+    const RectF outer(QPointF(1400, 100), window->size());
+    const RectF inner(QPointF(1500, 200), queuedResize ? QSizeF(400, 300) : window->size());
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    QSignalSpy outputs(window, &Window::outputChanged);
+    QObject context;
+    bool interrupted = false;
+    connect(window, &Window::bufferGeometryChanged, &context, [&]() {
+        if (!interrupted) {
+            interrupted = true;
+            window->moveResize(inner);
+        }
+    });
+    window->moveResize(outer);
+    QVERIFY(interrupted);
+    QCOMPARE(window->moveResizeGeometry(), inner);
+    QCOMPARE(window->frameGeometry(), queuedResize ? outer : inner);
+    QCOMPARE(frames.count(), 1);
+    QCOMPARE(frames.first().first().value<RectF>(), originalFrame);
+    QCOMPARE(outputs.count(), 1);
+    QCOMPARE(outputs.first().first().value<LogicalOutput *>(), originalOutput);
+    if (queuedResize) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), inner.size().toSize(), Qt::blue);
+        QTRY_COMPARE(window->frameGeometry(), inner);
+        QCOMPARE(outputs.count(), 1);
+    }
+}
+
+void TestXdgShellWindow::testGeometryCallbackClose_data()
+{
+    QTest::addColumn<bool>("clientCommit");
+    QTest::newRow("request-callback") << false;
+    QTest::newRow("commit-callback") << true;
+}
+
+void TestXdgShellWindow::testGeometryCallbackClose()
+{
+    QFETCH(bool, clientCommit);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    QPointer<Window> guard(window);
+    QObject context;
+    bool closed = false;
+    const auto close = [&]() {
+        if (!closed) {
+            closed = true;
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }
+    };
+    if (clientCommit) {
+        window->moveResize(RectF(100, 100, 400, 300));
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        connect(window, &Window::bufferGeometryChanged, &context, close);
+        Test::render(surface.get(), QSize(400, 300), Qt::blue);
+        QVERIFY(Test::waylandSync());
+    } else {
+        connect(window, &Window::frameGeometryAboutToChange, &context, close);
+        window->moveResize(RectF(100, 100, 400, 300));
+    }
+    QVERIFY(closed);
+    QTRY_VERIFY(guard.isNull());
+}
+
+void TestXdgShellWindow::testGeometrySameRectangleIntent()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const auto before = window->geometryRequestGeneration();
+    QObject context;
+    bool nested = false;
+    connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+        if (!nested) {
+            nested = true;
+            window->moveResize(window->moveResizeGeometry());
+        }
+    });
+    const RectF target(100, 100, 200, 100);
+    window->moveResize(target);
+    QVERIFY(nested);
+    QCOMPARE(window->geometryRequestGeneration(), before + 2);
+    QCOMPARE(window->frameGeometry(), target);
+}
+
+void TestXdgShellWindow::testMoveDuringQueuedResize()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    window->resize(QSizeF(400, 300));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    const auto serial = configure.last().at(0).value<quint32>();
+    window->move(QPointF(150, 150));
+    QCOMPARE(window->frameGeometry(), RectF(150, 150, 200, 100));
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(configure.count(), 1);
+    shell->xdgSurface()->ack_configure(serial);
+    Test::render(surface.get(), QSize(400, 300), Qt::blue);
+    QTRY_COMPARE(window->frameGeometry(), RectF(150, 150, 400, 300));
+}
+
+void TestXdgShellWindow::testNestedOutputPropertySync()
+{
+    auto destination = workspace()->outputs()[1];
+    OutputConfiguration configuration;
+    auto changes = configuration.changeSet(destination->backendOutput());
+    changes->scale = 2.0;
+    changes->scaleSetting = 2.0;
+    changes->transform = OutputTransform::Kind::Rotate180;
+    QVERIFY(workspace()->applyOutputConfiguration(configuration).has_value());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(window->moveResizeOutput() != destination);
+    QVERIFY(window->preferredBufferTransform() != destination->transform());
+    // Virtual outputs share an SDR color space; seed a different prior preference to test refresh.
+    window->setPreferredColorDescription(ColorDescription::BT2020PQ);
+    QVERIFY(window->preferredColorDescription() != destination->blendingColor());
+    QObject context;
+    bool nested = false;
+    connect(window, &Window::nextTargetScaleChanged, &context, [&]() {
+        if (!nested) {
+            nested = true;
+            window->moveResize(RectF(1450, 150, 200, 100));
+        }
+    });
+    window->moveResize(RectF(1400, 100, 200, 100));
+    QVERIFY(nested);
+    QCOMPARE(window->moveResizeOutput(), destination);
+    QCOMPARE(window->nextTargetScale(), destination->scale());
+    QCOMPARE(window->preferredBufferTransform(), destination->transform());
+    QCOMPARE(window->preferredColorDescription(), destination->blendingColor());
+}
+
+void TestXdgShellWindow::testGeometryNotificationNetZero()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const auto original = window->frameGeometry();
+    const auto originalOutput = window->output();
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    QSignalSpy outputs(window, &Window::outputChanged);
+    QObject context;
+    bool nested = false;
+    connect(window, &Window::bufferGeometryChanged, &context, [&]() {
+        if (!nested) {
+            nested = true;
+            window->moveResize(original);
+        }
+    });
+    window->moveResize(RectF(QPointF(1400, 100), original.size()));
+    QVERIFY(nested);
+    QCOMPARE(window->frameGeometry(), original);
+    QCOMPARE(window->output(), originalOutput);
+    QCOMPARE(frames.count(), 0);
+    QCOMPARE(outputs.count(), 0);
+}
+
+void TestXdgShellWindow::testOutputScaleCallbackClose()
+{
+    auto destination = workspace()->outputs()[1];
+    OutputConfiguration configuration;
+    auto changes = configuration.changeSet(destination->backendOutput());
+    changes->scale = 2.0;
+    changes->scaleSetting = 2.0;
+    QVERIFY(workspace()->applyOutputConfiguration(configuration).has_value());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QPointer<Window> guard(window);
+    QObject context;
+    bool closed = false;
+    connect(window, &Window::nextTargetScaleChanged, &context, [&]() {
+        if (!closed) {
+            closed = true;
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }
+    });
+    window->moveResize(RectF(1400, 100, 200, 100));
+    QVERIFY(closed);
+    QTRY_VERIFY(guard.isNull());
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)

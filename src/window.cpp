@@ -47,7 +47,10 @@
 #include <QHash>
 #include <QJSEngine>
 #include <QMouseEvent>
+#include <QScopeGuard>
 #include <QStyleHints>
+
+#include <limits>
 
 namespace KWin
 {
@@ -3467,26 +3470,43 @@ LogicalOutput *Window::moveResizeOutput() const
 
 void Window::setMoveResizeOutput(LogicalOutput *output)
 {
-    if (m_moveResizeOutput == output) {
+    if (m_moveResizeOutput == output && !m_outputPropertiesPending) {
         return;
     }
 
-    if (m_moveResizeOutput) {
-        disconnect(m_moveResizeOutput, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
-        disconnect(m_moveResizeOutput, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
-        disconnect(m_moveResizeOutput, &LogicalOutput::blendingColorChanged, this, &Window::updatePreferredColorDescription);
+    if (m_moveResizeOutput != output) {
+        if (m_moveResizeOutput) {
+            disconnect(m_moveResizeOutput, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
+            disconnect(m_moveResizeOutput, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
+            disconnect(m_moveResizeOutput, &LogicalOutput::blendingColorChanged, this, &Window::updatePreferredColorDescription);
+        }
+        m_moveResizeOutput = output;
+        if (output) {
+            connect(output, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
+            connect(output, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
+            connect(output, &LogicalOutput::blendingColorChanged, this, &Window::updatePreferredColorDescription);
+        }
+    }
+    if (!m_moveResizeOutput) {
+        m_outputPropertiesPending = false;
+        return;
     }
 
-    m_moveResizeOutput = output;
-    if (output) {
-        connect(output, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
-        connect(output, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
-        connect(output, &LogicalOutput::blendingColorChanged, this, &Window::updatePreferredColorDescription);
-    }
-
+    // A nested request to this output must finish synchronization if this request is superseded.
+    m_outputPropertiesPending = true;
+    const auto generation = m_geometryRequestGeneration;
     updateNextTargetScale();
+    if (!geometryRequestIsCurrent(generation)) {
+        return;
+    }
     updatePreferredBufferTransform();
+    if (!geometryRequestIsCurrent(generation)) {
+        return;
+    }
     updatePreferredColorDescription();
+    if (geometryRequestIsCurrent(generation)) {
+        m_outputPropertiesPending = false;
+    }
 }
 
 void Window::move(const QPointF &point)
@@ -3497,9 +3517,7 @@ void Window::move(const QPointF &point)
 
     const RectF rect = RectF(point, m_moveResizeGeometry.size());
 
-    setMoveResizeGeometry(rect);
-    moveResizeInternal(rect, MoveResizeMode::Move);
-    notifyRequestedGeometryChanged();
+    performMoveResize(rect, MoveResizeMode::Move);
 }
 
 void Window::resize(const QSizeF &size)
@@ -3510,9 +3528,7 @@ void Window::resize(const QSizeF &size)
 
     const RectF rect = RectF(m_moveResizeGeometry.topLeft(), size);
 
-    setMoveResizeGeometry(rect);
-    moveResizeInternal(rect, MoveResizeMode::Resize);
-    notifyRequestedGeometryChanged();
+    performMoveResize(rect, MoveResizeMode::Resize);
 }
 
 void Window::moveResize(const RectF &rect)
@@ -3521,9 +3537,55 @@ void Window::moveResize(const RectF &rect)
         return;
     }
 
+    performMoveResize(rect, MoveResizeMode::MoveResize);
+}
+
+quint64 Window::geometryRequestGeneration() const
+{
+    return m_geometryRequestGeneration;
+}
+
+bool Window::geometryRequestIsCurrent(quint64 generation) const
+{
+    return !isDeleted() && generation == m_geometryRequestGeneration;
+}
+
+void Window::geometryResizeSubmitted(quint64 generation)
+{
+    if (geometryRequestIsCurrent(generation)) {
+        m_geometryResizePending = false;
+    }
+}
+
+void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
+{
+    if (isDeleted() || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
+        return;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // A Move inside an unsubmitted resize inherits that resize's requested size.
+    if (mode == MoveResizeMode::Move && m_geometryResizePending) {
+        mode = MoveResizeMode::MoveResize;
+    }
+    const auto generation = ++m_geometryRequestGeneration;
+    m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
+    const auto finish = qScopeGuard([this, generation]() {
+        // An obsolete stack frame must not clear a newer request's pending submission.
+        if (generation == m_geometryRequestGeneration) {
+            m_geometryResizePending = false;
+        }
+    });
     setMoveResizeGeometry(rect);
-    moveResizeInternal(rect, MoveResizeMode::MoveResize);
-    notifyRequestedGeometryChanged();
+    if (!geometryRequestIsCurrent(generation)) {
+        return;
+    }
+    moveResizeInternal(rect, mode);
+    if (geometryRequestIsCurrent(generation)) {
+        notifyRequestedGeometryChanged();
+    }
 }
 
 bool Window::isPlaced() const
