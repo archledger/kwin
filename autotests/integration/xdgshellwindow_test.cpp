@@ -9,8 +9,10 @@
 */
 #include "kwin_wayland_test.h"
 
+#include "core/backendoutput.h"
 #include "core/colorspace.h"
 #include "core/output.h"
+#include "core/outputbackend.h"
 #include "core/outputconfiguration.h"
 #include "decorations/decorationbridge.h"
 #include "decorations/settings.h"
@@ -380,6 +382,16 @@ private Q_SLOTS:
     void testQuickTileCallbackWins();
     void testWorkspaceShutdown_data();
     void testWorkspaceShutdown();
+    void testOutputUpdatePending_data();
+    void testOutputUpdatePending();
+    void testOutputUpdateFrozenConfiguration();
+    void testOutputUpdateFrozenOrder();
+    void testOutputUpdateBackendReplacement();
+    void testOutputUpdateRetainsClosedWindow();
+    void testOutputUpdateCleanupReentry();
+    void testOutputUpdatePlaceholderRoundTrip();
+    void testOutputUpdateCallerLifetime();
+    void testOutputUpdateCallerLifetime_data();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -7541,6 +7553,228 @@ void TestXdgShellWindow::testWorkspaceShutdown()
         observation.writer.reset();
     });
     observation.armed = true;
+}
+
+void TestXdgShellWindow::testOutputUpdatePending_data()
+{
+    QTest::addColumn<bool>("nestedEvents");
+    QTest::addColumn<bool>("consumeQueued");
+    QTest::newRow("deferred") << false << false;
+    QTest::newRow("nested-event-loop") << true << false;
+    QTest::newRow("direct-call-consumes-queued") << false << true;
+}
+
+void TestXdgShellWindow::testOutputUpdatePending()
+{
+    QFETCH(bool, nestedEvents);
+    QFETCH(bool, consumeQueued);
+    int depth = 0;
+    int maxDepth = 0;
+    int passes = 0;
+    QObject callbackContext;
+    connect(workspace(), &Workspace::outputsChanged, &callbackContext, [&]() {
+        ++depth;
+        maxDepth = std::max(maxDepth, depth);
+        ++passes;
+        if (passes == 1) {
+            workspace()->updateOutputs();
+            if (nestedEvents) {
+                QCoreApplication::processEvents();
+            }
+        }
+        --depth;
+    });
+    workspace()->updateOutputs();
+    QCOMPARE(maxDepth, 1);
+    QCOMPARE(passes, 1);
+    if (consumeQueued) {
+        workspace()->updateOutputs();
+    }
+    QTRY_COMPARE(passes, 2);
+    QCoreApplication::processEvents();
+    QCOMPARE(passes, 2);
+    QCOMPARE(maxDepth, 1);
+}
+
+void TestXdgShellWindow::testOutputUpdateFrozenConfiguration()
+{
+    const auto outputs = workspace()->outputs();
+    QPointer<LogicalOutput> second(outputs.last());
+    auto backend = second->backendOutput();
+    bool nested = false;
+    QObject callbackContext;
+    connect(outputs.first(), &LogicalOutput::changed, &callbackContext, [&]() {
+        if (nested) {
+            return;
+        }
+        nested = true;
+        OutputConfiguration latest;
+        latest.changeSet(backend)->pos = QPoint(3000, 0);
+        QVERIFY(workspace()->applyOutputConfiguration(latest).has_value());
+    });
+    QSignalSpy changed(workspace(), &Workspace::outputsChanged);
+    OutputConfiguration initial;
+    initial.changeSet(backend)->pos = QPoint(1600, 0);
+    QVERIFY(workspace()->applyOutputConfiguration(initial).has_value());
+    QVERIFY(nested);
+    QCOMPARE(changed.size(), 1);
+    QCOMPARE(second->geometry().x(), 1600);
+    QTRY_COMPARE(second->geometry().x(), 3000);
+    QCOMPARE(changed.size(), 2);
+}
+
+void TestXdgShellWindow::testOutputUpdateFrozenOrder()
+{
+    const auto outputs = workspace()->outputs();
+    bool nested = false;
+    QObject callbackContext;
+    connect(outputs.first(), &LogicalOutput::changed, &callbackContext, [&]() {
+        if (nested) {
+            return;
+        }
+        nested = true;
+        OutputConfiguration latest;
+        latest.changeSet(outputs.first()->backendOutput())->priority = 1;
+        latest.changeSet(outputs.last()->backendOutput())->priority = 0;
+        QVERIFY(workspace()->applyOutputConfiguration(latest).has_value());
+    });
+    OutputConfiguration initial;
+    initial.changeSet(outputs.first()->backendOutput())->priority = 0;
+    initial.changeSet(outputs.last()->backendOutput())->priority = 1;
+    QVERIFY(workspace()->applyOutputConfiguration(initial).has_value());
+    QVERIFY(nested);
+    QCOMPARE(workspace()->outputOrder().first(), outputs.first());
+    QTRY_COMPARE(workspace()->outputOrder().first(), outputs.last());
+}
+
+void TestXdgShellWindow::testOutputUpdateBackendReplacement()
+{
+    const auto outputs = workspace()->outputs();
+    QPointer<LogicalOutput> oldLogical(outputs.last());
+    QPointer<BackendOutput> oldBackend(oldLogical->backendOutput());
+    bool nested = false;
+    QObject callbackContext;
+    connect(outputs.first(), &LogicalOutput::changed, &callbackContext, [&]() {
+        if (nested) {
+            return;
+        }
+        nested = true;
+        Test::setOutputConfig({Rect(0, 0, 1600, 900)});
+        QVERIFY(oldLogical);
+        QVERIFY(oldBackend);
+    });
+    workspace()->updateOutputs();
+    QVERIFY(nested);
+    QCOMPARE(workspace()->outputs(), outputs);
+    QVERIFY(oldLogical);
+    QVERIFY(oldBackend);
+    QTRY_COMPARE(workspace()->outputs().size(), 1);
+    QTRY_VERIFY(!oldLogical);
+    QTRY_VERIFY(!oldBackend);
+    QCOMPARE(workspace()->outputs().first()->geometry(), Rect(0, 0, 1600, 900));
+}
+
+void TestXdgShellWindow::testOutputUpdateRetainsClosedWindow()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    window->setSkipCloseAnimation(true);
+    QPointer<Window> guard(window);
+    bool called = false;
+    QObject callbackContext;
+    connect(workspace()->outputs().first(), &LogicalOutput::changed, &callbackContext, [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        window->destroyWindow();
+        QVERIFY(guard); // The old-output mapping must retain this identity through the pass.
+        QVERIFY(guard->isDeleted());
+    });
+    workspace()->updateOutputs();
+    QVERIFY(called);
+    QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testOutputUpdateCleanupReentry()
+{
+    QPointer<BackendOutput> removed(workspace()->outputs().first()->backendOutput());
+    int notifications = 0;
+    bool reentered = false;
+    QObject callbackContext;
+    connect(workspace(), &Workspace::outputsChanged, &callbackContext, [&]() {
+        ++notifications;
+    });
+    connect(removed, &QObject::destroyed, &callbackContext, [&]() {
+        reentered = true;
+        const auto before = notifications;
+        workspace()->updateOutputs();
+        QCOMPARE(notifications, before);
+    });
+    Test::setOutputConfig({Rect(0, 0, 1600, 900)});
+    QVERIFY(reentered);
+    QVERIFY(!removed);
+}
+
+void TestXdgShellWindow::testOutputUpdatePlaceholderRoundTrip()
+{
+    Test::setOutputConfig(QList<Rect>{});
+    QCOMPARE(workspace()->outputs().size(), 1);
+    QPointer<LogicalOutput> placeholder(workspace()->outputs().first());
+    QPointer<BackendOutput> placeholderBackend(placeholder->backendOutput());
+    QVERIFY(placeholder->isPlaceholder());
+    QVERIFY(workspace()->tileManager(placeholder));
+    Test::setOutputConfig({Rect(0, 0, 1600, 900)});
+    QCOMPARE(workspace()->outputs().size(), 1);
+    QVERIFY(!workspace()->outputs().first()->isPlaceholder());
+    QVERIFY(workspace()->tileManager(workspace()->outputs().first()));
+    QTRY_VERIFY(!placeholder);
+    QTRY_VERIFY(!placeholderBackend);
+}
+
+void TestXdgShellWindow::testOutputUpdateCallerLifetime_data()
+{
+    QTest::addColumn<bool>("queryConfiguration");
+    QTest::newRow("direct-application") << false;
+    QTest::newRow("queried-configuration") << true;
+}
+
+void TestXdgShellWindow::testOutputUpdateCallerLifetime()
+{
+    QFETCH(bool, queryConfiguration);
+    const auto backends = kwinApp()->outputBackend()->outputs();
+    QPointer<BackendOutput> disabled(backends.last());
+    OutputConfiguration disable;
+    disable.changeSet(disabled)->enabled = false;
+    QVERIFY(workspace()->applyOutputConfiguration(disable).has_value());
+    QCOMPARE(workspace()->outputs().size(), 1);
+    QVERIFY(!workspace()->findOutput(disabled));
+
+    bool removed = false;
+    bool destroyed = false;
+    QObject callbackContext;
+    connect(disabled, &QObject::destroyed, &callbackContext, [&]() {
+        destroyed = true;
+        // Caller bookkeeping still uses its backend snapshot after the pass releases its holds.
+        QVERIFY(!workspace()->m_updatingOutputs);
+    });
+    connect(workspace()->outputs().first(), &LogicalOutput::changed, &callbackContext, [&]() {
+        if (!removed) {
+            removed = true;
+            kwinApp()->outputBackend()->removeVirtualOutput(disabled);
+        }
+    });
+    if (queryConfiguration) {
+        workspace()->updateOutputConfiguration();
+    } else {
+        OutputConfiguration apply;
+        QVERIFY(workspace()->applyOutputConfiguration(apply).has_value());
+    }
+    QVERIFY(removed);
+    QTRY_VERIFY(destroyed);
+    QVERIFY(!disabled);
 }
 
 int main(int argc, char *argv[])

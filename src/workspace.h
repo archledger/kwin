@@ -635,6 +635,7 @@ private:
     void updateOutputs();
     void assignBrightnessDevices(OutputConfiguration &outputConfig);
     void updateOutputOrder();
+    void updateOutputOrder(const QList<LogicalOutput *> &order);
     void maybeUpdateDpmsState();
 
     bool breaksShowingDesktop(Window *window) const;
@@ -747,6 +748,9 @@ private:
     std::map<LogicalOutput *, QPointer<TileManager>> m_tileManagers;
     std::unique_ptr<TransientTileController> m_transientTileController;
     bool m_shuttingDown = false;
+    bool m_updatingOutputs = false;
+    bool m_outputUpdatePending = false;
+    QTimer m_outputUpdateTimer;
     std::unique_ptr<OutputConfigurationStore> m_outputConfigStore;
     std::unique_ptr<LidSwitchTracker> m_lidSwitchTracker;
     std::unique_ptr<OrientationSensor> m_orientationSensor;
