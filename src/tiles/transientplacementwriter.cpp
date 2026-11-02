@@ -223,7 +223,8 @@ TransientPlacementWriter::Result TransientPlacementWriter::record(const QUuid &p
     }
     auto reservation = m_reservations.find(window->key);
     if (reservation != m_reservations.end()) {
-        if (reservation->owner == update.window && (!reservation->restoring || update.origin == Origin::Close)) {
+        if (reservation->owner == update.window && reservation->phase != Phase::Prepared
+            && (reservation->phase != Phase::Restoring || update.origin == Origin::Close)) {
             return Result::Suppressed;
         }
         if (reservation->deferred && update.eventSequence <= reservation->deferred->eventSequence) {
@@ -253,7 +254,8 @@ TransientPlacementWriter::Result TransientPlacementWriter::reserve(const QUuid &
     if (window == m_windows.end()) {
         return Result::UnknownWindow;
     }
-    if (request.generation.isEmpty() || !validFrame(request.frame) || !sameFrame(m_entries.value(window->key), request.frame)) {
+    if (request.generation.isEmpty() || request.key.isEmpty() || request.key != window->key
+        || !validFrame(request.frame) || !sameFrame(m_entries.value(window->key), request.frame)) {
         return Result::InvalidRecord;
     }
     if (m_reservations.contains(window->key)) {
@@ -269,7 +271,7 @@ TransientPlacementWriter::Result TransientPlacementWriter::reserve(const QUuid &
     }
     const QString key = window->key;
     QScopedValueRollback<bool> transaction(m_busy, true);
-    m_reservations.insert(key, Reservation{request.window, request.generation, request.frame, false, std::nullopt});
+    m_reservations.insert(key, Reservation{request.window, request.generation, request.frame, Phase::Prepared, provider, m_providerRevision, std::nullopt});
     if (!flushImpl()) {
         m_reservations.remove(key);
         return Result::PersistenceFailed;
@@ -280,6 +282,75 @@ TransientPlacementWriter::Result TransientPlacementWriter::reserve(const QUuid &
     }
     window->lastGeneration = request.generation;
     return Result::Accepted;
+}
+
+TransientPlacementWriter::Result TransientPlacementWriter::activateReservation(const QUuid &provider, const QUuid &window, const QString &generation)
+{
+    if (m_busy) {
+        return Result::Busy;
+    }
+    if (!m_provider || provider.isNull() || provider != m_providerToken) {
+        return Result::StaleProvider;
+    }
+    const auto tracked = m_windows.constFind(window);
+    if (tracked == m_windows.cend()) {
+        return Result::UnknownWindow;
+    }
+    auto reservation = m_reservations.find(tracked->key);
+    if (reservation == m_reservations.end() || reservation->owner != window || reservation->generation != generation) {
+        return Result::StaleGeneration;
+    }
+    if (reservation->phase != Phase::Prepared) {
+        return Result::Busy;
+    }
+    if (reservation->provider != provider) {
+        return Result::StaleProvider;
+    }
+    if (reservation->providerRevision != m_providerRevision) {
+        return Result::StaleRevision;
+    }
+    for (auto other = m_windows.cbegin(); other != m_windows.cend(); ++other) {
+        if (other.key() != window && other->key == tracked->key) {
+            return Result::Conflict;
+        }
+    }
+    reservation->phase = Phase::Owned;
+    return Result::Accepted;
+}
+
+TransientPlacementWriter::Result TransientPlacementWriter::cancelReservation(const QUuid &window, const QString &generation)
+{
+    if (m_busy) {
+        return Result::Busy;
+    }
+    const auto tracked = m_windows.constFind(window);
+    if (tracked == m_windows.cend()) {
+        return Result::UnknownWindow;
+    }
+    auto reservation = m_reservations.find(tracked->key);
+    if (reservation == m_reservations.end() || reservation->owner != window || reservation->generation != generation) {
+        return Result::StaleGeneration;
+    }
+    if (reservation->phase != Phase::Prepared) {
+        return Result::Busy;
+    }
+    const auto deferred = reservation->deferred;
+    if (deferred && !applyRecord(tracked->key, deferred->frame, deferred->eventSequence)) {
+        return Result::InvalidRecord;
+    }
+    m_reservations.erase(reservation);
+    return Result::Accepted;
+}
+
+bool TransientPlacementWriter::ownsReservation(const QUuid &window, const QString &generation) const
+{
+    const auto tracked = m_windows.constFind(window);
+    if (tracked == m_windows.cend()) {
+        return false;
+    }
+    const auto reservation = m_reservations.constFind(tracked->key);
+    return reservation != m_reservations.cend() && reservation->owner == window
+        && reservation->generation == generation && reservation->phase == Phase::Owned;
 }
 
 TransientPlacementWriter::Result TransientPlacementWriter::beginRestore(const QUuid &window, const QString &generation)
@@ -295,7 +366,10 @@ TransientPlacementWriter::Result TransientPlacementWriter::beginRestore(const QU
     if (reservation == m_reservations.end() || reservation->owner != window || reservation->generation != generation) {
         return Result::StaleGeneration;
     }
-    reservation->restoring = true;
+    if (reservation->phase == Phase::Prepared) {
+        return Result::Busy;
+    }
+    reservation->phase = Phase::Restoring;
     return Result::Accepted;
 }
 
@@ -312,7 +386,7 @@ TransientPlacementWriter::Result TransientPlacementWriter::completeRestore(const
     if (reservation == m_reservations.end() || reservation->owner != window || reservation->generation != generation) {
         return Result::StaleGeneration;
     }
-    if (!reservation->restoring) {
+    if (reservation->phase != Phase::Restoring) {
         return Result::Busy;
     }
     if (eventSequence == 0 || eventSequence < tracked->eventSequence) {

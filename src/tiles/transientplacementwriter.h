@@ -74,6 +74,7 @@ public:
         QRectF frame;
         quint64 providerRevision;
         quint64 mapRevision;
+        QString key;
     };
 
     explicit TransientPlacementWriter(const QString &path, QObject *parent = nullptr);
@@ -85,6 +86,9 @@ public:
     bool forgetWindow(const QUuid &window);
     Result record(const QUuid &provider, quint64 revision, const Update &update);
     Result reserve(const QUuid &provider, const ReservationRequest &request);
+    Result activateReservation(const QUuid &provider, const QUuid &window, const QString &generation);
+    Result cancelReservation(const QUuid &window, const QString &generation);
+    bool ownsReservation(const QUuid &window, const QString &generation) const;
     Result beginRestore(const QUuid &window, const QString &generation);
     Result completeRestore(const QUuid &window, const QString &generation, quint64 eventSequence);
     bool isReserved(const QUuid &window) const;
@@ -104,12 +108,20 @@ private:
         std::optional<quint64> restoreWatermark;
     };
 
+    enum class Phase {
+        Prepared,
+        Owned,
+        Restoring,
+    };
+
     struct Reservation
     {
         QUuid owner;
         QString generation;
         QRectF original;
-        bool restoring = false;
+        Phase phase = Phase::Prepared;
+        QUuid provider;
+        quint64 providerRevision = 0;
         std::optional<Update> deferred;
     };
 
