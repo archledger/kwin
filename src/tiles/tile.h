@@ -241,8 +241,9 @@ protected:
         Transient,
     };
 
-    // Transient tiles never use public layout or membership mutation paths.
+    // Transient admission/layout stays private; membership release delegates to its owner.
     Tile(TileManager *tiling, Tile *parentItem, Type type);
+    virtual bool releaseTransientWindow(Window *window);
 
     void insertChild(int position, Tile *item);
     void removeChild(Tile *child);
