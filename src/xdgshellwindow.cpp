@@ -634,6 +634,7 @@ XdgSurfaceConfigure *XdgToplevelWindow::sendRoleConfigure()
     configureEvent->decorationState = m_nextDecorationState;
     configureEvent->serial = serial;
     configureEvent->tile = m_requestedTile;
+    configureEvent->transientOwnershipGeneration = requestedTransientTileGeneration();
     configureEvent->gravity = m_configureGravity;
     configureEvent->scale = m_nextTargetScale;
 
@@ -714,11 +715,12 @@ void XdgToplevelWindow::handleRoleCommit()
     if (configureEvent) {
         const auto states = configureEvent->states;
         const QPointer<Tile> tile = configureEvent->tile;
+        const quint64 transientGeneration = configureEvent->transientOwnershipGeneration;
         handleStatesAcknowledged(states);
         if (isDeleted()) {
             return;
         }
-        commitTile(tile);
+        commitTileFromConfigure(tile, transientGeneration);
     }
 }
 
