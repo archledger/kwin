@@ -10,6 +10,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <QUuid>
 
 namespace KWin
 {
@@ -17,9 +18,11 @@ namespace KWin
 class Tile;
 class TileManager;
 class TransientTile;
+class TransientPlacementWriter;
 class VirtualDesktop;
+class Window;
 
-// Internal empty-tree authority. This does not admit windows or expose a scripting API.
+// Internal native authority; no scripting API or production instance is exposed yet.
 class KWIN_EXPORT TransientTileController : public QObject
 {
     Q_OBJECT
@@ -33,6 +36,8 @@ public:
         StaleGeneration,
         GenerationExhausted,
         Superseded,
+        Ineligible,
+        Refused,
     };
 
     explicit TransientTileController(QObject *parent = nullptr);
@@ -41,6 +46,8 @@ public:
     Result createTree(TileManager *manager, VirtualDesktop *desktop, const RectF &geometry);
     Result setGeometry(quint64 generation, const RectF &geometry);
     Result clearTree(quint64 generation);
+    Result admit(quint64 generation, Window *window, TransientPlacementWriter *writer, const QUuid &provider,
+                 const QString &key, quint64 providerRevision, quint64 mapRevision);
 
     quint64 generation() const;
     Tile *rootTile() const;
@@ -51,10 +58,16 @@ Q_SIGNALS:
 
 private:
     friend class TransientTile;
+    friend class Window;
     class Mutation;
+    class Request;
+    class Release;
 
     void resetTree();
     void nodeAboutToBeDestroyed(TransientTile *node);
+    bool admissionCurrent(Window *window, quint64 generation) const;
+    bool releaseWindow(Window *window, quint64 generation);
+    void clearAdmission();
 
     QPointer<TransientTile> m_root;
     QPointer<TransientTile> m_tile;
@@ -62,6 +75,14 @@ private:
     QPointer<VirtualDesktop> m_desktop;
     QMetaObject::Connection m_managerDestroyed;
     QMetaObject::Connection m_desktopDestroyed;
+    QMetaObject::Connection m_windowClosed;
+    QMetaObject::Connection m_providerRetired;
+    QMetaObject::Connection m_keyConflict;
+    QPointer<Window> m_window;
+    QString m_key;
+    QString m_activity;
+    quint64 m_ownershipGeneration = 0;
+    bool m_membershipPublished = false;
     quint64 m_generation = 0;
     bool m_mutating = false;
     bool m_shuttingDown = false;
