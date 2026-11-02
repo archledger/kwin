@@ -5,9 +5,17 @@
 
 #include "transienttilecontroller.h"
 
+#include "config-kwin.h"
 #include "tile.h"
 #include "tilemanager.h"
+#include "transientplacementwriter.h"
 #include "virtualdesktops.h"
+#include "window.h"
+#include "workspace.h"
+
+#if KWIN_BUILD_ACTIVITIES
+#include "activities.h"
+#endif
 
 #include <QScopeGuard>
 
@@ -77,6 +85,7 @@ public:
 
     ~TransientTile() override
     {
+        m_destroying = true;
         if (m_controller) {
             m_controller->nodeAboutToBeDestroyed(this);
         }
@@ -84,6 +93,43 @@ public:
 
 private:
     friend class TransientTileController;
+
+    bool addMember(Window *window)
+    {
+        if (m_destroying || !m_windows.isEmpty()) {
+            return false;
+        }
+        m_windows.append(window);
+        return true;
+    }
+
+    void removeMember(Window *window)
+    {
+        m_windows.removeAll(window);
+    }
+
+    bool publishAdded(Window *window, quint64 generation)
+    {
+        const QPointer<TransientTile> guard(this);
+        const auto controller = m_controller;
+        Q_EMIT windowAdded(window);
+        if (!guard || !controller || !controller->admissionCurrent(window, generation)) {
+            return false;
+        }
+        Q_EMIT windowsChanged();
+        return guard && controller && controller->admissionCurrent(window, generation);
+    }
+
+    void publishRemoved(Window *window, quint64 generation)
+    {
+        const QPointer<TransientTile> guard(this);
+        const auto controller = m_controller;
+        Q_EMIT windowRemoved(window);
+        if (guard && !guard->m_destroying && controller && !controller->m_shuttingDown
+            && controller->m_generation == generation && controller->m_tile == guard) {
+            Q_EMIT windowsChanged();
+        }
+    }
 
     void linkToRoot(TransientTile *root)
     {
@@ -127,7 +173,157 @@ private:
     }
 
     QPointer<TransientTileController> m_controller;
+    bool m_destroying = false;
 };
+
+class TransientTileController::Release
+{
+public:
+    explicit Release(TransientTileController *controller, bool notifyLeaf = true)
+        : m_controller(controller)
+        , m_window(controller->m_window)
+        , m_tile(controller->m_tile)
+        , m_generation(controller->m_ownershipGeneration)
+        , m_treeGeneration(controller->m_generation)
+        , m_notifyLeaf(notifyLeaf)
+    {
+        if (!m_window || !m_generation) {
+            m_window.clear();
+            return;
+        }
+        m_window->ref();
+        m_active = m_window->beginTransientRelease(m_generation);
+        if (!m_active) {
+            return;
+        }
+        // All state changes before finish() are callback-free.
+        controller->clearAdmission();
+        m_window->m_transientOwnership->controller.clear();
+        if (m_tile) {
+            m_tile->removeMember(m_window);
+        }
+        m_changes = m_window->detachTransientAssociation(m_generation);
+    }
+
+    ~Release()
+    {
+        finish();
+        if (m_window) {
+            m_window->unref();
+        }
+    }
+
+    bool finish()
+    {
+        if (m_finished) {
+            return m_finalized;
+        }
+        m_finished = true;
+        if (!m_active || !m_window) {
+            return false;
+        }
+        m_window->notifyTransientAssociation(m_generation, m_changes);
+        if (m_notifyLeaf && m_tile && !m_tile->m_destroying && m_controller && !m_controller->m_shuttingDown
+            && m_controller->m_generation == m_treeGeneration && m_controller->m_tile == m_tile) {
+            m_tile->publishRemoved(m_window, m_treeGeneration);
+        }
+        m_finalized = m_window->finishTransientRelease(m_generation);
+        return m_finalized;
+    }
+
+private:
+    Q_DISABLE_COPY_MOVE(Release)
+    QPointer<TransientTileController> m_controller;
+    QPointer<Window> m_window;
+    QPointer<TransientTile> m_tile;
+    Window::TransientAssociationChanges m_changes;
+    quint64 m_generation;
+    quint64 m_treeGeneration;
+    bool m_notifyLeaf;
+    bool m_active = false;
+    bool m_finished = false;
+    bool m_finalized = false;
+};
+
+class TransientTileController::Request final : public Window::TransientTileRequest
+{
+public:
+    Request(TransientTileController *controller, Window *window, quint64 generation)
+        : TransientTileRequest(window, controller->m_tile, 0)
+        , m_controller(controller)
+        , m_window(window)
+        , m_generation(generation)
+    {
+    }
+
+private:
+    bool authorityIsCurrent() const override
+    {
+        return m_controller && m_controller->admissionCurrent(m_window, m_generation);
+    }
+
+    QPointer<TransientTileController> m_controller;
+    QPointer<Window> m_window;
+    quint64 m_generation;
+};
+
+static QString placementKey(Window *window)
+{
+    QString key = window->desktopFileName();
+    if (key.isEmpty()) {
+        key = window->resourceClass();
+    } else {
+        const auto slash = key.lastIndexOf(QLatin1Char('/'));
+        if (slash >= 0) {
+            key = key.mid(slash + 1);
+        }
+        if (key.endsWith(QStringLiteral(".desktop"))) {
+            key.chop(8);
+        }
+    }
+    return key.toLower();
+}
+
+static bool sameFrame(const RectF &left, const RectF &right)
+{
+    return left.x() == right.x() && left.y() == right.y() && left.width() == right.width() && left.height() == right.height();
+}
+
+static std::optional<QString> activityContext(Window *window)
+{
+#if KWIN_BUILD_ACTIVITIES
+    if (auto activities = workspace()->activities()) {
+        if (activities->serviceStatus() != KActivities::Consumer::Running) {
+            return std::nullopt;
+        }
+        const auto all = activities->all();
+        const auto current = activities->current();
+        const auto selected = window->activities();
+        if (current.isEmpty() || !all.contains(current)
+            || (selected.isEmpty() ? all.size() != 1 : selected.size() != 1 || selected.constFirst() != current)) {
+            return std::nullopt;
+        }
+        return current;
+    }
+#endif
+    return QString();
+}
+
+static bool freeOfNativeMembership(Window *window)
+{
+    for (auto output : workspace()->outputs()) {
+        auto manager = workspace()->tileManager(output);
+        if (!manager || manager->tearingDown()) {
+            return false;
+        }
+        for (auto desktop : VirtualDesktopManager::self()->desktops()) {
+            if (!manager->rootTile(desktop) || !manager->quickRootTile(desktop) || manager->tileForWindow(window, desktop)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 bool TransientTileController::Mutation::current(const TransientTile *tile) const
 {
@@ -162,12 +358,14 @@ TransientTileController::TransientTileController(QObject *parent)
 TransientTileController::~TransientTileController()
 {
     m_shuttingDown = true;
+    Release release(this, false);
     const auto root = m_root;
     resetTree();
     if (root) {
         root->setParent(nullptr);
     }
     delete root.data();
+    release.finish();
 }
 
 TransientTileController::Result TransientTileController::createTree(TileManager *manager, VirtualDesktop *desktop, const RectF &geometry)
@@ -230,7 +428,7 @@ TransientTileController::Result TransientTileController::createTree(TileManager 
 
 TransientTileController::Result TransientTileController::setGeometry(quint64 generation, const RectF &geometry)
 {
-    if (m_mutating || m_shuttingDown) {
+    if (m_mutating || m_shuttingDown || m_window) {
         return Result::Busy;
     }
     if (!m_root || !m_tile || generation == 0 || generation != m_generation) {
@@ -255,11 +453,13 @@ TransientTileController::Result TransientTileController::clearTree(quint64 gener
         return Result::StaleGeneration;
     }
     Mutation mutation(this);
+    Release release(this, false);
     const auto root = m_root;
     resetTree();
     QPointer<TransientTileController> guard(this);
     root->setParent(nullptr);
     delete root.data();
+    release.finish();
     if (!guard) {
         return Result::Superseded;
     }
@@ -283,6 +483,7 @@ void TransientTileController::nodeAboutToBeDestroyed(TransientTile *node)
         return;
     }
     Mutation mutation(this);
+    Release release(this, false);
     const auto root = m_root;
     const auto generation = m_generation;
     resetTree();
@@ -295,6 +496,7 @@ void TransientTileController::nodeAboutToBeDestroyed(TransientTile *node)
         // Do not delete the parent while its child is still unwinding its destructor.
         root->deleteLater();
     }
+    release.finish();
     if (guard) {
         QMetaObject::invokeMethod(this, [this, generation]() {
             if (!m_shuttingDown && m_generation == generation) {
@@ -302,6 +504,133 @@ void TransientTileController::nodeAboutToBeDestroyed(TransientTile *node)
             }
         }, Qt::QueuedConnection);
     }
+}
+
+void TransientTileController::clearAdmission()
+{
+    disconnect(m_windowClosed);
+    disconnect(m_providerRetired);
+    disconnect(m_keyConflict);
+    m_window.clear();
+    m_ownershipGeneration = 0;
+    m_membershipPublished = false;
+    m_key.clear();
+    m_activity.clear();
+}
+
+bool TransientTileController::admissionCurrent(Window *window, quint64 generation) const
+{
+    if (m_shuttingDown || !m_root || !m_tile || generation != m_generation || m_window != window
+        || !window || window->isDeleted() || !window->isNormalWindow() || window->isTransient() || window->isMinimized()
+        || !validContext(m_manager, m_desktop) || window->moveResizeOutput() != m_manager->output()
+        || window->desktops().size() != 1 || window->desktops().constFirst() != m_desktop || placementKey(window) != m_key) {
+        return false;
+    }
+    const auto activity = activityContext(window);
+    if (!activity || *activity != m_activity) {
+        return false;
+    }
+    if (m_ownershipGeneration && (!window->m_transientOwnership || window->m_transientOwnership->generation != m_ownershipGeneration || window->m_transientOwnership->controller != this)) {
+        return false;
+    }
+    if (m_ownershipGeneration) {
+        const auto &ownership = *window->m_transientOwnership;
+        if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+            || !sameFrame(ownership.target, m_tile->windowGeometry()) || !window->isTransientTileTargetFeasible(ownership.target)) {
+            return false;
+        }
+        if (ownership.progress == Window::TransientRequestProgress::NoRequest
+            && (window->geometryRequestGeneration() != ownership.initialGeometryGeneration
+                || !sameFrame(window->frameGeometry(), ownership.floating) || !sameFrame(window->moveResizeGeometry(), ownership.floating)
+                || (!ownership.executing && !window->canStartTransientTileRequest(ownership.target)))) {
+            return false;
+        }
+    }
+    return !m_membershipPublished
+        || (m_tile->windows().contains(window) && window->m_transientOwnership
+            && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned
+            && window->m_transientOwnership->writer
+            && window->m_transientOwnership->writer->ownsReservation(window->internalId(), QString::number(m_ownershipGeneration)));
+}
+
+TransientTileController::Result TransientTileController::admit(quint64 generation, Window *window, TransientPlacementWriter *writer,
+                                                               const QUuid &provider, const QString &key, quint64 providerRevision, quint64 mapRevision)
+{
+    if (m_mutating || m_shuttingDown || m_window || (window && window->m_transientOwnership)) {
+        return Result::Busy;
+    }
+    if (!m_root || !m_tile || !generation || generation != m_generation) {
+        return Result::StaleGeneration;
+    }
+    const auto activity = window ? activityContext(window) : std::nullopt;
+    if (!window || !writer || !activity || key.isEmpty() || placementKey(window) != key || !freeOfNativeMembership(window)) {
+        return Result::Ineligible;
+    }
+    Mutation mutation(this);
+    const QPointer<TransientTileController> guard(this);
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    m_window = window;
+    m_key = key;
+    m_activity = *activity;
+    if (!admissionCurrent(window, generation)) {
+        clearAdmission();
+        return Result::Ineligible;
+    }
+    const auto ownership = window->prepareTransientOwnership(writer, provider, key, providerRevision, mapRevision,
+                                                             std::make_unique<Request>(this, window, generation));
+    if (!ownership) {
+        clearAdmission();
+        return Result::Refused;
+    }
+    m_ownershipGeneration = ownership;
+    window->m_transientOwnership->controller = this;
+    m_windowClosed = connect(window, &Window::closed, this, [this, window, ownership]() {
+        releaseWindow(window, ownership);
+    });
+    m_providerRetired = connect(writer, &TransientPlacementWriter::providerRetired, this, [this, window, provider, ownership](const QUuid &retired) {
+        if (provider == retired) {
+            releaseWindow(window, ownership);
+        }
+    });
+    const auto id = window->internalId();
+    m_keyConflict = connect(writer, &TransientPlacementWriter::keyConflict, this, [this, window, id, ownership](const QString &, const QUuid &owner, const QString &token) {
+        if (owner == id && token == QString::number(ownership)) {
+            releaseWindow(window, ownership);
+        }
+    });
+    if (!window->activateTransientOwnership(ownership) || !m_tile->addMember(window)) {
+        releaseWindow(window, ownership);
+        return Result::Refused;
+    }
+    m_membershipPublished = true;
+    if (!m_tile->publishAdded(window, generation)) {
+        window->revokeTransientOwnership(ownership);
+        return Result::Superseded;
+    }
+    const auto receipt = window->applyTransientOwnership(ownership);
+    if (guard && guard->admissionCurrent(window, generation) && receipt.outcome == Window::TransientRequestOutcome::Applied) {
+        return Result::Accepted;
+    }
+    window->revokeTransientOwnership(ownership);
+    return Result::Superseded;
+}
+
+bool TransientTileController::releaseWindow(Window *window, quint64 generation)
+{
+    if (m_window != window || m_ownershipGeneration != generation) {
+        if (window && window->m_transientOwnership && window->m_transientOwnership->generation == generation
+            && window->m_transientOwnership->controller == this) {
+            window->m_transientOwnership->controller.clear();
+            return window->revokeTransientOwnership(generation);
+        }
+        return false;
+    }
+    Mutation mutation(this);
+    Release release(this);
+    return release.finish();
 }
 
 quint64 TransientTileController::generation() const
