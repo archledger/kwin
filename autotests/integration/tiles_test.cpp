@@ -11,6 +11,7 @@
 #include "core/output.h"
 #include "pointer_input.h"
 #include "tiles/tilemanager.h"
+#include "utils/gravity.h"
 #include "wayland_server.h"
 #include "window.h"
 #include "workspace.h"
@@ -22,12 +23,53 @@
 #endif
 
 #include <QAbstractItemModelTester>
+#include <QPointer>
 
 Q_DECLARE_METATYPE(KWin::QuickTileMode)
 Q_DECLARE_METATYPE(KWin::MaximizeMode)
 
 namespace KWin
 {
+
+class NativeTestTile : public Tile
+{
+public:
+    explicit NativeTestTile(TileManager *manager)
+        : Tile(manager)
+    {
+    }
+
+    void attachForTest(Tile *child)
+    {
+        insertChild(0, child);
+    }
+};
+
+class TransientTestTile : public Tile
+{
+public:
+    explicit TransientTestTile(TileManager *manager, Tile *parent = nullptr)
+        : Tile(manager, parent, Type::Transient)
+    {
+        m_desktop = VirtualDesktopManager::self()->currentDesktop(manager->output());
+        m_relativeGeometry = RectF(0.1, 0.1, 0.4, 0.4);
+    }
+
+    void attachForTest(Tile *child)
+    {
+        insertChild(0, child);
+    }
+
+    void clearMembershipForTest()
+    {
+        m_windows.clear();
+    }
+
+    void seedMembershipForTest(Window *window)
+    {
+        m_windows.append(window);
+    }
+};
 
 #if KWIN_BUILD_X11
 static X11Window *createWindow(xcb_connection_t *connection, const Rect &geometry, std::function<void(xcb_window_t)> setup = {})
@@ -80,6 +122,13 @@ private Q_SLOTS:
     void splitFromSingleTileBelowRoot();
     void requestedGeometryAfterUntileBeforeCommit();
     void requestedGeometryChangedAfterX11Tile();
+    void transientPublicMutations_data();
+    void transientPublicMutations();
+    void transientRefusesDirectManagement();
+    void transientMembershipMutations_data();
+    void transientMembershipMutations();
+    void transientChildDestruction_data();
+    void transientChildDestruction();
 
 private:
     void createSimpleLayout();
@@ -116,6 +165,7 @@ void TilesTest::init()
     m_output = workspace()->activeOutput();
     m_tileManager = workspace()->tileManager(m_output);
     m_rootTile = workspace()->rootTile(m_output);
+    QVERIFY(!m_rootTile->isTransient());
     QAbstractItemModelTester(m_tileManager->model(), QAbstractItemModelTester::FailureReportingMode::QtTest);
 
     VirtualDesktopManager::self()->setCount(3);
@@ -126,6 +176,212 @@ void TilesTest::init()
 void TilesTest::cleanup()
 {
     Test::destroyWaylandConnection();
+}
+
+void TilesTest::transientPublicMutations_data()
+{
+    QTest::addColumn<int>("operation");
+    QTest::newRow("relative-property") << 0;
+    QTest::newRow("padding-property") << 1;
+    QTest::newRow("minimum-property") << 2;
+    QTest::newRow("quick-mode") << 3;
+    QTest::newRow("absolute-geometry") << 4;
+    QTest::newRow("window-geometry") << 5;
+    QTest::newRow("pixel-resize") << 6;
+    QTest::newRow("gravity-resize") << 7;
+    QTest::newRow("create-child") << 8;
+    QTest::newRow("destroy-child") << 9;
+}
+
+void TilesTest::transientPublicMutations()
+{
+    QFETCH(int, operation);
+    auto root = std::make_unique<TransientTestTile>(m_tileManager);
+    auto tile = new TransientTestTile(m_tileManager, root.get());
+    root->attachForTest(tile);
+    QVERIFY(tile->isTransient());
+    QVERIFY(!tile->canBeRemoved());
+    QVERIFY(!tile->supportsResizeGravity(Gravity::BottomRight));
+    const auto geometry = tile->relativeGeometry();
+    const auto padding = tile->padding();
+    const auto minimum = tile->minimumSize();
+    const auto mode = tile->quickTileMode();
+    QCOMPARE(mode, QuickTileMode(QuickTileFlag::Custom));
+    QSignalSpy geometryChanged(tile, &Tile::relativeGeometryChanged);
+    QSignalSpy absoluteChanged(tile, &Tile::absoluteGeometryChanged);
+    QSignalSpy windowGeometryChanged(tile, &Tile::windowGeometryChanged);
+    QSignalSpy paddingChanged(tile, &Tile::paddingChanged);
+    QSignalSpy minimumChanged(tile, &Tile::minimumSizeChanged);
+    QSignalSpy childrenChanged(tile, &Tile::childTilesChanged);
+    QSignalSpy rootChildrenChanged(root.get(), &Tile::childTilesChanged);
+    QSignalSpy layoutChanged(tile, &Tile::isLayoutChanged);
+    switch (operation) {
+    case 0:
+        QVERIFY(tile->setProperty("relativeGeometry", QVariant::fromValue(RectF(0.2, 0.2, 0.5, 0.5))));
+        break;
+    case 1:
+        QVERIFY(tile->setProperty("padding", 24.0));
+        break;
+    case 2:
+        QVERIFY(tile->setProperty("minimumSize", QSizeF(0.6, 0.6)));
+        break;
+    case 3:
+        tile->setQuickTileMode(QuickTileFlag::Right);
+        break;
+    case 4:
+        tile->setGeometryFromAbsolute(RectF(10, 20, 600, 500));
+        break;
+    case 5:
+        tile->setGeometryFromWindow(RectF(10, 20, 600, 500));
+        break;
+    case 6:
+        tile->resizeByPixels(100, Qt::RightEdge);
+        break;
+    case 7:
+        tile->resizeFromGravity(Gravity::BottomRight, 900, 700);
+        break;
+    case 8: {
+        std::unique_ptr<TransientTestTile> created(tile->createChildAt<TransientTestTile>(RectF(0.1, 0.1, 0.2, 0.2), 0));
+        QVERIFY(!created);
+        break;
+    }
+    case 9: {
+        QPointer<TransientTestTile> guard(tile);
+        root->destroyChild(tile);
+        QVERIFY(guard);
+        break;
+    }
+    }
+    QCOMPARE(tile->relativeGeometry(), geometry);
+    QCOMPARE(tile->padding(), padding);
+    QCOMPARE(tile->minimumSize(), minimum);
+    QCOMPARE(tile->quickTileMode(), mode);
+    QCOMPARE(tile->childCount(), 0);
+    QCOMPARE(geometryChanged.count(), 0);
+    QCOMPARE(absoluteChanged.count(), 0);
+    QCOMPARE(windowGeometryChanged.count(), 0);
+    QCOMPARE(paddingChanged.count(), 0);
+    QCOMPARE(minimumChanged.count(), 0);
+    QCOMPARE(childrenChanged.count(), 0);
+    QCOMPARE(rootChildrenChanged.count(), 0);
+    QCOMPARE(layoutChanged.count(), 0);
+}
+
+void TilesTest::transientRefusesDirectManagement()
+{
+    TransientTestTile tile(m_tileManager);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(window);
+    auto manual = workspace()->rootTile(m_output)->childTile(0);
+    QVERIFY(manual->manage(window));
+    QVERIFY(!manual->isTransient());
+    const auto manualWindows = manual->windows();
+    const auto requestedGeometry = window->moveResizeGeometry();
+    QSignalSpy added(&tile, &Tile::windowAdded);
+    QSignalSpy transientWindowsChanged(&tile, &Tile::windowsChanged);
+    QSignalSpy manualWindowsChanged(manual, &Tile::windowsChanged);
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    const bool accepted = tile.manage(window);
+    const bool keptManual = window->requestedTile() == manual;
+    const bool keptMembership = manual->windows() == manualWindows;
+    const bool keptGeometry = window->moveResizeGeometry() == requestedGeometry;
+    const bool empty = tile.windows().isEmpty();
+    const bool silent = added.isEmpty() && transientWindowsChanged.isEmpty() && manualWindowsChanged.isEmpty() && requestedTileChanged.isEmpty();
+    // Clean a failed control without leaving a stale test-only membership.
+    tile.clearMembershipForTest();
+    window->requestTile(nullptr);
+    shellSurface.reset();
+    surface.reset();
+    QVERIFY(Test::waitForWindowClosed(window));
+    QVERIFY(!accepted);
+    QVERIFY(keptManual);
+    QVERIFY(keptMembership);
+    QVERIFY(keptGeometry);
+    QVERIFY(empty);
+    QVERIFY(silent);
+}
+
+void TilesTest::transientMembershipMutations_data()
+{
+    QTest::addColumn<int>("operation");
+    QTest::newRow("manage-existing") << 0;
+    QTest::newRow("unmanage") << 1;
+    QTest::newRow("forget") << 2;
+}
+
+void TilesTest::transientMembershipMutations()
+{
+    QFETCH(int, operation);
+    TransientTestTile tile(m_tileManager);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(window);
+    tile.seedMembershipForTest(window);
+    QSignalSpy removed(&tile, &Tile::windowRemoved);
+    QSignalSpy windowsChanged(&tile, &Tile::windowsChanged);
+    bool accepted = false;
+    if (operation == 0) {
+        accepted = tile.manage(window);
+    } else if (operation == 1) {
+        accepted = tile.unmanage(window);
+    } else {
+        tile.forget(window);
+    }
+    const bool retained = tile.windows() == QList<Window *>{window};
+    // The controller is not installed in this unit; clear the test-only membership explicitly.
+    tile.clearMembershipForTest();
+    shellSurface.reset();
+    surface.reset();
+    QVERIFY(Test::waitForWindowClosed(window));
+    QVERIFY(!accepted);
+    QVERIFY(retained);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(windowsChanged.count(), 0);
+}
+
+void TilesTest::transientChildDestruction_data()
+{
+    QTest::addColumn<bool>("transientParent");
+    QTest::addColumn<bool>("transientChild");
+    QTest::newRow("native-to-transient") << false << true;
+    QTest::newRow("transient-to-native") << true << false;
+    QTest::newRow("native-to-native") << false << false;
+}
+
+void TilesTest::transientChildDestruction()
+{
+    QFETCH(bool, transientParent);
+    QFETCH(bool, transientChild);
+    std::unique_ptr<NativeTestTile> nativeRoot;
+    std::unique_ptr<TransientTestTile> transientRoot;
+    if (transientParent) {
+        transientRoot = std::make_unique<TransientTestTile>(m_tileManager);
+    } else {
+        nativeRoot = std::make_unique<NativeTestTile>(m_tileManager);
+    }
+    Tile *root = transientParent ? static_cast<Tile *>(transientRoot.get()) : nativeRoot.get();
+    QPointer<Tile> child = transientChild ? static_cast<Tile *>(new TransientTestTile(m_tileManager, root)) : new Tile(m_tileManager, root);
+    if (transientParent) {
+        transientRoot->attachForTest(child);
+    } else {
+        nativeRoot->attachForTest(child);
+    }
+    QSignalSpy childrenChanged(root, &Tile::childTilesChanged);
+    QSignalSpy layoutChanged(root, &Tile::isLayoutChanged);
+    root->destroyChild(child);
+    if (transientParent || transientChild) {
+        QVERIFY(child);
+        QCOMPARE(root->childTiles(), QList<Tile *>{child});
+        QCOMPARE(childrenChanged.count(), 0);
+        QCOMPARE(layoutChanged.count(), 0);
+    } else {
+        QVERIFY(!child);
+        QCOMPARE(root->childCount(), 0);
+        QVERIFY(!childrenChanged.isEmpty());
+    }
 }
 
 void TilesTest::createSimpleLayout()
@@ -752,6 +1008,7 @@ void TilesTest::tileAndMaximize()
     auto rightTileD2 = qobject_cast<CustomTile *>(rootTileD2->childTiles()[1]);
 
     auto leftQuickTileD1 = m_tileManager->quickTile(QuickTileFlag::Left);
+    QVERIFY(!leftQuickTileD1->isTransient());
 
     const QList<LogicalOutput *> outputs = workspace()->outputs();
     TileManager *out2TileMan = workspace()->tileManager(outputs[1]);
