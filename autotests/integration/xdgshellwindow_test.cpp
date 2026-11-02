@@ -59,6 +59,7 @@
 
 #include <csignal>
 #include <functional>
+#include <limits>
 #include <type_traits>
 
 using namespace KWin;
@@ -276,6 +277,19 @@ private Q_SLOTS:
     void testNoRequestFinalizationDuringClose();
     void testNoRequestFinalizationValidity_data();
     void testNoRequestFinalizationValidity();
+    void testTransientOwnershipPreparation_data();
+    void testTransientOwnershipPreparation();
+    void testTransientOwnershipBeforeRequest_data();
+    void testTransientOwnershipBeforeRequest();
+    void testTransientOwnershipRevocation_data();
+    void testTransientOwnershipRevocation();
+    void testTransientOwnershipNativeProgress_data();
+    void testTransientOwnershipNativeProgress();
+    void testTransientOwnershipClose_data();
+    void testTransientOwnershipClose();
+    void testTransientOwnershipWriterLoss();
+    void testTransientOwnershipExhaustion();
+    void testTransientOwnershipApplied();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -5129,6 +5143,503 @@ void TestXdgShellWindow::testNoRequestFinalizationValidity()
         // A failed check must not consume the proof before a correctly bound consumer uses it.
         useCorrectBinding(QStringLiteral("correct-consumer"));
     }
+}
+
+void TestXdgShellWindow::testTransientOwnershipPreparation_data()
+{
+    QTest::addColumn<int>("change");
+    QTest::newRow("unchanged") << 0;
+    QTest::newRow("retired-provider") << 1;
+    QTest::newRow("manual-cancellation") << 2;
+    QTest::newRow("native-snapshot-change") << 3;
+}
+
+void TestXdgShellWindow::testTransientOwnershipPreparation()
+{
+    QFETCH(int, change);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto first = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                         std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(first);
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Prepared);
+    QVERIFY(writer.isReserved(id));
+    QVERIFY(!writer.ownsReservation(id, QString::number(first)));
+    QCOMPARE(QRectF(window->frameGeometry()), original);
+    QCOMPARE(window->m_transientOwnership->nativeSequence, quint64(0));
+    QVERIFY(window->revokeTransientOwnership(first));
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!writer.isReserved(id));
+
+    const auto second = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                          std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(second > first);
+    if (change == 1) {
+        provider.reset(); // The queued providerRetired signal has not run yet.
+    } else if (change == 2) {
+        window->move(QPointF(90, 80));
+    } else if (change == 3) {
+        // A native snapshot change, not public manual intent: Prepared must remain present.
+        window->setMoveResizeGeometry(RectF(90, 80, original.width(), original.height()));
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Prepared);
+    }
+    QCOMPARE(window->activateTransientOwnership(second), change == 0);
+    if (change == 0) {
+        QVERIFY(writer.ownsReservation(id, QString::number(second)));
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+        QVERIFY(window->m_transientOwnership->nativeSequence);
+    }
+    if (window->m_transientOwnership) {
+        QVERIFY(window->revokeTransientOwnership(second));
+    }
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+}
+
+void TestXdgShellWindow::testTransientOwnershipBeforeRequest_data()
+{
+    QTest::addColumn<bool>("retireProvider");
+    QTest::newRow("explicit-revocation") << false;
+    QTest::newRow("provider-retired-before-call") << true;
+}
+
+void TestXdgShellWindow::testTransientOwnershipBeforeRequest()
+{
+    QFETCH(bool, retireProvider);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    QSignalSpy geometry(window, &Window::requestedGeometryChanged);
+    if (retireProvider) {
+        provider.reset();
+        const auto receipt = window->applyTransientOwnership(generation);
+        QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+        QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Rejected);
+    } else {
+        QVERIFY(window->revokeTransientOwnership(generation));
+    }
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(geometry.count(), 0);
+    QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+}
+
+void TestXdgShellWindow::testTransientOwnershipRevocation_data()
+{
+    QTest::addColumn<int>("mode");
+    QTest::newRow("writer-revoked-before-call") << 0;
+    QTest::newRow("writer-revoked-in-callback") << 1;
+    QTest::newRow("returned-proof-already-consumed") << 2;
+}
+
+void TestXdgShellWindow::testTransientOwnershipRevocation()
+{
+    QFETCH(int, mode);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    if (mode == 0) {
+        QCOMPARE(writer.beginRestore(id, QString::number(generation)), Result::Accepted);
+    } else {
+        connect(window, &Window::maximizeGeometryRestoreChanged, &writer, [&, generation]() {
+            if (mode == 1) {
+                QCOMPARE(writer.beginRestore(id, QString::number(generation)), Result::Accepted);
+            } else {
+                window->requestTile(nullptr);
+            }
+        });
+    }
+    const auto receipt = window->applyTransientOwnership(generation);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+    if (mode == 2) {
+        QVERIFY(receipt.noRequestProof);
+        TransientPlacementWriter another(directory.filePath(QStringLiteral("another")));
+        QObject anotherProvider;
+        const auto anotherToken = another.registerProvider(&anotherProvider);
+        QVERIFY(another.trackWindow(id, QStringLiteral("app")));
+        QCOMPARE(another.record(anotherToken, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        const auto snapshot = another.snapshot();
+        QCOMPARE(another.reserve(anotherToken, {id, QString::number(generation), original, snapshot.providerRevision, snapshot.mapRevision, QStringLiteral("app")}), Result::Accepted);
+        QCOMPARE(another.activateReservation(anotherToken, id, QString::number(generation)), Result::Accepted);
+        QCOMPARE(another.finalizeNoRequest(receipt.noRequestProof), Result::InvalidRecord);
+        QVERIFY(another.isReserved(id));
+    }
+}
+
+void TestXdgShellWindow::testTransientOwnershipNativeProgress_data()
+{
+    QTest::addColumn<bool>("afterRequest");
+    QTest::addColumn<bool>("retireProvider");
+    QTest::newRow("manual-before-request") << false << false;
+    QTest::newRow("provider-before-request") << false << true;
+    QTest::newRow("manual-after-request") << true << false;
+    QTest::newRow("provider-after-request") << true << true;
+}
+
+void TestXdgShellWindow::testTransientOwnershipNativeProgress()
+{
+    QFETCH(bool, afterRequest);
+    QFETCH(bool, retireProvider);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    const QRectF manual(70, 80, 240, 140);
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    bool observed = false;
+    const auto cancel = [&]() {
+        if (observed) {
+            return;
+        }
+        observed = true;
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->progress, afterRequest ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+        QCOMPARE(window->m_transientOwnership->target, tile.windowGeometry());
+        QCOMPARE(window->m_transientOwnership->tile.data(), &tile);
+        QCOMPARE(window->m_transientOwnership->manager.data(), tile.manager());
+        QCOMPARE(window->m_transientOwnership->output.data(), tile.manager()->output());
+        QCOMPARE(window->m_transientOwnership->desktop.data(), tile.desktop());
+        if (retireProvider) {
+            provider.reset();
+        } else {
+            window->moveResize(manual);
+            QVERIFY(window->m_transientOwnership);
+            QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+            QCOMPARE(writer.record(token, 2, {id, manual, 20, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        }
+    };
+    if (afterRequest) {
+        connect(window, &Window::requestedGeometryChanged, &writer, cancel);
+    } else {
+        connect(window, &Window::maximizeGeometryRestoreChanged, &writer, cancel);
+    }
+    const auto receipt = window->applyTransientOwnership(generation);
+    QVERIFY(observed);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, afterRequest ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
+    if (afterRequest) {
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+        QCOMPARE(window->m_transientOwnership->target, tile.windowGeometry());
+        QCOMPARE(window->m_transientOwnership->tile.data(), &tile);
+        QVERIFY(writer.isReserved(id));
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+        QPointer<Window> guard(window);
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QTRY_VERIFY(!guard);
+    } else {
+        QVERIFY(!window->m_transientOwnership);
+    }
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), retireProvider ? original : manual);
+}
+
+void TestXdgShellWindow::testTransientOwnershipClose_data()
+{
+    QTest::addColumn<bool>("activate");
+    QTest::newRow("prepared") << false;
+    QTest::newRow("activated-no-request") << true;
+}
+
+void TestXdgShellWindow::testTransientOwnershipClose()
+{
+    QFETCH(bool, activate);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    if (activate) {
+        QVERIFY(window->activateTransientOwnership(generation));
+    }
+    bool protectedDuringClose = false;
+    connect(window, &Window::closed, &writer, [&]() {
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        protectedDuringClose = writer.isReserved(id);
+        QVERIFY(window->m_transientOwnership);
+    });
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(protectedDuringClose);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+}
+
+void TestXdgShellWindow::testTransientOwnershipWriterLoss()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto writer = std::make_unique<TransientPlacementWriter>(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer->registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer->trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer->record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer->snapshot();
+    const auto generation = window->prepareTransientOwnership(writer.get(), token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    writer.reset();
+    QCOMPARE(window->applyTransientOwnership(generation).outcome, Window::TransientRequestOutcome::Rejected);
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+    QVERIFY(!window->revokeTransientOwnership(generation));
+    TransientPlacementWriter replacement(directory.filePath(QStringLiteral("replacement")));
+    const auto replacementToken = replacement.registerProvider(&provider);
+    QVERIFY(replacement.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(replacement.record(replacementToken, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    const auto replacementState = replacement.snapshot();
+    QCOMPARE(window->prepareTransientOwnership(&replacement, replacementToken, QStringLiteral("app"), replacementState.providerRevision, replacementState.mapRevision,
+                                               std::make_unique<RequestForTest>(window, &tile, authority, 0)),
+             quint64(0));
+    QVERIFY(window->m_transientOwnership);
+}
+
+void TestXdgShellWindow::testTransientOwnershipExhaustion()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    window->m_transientOwnershipGeneration = std::numeric_limits<quint64>::max();
+    QCOMPARE(window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                               std::make_unique<RequestForTest>(window, &tile, authority, 0)),
+             quint64(0));
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(QRectF(window->frameGeometry()), original);
+}
+
+void TestXdgShellWindow::testTransientOwnershipApplied()
+{
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    const RectF target(original.x() + 40, original.y() + 30, original.width(), original.height());
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    tile.setTargetForTest(target);
+    QCOMPARE(tile.windowGeometry(), target);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto state = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), state.providerRevision, state.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, &tile, authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    bool observed = false;
+    connect(window, &Window::frameGeometryChanged, &writer, [&]() {
+        observed = true;
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+    });
+    const auto receipt = window->applyTransientOwnership(generation);
+    QVERIFY(observed);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QVERIFY(!receipt.noRequestProof);
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+    QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+    QCOMPARE(window->m_transientOwnership->target, target);
+    QCOMPARE(window->m_transientOwnership->tile.data(), &tile);
+    QCOMPARE(window->m_transientOwnership->manager.data(), tile.manager());
+    QVERIFY(!window->m_transientOwnership->request);
+    QVERIFY(writer.ownsReservation(id, QString::number(generation)));
+    QCOMPARE(window->frameGeometry(), target);
+    const auto sequence = window->m_transientRequestSequence;
+    QCOMPARE(window->applyTransientOwnership(generation).outcome, Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(window->m_transientRequestSequence, sequence);
+    QVERIFY(writer.ownsReservation(id, QString::number(generation)));
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)
