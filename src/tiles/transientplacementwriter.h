@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <kwin_export.h>
+
 #include <QHash>
 #include <QMap>
 #include <QObject>
@@ -59,7 +61,7 @@ private:
 
 // Compositor-thread-only. Event ordering/origin comes from the native adapter, never QML claims.
 // This writer is not instantiated by the desktop until its native integration is ready.
-class TransientPlacementWriter : public QObject
+class KWIN_EXPORT TransientPlacementWriter : public QObject
 {
     Q_OBJECT
 
@@ -117,6 +119,10 @@ public:
     ~TransientPlacementWriter() override;
 
     QUuid registerProvider(QObject *provider);
+    bool isProviderCurrent(const QUuid &provider, quint64 revision) const
+    {
+        return m_provider && !provider.isNull() && provider == m_providerToken && revision == m_providerRevision;
+    }
     bool trackWindow(const QUuid &window, const QString &key);
     // Called at QObject destruction, not before the window's close callbacks.
     bool forgetWindow(const QUuid &window);
