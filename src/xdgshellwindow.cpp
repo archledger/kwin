@@ -40,6 +40,8 @@
 #include <KDecoration3/DecoratedWindow>
 #include <KDecoration3/Decoration>
 
+#include <QPointer>
+
 namespace KWin
 {
 
@@ -167,7 +169,11 @@ void XdgSurfaceWindow::handleCommit()
     m_lastAcknowledgedConfigure.reset();
     m_lastAcknowledgedConfigureSerial.reset();
 
+    QPointer<XdgSurfaceWindow> guard(this);
     markAsMapped();
+    if (guard && !guard->isDeleted()) {
+        guard->notifyRequestedGeometryChanged();
+    }
 }
 
 void XdgSurfaceWindow::handleRolePrecommit()

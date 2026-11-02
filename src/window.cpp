@@ -47,12 +47,21 @@
 
 #include <QDebug>
 #include <QDir>
+#include <QHash>
 #include <QJSEngine>
 #include <QMouseEvent>
 #include <QStyleHints>
 
 namespace KWin
 {
+
+namespace
+{
+
+// Keep the same-version backport ABI-compatible with consumers built against stock headers.
+QHash<const Window *, RectF> s_notifiedRequestedGeometry;
+
+}
 
 QHash<QString, std::weak_ptr<Decoration::DecorationPalette>> Window::s_palettes;
 std::shared_ptr<Decoration::DecorationPalette> Window::s_defaultPalette;
@@ -101,6 +110,7 @@ Window::Window()
 
 Window::~Window()
 {
+    s_notifiedRequestedGeometry.remove(this);
 }
 
 void Window::ref()
@@ -3361,6 +3371,16 @@ void Window::setMoveResizeGeometry(const RectF &geo)
     setMoveResizeOutput(workspace()->outputAt(geo.center()));
 }
 
+void Window::notifyRequestedGeometryChanged()
+{
+    const RectF previous = s_notifiedRequestedGeometry.value(this);
+    if (m_moveResizeGeometry == previous) {
+        return;
+    }
+    s_notifiedRequestedGeometry.insert(this, m_moveResizeGeometry);
+    Q_EMIT requestedGeometryChanged();
+}
+
 LogicalOutput *Window::moveResizeOutput() const
 {
     return m_moveResizeOutput;
@@ -3400,6 +3420,7 @@ void Window::move(const QPointF &point)
 
     setMoveResizeGeometry(rect);
     moveResizeInternal(rect, MoveResizeMode::Move);
+    notifyRequestedGeometryChanged();
 }
 
 void Window::resize(const QSizeF &size)
@@ -3412,6 +3433,7 @@ void Window::resize(const QSizeF &size)
 
     setMoveResizeGeometry(rect);
     moveResizeInternal(rect, MoveResizeMode::Resize);
+    notifyRequestedGeometryChanged();
 }
 
 void Window::moveResize(const RectF &rect)
@@ -3422,6 +3444,7 @@ void Window::moveResize(const RectF &rect)
 
     setMoveResizeGeometry(rect);
     moveResizeInternal(rect, MoveResizeMode::MoveResize);
+    notifyRequestedGeometryChanged();
 }
 
 bool Window::isPlaced() const
