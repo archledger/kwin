@@ -10,6 +10,7 @@
 #include "tilemanager.h"
 #include "core/backendoutput.h"
 #include "quicktile.h"
+#include "transienttilecontroller.h"
 #include "virtualdesktops.h"
 #include "window.h"
 #include "workspace.h"
@@ -21,6 +22,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopeGuard>
 #include <QTimer>
 
 namespace KWin
@@ -82,7 +84,22 @@ TileManager::TileManager(LogicalOutput *parent)
     connect(VirtualDesktopManager::self(), &VirtualDesktopManager::desktopAdded, this, addDesktop);
     connect(VirtualDesktopManager::self(), &VirtualDesktopManager::desktopRemoved,
             this, [this](VirtualDesktop *desk) {
+        const QPointer<TileManager> guard(this);
+        const bool acquired = !m_drainingDesktops.contains(desk);
+        m_drainingDesktops.insert(desk);
+        const auto release = qScopeGuard([guard, desk, acquired]() {
+            if (guard && acquired) {
+                guard->m_drainingDesktops.remove(desk);
+            }
+        });
+        drainTransientRoots(desk);
+        if (!guard) {
+            return;
+        }
         delete m_rootTiles.take(desk);
+        if (!guard) {
+            return;
+        }
         delete m_quickRootTiles.take(desk);
     });
     connect(VirtualDesktopManager::self(), &VirtualDesktopManager::currentChanged,
@@ -97,7 +114,114 @@ TileManager::TileManager(LogicalOutput *parent)
 
 TileManager::~TileManager()
 {
+    prepareForRemoval();
     m_tearingDown = true;
+}
+
+bool TileManager::canRegisterTransientRoot(VirtualDesktop *desktop) const
+{
+    return !m_tearingDown && !m_transientRegistrationClosed && desktop && !m_drainingDesktops.contains(desktop)
+        && m_output && workspace()->outputs().contains(m_output) && VirtualDesktopManager::self()->desktops().contains(desktop)
+        && m_rootTiles.contains(desktop) && m_quickRootTiles.contains(desktop) && !m_transientRoots.contains(desktop);
+}
+
+std::shared_ptr<TileManager::TransientRegistration> TileManager::registerTransientRoot(Tile *root, TransientTileController *controller, quint64 generation)
+{
+    if (!root || !controller || !generation || !canRegisterTransientRoot(root->desktop()) || !root->isTransient()
+        || root->manager() != this || root->parentTile() || root->parent() != controller
+        || controller->rootTile() != root || controller->generation() != generation || m_transientLifetime.contains(root)) {
+        return {};
+    }
+    auto registration = std::make_shared<TransientRegistration>(TransientRegistration{root, controller, root->desktop(), generation});
+    m_transientRoots.insert(root->desktop(), registration);
+    m_transientLifetime.insert(root, registration);
+    connect(root, &QObject::destroyed, this, [this, root, registration]() {
+        if (m_transientRoots.value(registration->desktop) == registration) {
+            m_transientRoots.remove(registration->desktop);
+        }
+        if (m_transientLifetime.value(root) == registration) {
+            m_transientLifetime.remove(root);
+        }
+    });
+    return registration;
+}
+
+bool TileManager::unregisterTransientRoot(VirtualDesktop *desktop, Tile *root, TransientTileController *controller, quint64 generation)
+{
+    const auto it = m_transientRoots.constFind(desktop);
+    if (it == m_transientRoots.cend() || (*it)->root != root || (*it)->controller != controller || (*it)->generation != generation) {
+        return false;
+    }
+    // Lookup ends now; weak lifetime tracking remains until actual QObject destruction.
+    m_transientRoots.remove(desktop);
+    return true;
+}
+
+void TileManager::closeTransientRegistration()
+{
+    m_transientRegistrationClosed = true;
+}
+
+void TileManager::prepareForRemoval()
+{
+    closeTransientRegistration();
+    drainTransientRoots();
+}
+
+void TileManager::disposeTransientRoot(const std::shared_ptr<TransientRegistration> &registration)
+{
+    if (!registration->root || registration->destroying || registration->draining) {
+        return;
+    }
+    registration->draining = true;
+    const auto finish = qScopeGuard([registration]() {
+        registration->draining = false;
+    });
+    const auto root = registration->root;
+    const auto controller = registration->controller;
+    if (controller && controller->rootTile() == root && controller->generation() == registration->generation) {
+        const auto result = controller->clearTree(registration->generation);
+        if (root && !registration->destroying && result != TransientTileController::Result::Accepted) {
+            qCWarning(KWIN_CORE) << "Transient root needs fallback disposal after controller cleanup" << int(result);
+        }
+    }
+    if (root && !registration->destroying) {
+        delete root.data();
+    }
+}
+
+void TileManager::drainTransientRoots(VirtualDesktop *desktop)
+{
+    const QPointer<TileManager> guard(this);
+    const bool acquired = desktop && !m_drainingDesktops.contains(desktop);
+    if (acquired) {
+        m_drainingDesktops.insert(desktop);
+    }
+    const auto release = qScopeGuard([guard, desktop, acquired]() {
+        if (guard && acquired) {
+            guard->m_drainingDesktops.remove(desktop);
+        }
+    });
+    QList<std::shared_ptr<TransientRegistration>> roots;
+    for (auto it = m_transientRoots.begin(); it != m_transientRoots.end();) {
+        if (!desktop || it.key() == desktop) {
+            roots.append(it.value());
+            it = m_transientRoots.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto &registration : std::as_const(m_transientLifetime)) {
+        if ((!desktop || registration->desktop == desktop) && !roots.contains(registration)) {
+            roots.append(registration);
+        }
+    }
+    // The captured metadata owns no QObject and remains usable after a callback deletes us.
+    const auto cleanup = qScopeGuard([roots = std::move(roots)]() {
+        for (const auto &registration : roots) {
+            disposeTransientRoot(registration);
+        }
+    });
 }
 
 bool TileManager::tearingDown() const
@@ -147,17 +271,32 @@ TileModel *TileManager::model() const
 
 Tile *TileManager::tileForWindow(Window *window, VirtualDesktop *desktop)
 {
-    if (!window || !desktop) {
+    if (!window || !desktop || m_tearingDown) {
         return nullptr;
     }
-    Q_ASSERT(m_rootTiles.contains(desktop));
-    Q_ASSERT(m_quickRootTiles.contains(desktop));
-
-    Tile *owner = m_quickRootTiles[desktop]->tileForWindow(window);
+    const auto registration = m_transientRoots.value(desktop);
+    if (registration && registration->root && !registration->destroying && !registration->draining && registration->controller
+        && registration->controller->rootTile() == registration->root && registration->controller->generation() == registration->generation) {
+        Tile *owner = nullptr;
+        registration->root->visitDescendants([&](Tile *tile) {
+            if (tile->windows().contains(window)) {
+                owner = tile;
+            }
+        });
+        if (owner) {
+            return owner;
+        }
+    }
+    const auto quick = m_quickRootTiles.value(desktop);
+    const auto manual = m_rootTiles.value(desktop);
+    if (!quick || !manual) {
+        return nullptr;
+    }
+    Tile *owner = quick->tileForWindow(window);
     if (owner) {
         return owner;
     }
-    return m_rootTiles[desktop]->tileForWindow(window);
+    return manual->tileForWindow(window);
 }
 
 void TileManager::forgetWindow(Window *window, VirtualDesktop *desktop)
@@ -165,20 +304,33 @@ void TileManager::forgetWindow(Window *window, VirtualDesktop *desktop)
     if (!window) {
         return;
     }
-
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Window> target(window);
+    const QPointer<TileManager> guard(this);
+    QList<QPointer<VirtualDesktop>> desktops;
     if (desktop) {
-        Tile *owner = tileForWindow(window, desktop);
-        if (owner) {
-            owner->forget(window);
+        desktops.append(desktop);
+    } else {
+        for (auto desk : VirtualDesktopManager::self()->desktops()) {
+            desktops.append(desk);
         }
-        return;
     }
-
-    const QList<VirtualDesktop *> desktops = VirtualDesktopManager::self()->desktops();
-    for (VirtualDesktop *desk : desktops) {
-        Tile *owner = tileForWindow(window, desk);
+    for (const auto &desk : desktops) {
+        if (!guard || !target) {
+            return;
+        }
+        if (!desk) {
+            continue;
+        }
+        Tile *owner = guard->tileForWindow(target, desk);
         if (owner) {
-            owner->forget(window);
+            owner->forget(target);
+            if (!guard || !target || target->isDeleted()) {
+                return;
+            }
         }
     }
 }

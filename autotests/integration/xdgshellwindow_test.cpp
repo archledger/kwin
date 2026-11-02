@@ -40,6 +40,7 @@
 #include <KWayland/Client/subsurface.h>
 #include <KWayland/Client/surface.h>
 
+#include <QChildEvent>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDir>
@@ -47,6 +48,9 @@
 #include <QPointer>
 #include <QScopeGuard>
 #include <QTemporaryDir>
+#include <QTimer>
+
+#include <KConfigGroup>
 
 #include <KPluginFactory>
 #include <KPluginMetaData>
@@ -326,6 +330,18 @@ private Q_SLOTS:
     void testPublicTransientReleaseDestruction_data();
     void testPublicTransientReleaseDestruction();
     void testPublicTransientReleaseRefusal();
+    void testTransientRegistryLookup();
+    void testTransientRegistryRetiredRoot();
+    void testTransientRegistryDestructorReentry_data();
+    void testTransientRegistryDestructorReentry();
+    void testTransientRegistryDrainSnapshots_data();
+    void testTransientRegistryDrainSnapshots();
+    void testTransientRegistryTransactions_data();
+    void testTransientRegistryTransactions();
+    void testTransientRegistryClosedRegistration();
+    void testTransientRegistryDesktopRemoval();
+    void testTransientRegistryForgetReentry_data();
+    void testTransientRegistryForgetReentry();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -6785,6 +6801,397 @@ void TestXdgShellWindow::testPublicTransientReleaseRefusal()
     QTRY_VERIFY(!guard);
     other->setSkipCloseAnimation(true);
     other->destroyWindow();
+}
+
+void TestXdgShellWindow::testTransientRegistryLookup()
+{
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.registry"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    const auto manualRoot = manager->rootTile(desktop);
+    const auto manualModel = manager->model();
+    const auto timers = manager->findChildren<QTimer *>(QString(), Qt::FindDirectChildrenOnly);
+    QCOMPARE(timers.size(), 1);
+    QSignalSpy saved(timers.first(), &QTimer::timeout);
+    const auto padding = manualRoot->padding();
+    manualRoot->setPadding(padding + 1);
+    manualRoot->setPadding(padding);
+    QVERIFY(saved.wait());
+    KConfigGroup tiling(kwinApp()->config(), QStringLiteral("Tiling"));
+    KConfigGroup deskConfig(&tiling, desktop->id());
+    KConfigGroup outputConfig(&deskConfig, manager->output()->uuid());
+    const auto originalLayout = outputConfig.readEntry("tiles", QByteArray());
+    QVERIFY(!originalLayout.isEmpty());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.registry");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QCOMPARE(manager->tileForWindow(window, desktop), controller.tile());
+    QCOMPARE(manager->rootTile(desktop), manualRoot);
+    QCOMPARE(manager->model(), manualModel);
+    QVERIFY(!manager->bestTileForPosition(100, 100)->isTransient());
+    manualRoot->setPadding(padding + 1);
+    manualRoot->setPadding(padding);
+    QVERIFY(saved.wait());
+    QCOMPARE(outputConfig.readEntry("tiles", QByteArray()), originalLayout);
+    manager->forgetWindow(window, desktop);
+    QVERIFY(controller.tile()->windows().isEmpty());
+    QVERIFY(!manager->tileForWindow(window, desktop));
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(writer.isReserved(id));
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testTransientRegistryRetiredRoot()
+{
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.registry"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto manager = std::make_unique<TileManager>(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.registry");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager.get(), desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QPointer<Tile> root(controller.rootTile());
+    delete controller.tile();
+    QVERIFY(root); // Its deferred deletion has not run yet.
+    QVERIFY(!controller.rootTile());
+    manager.reset();
+    QVERIFY(!root); // Manager teardown must also drain retired roots synchronously.
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(writer.isReserved(id));
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testTransientRegistryDestructorReentry_data()
+{
+    QTest::addColumn<bool>("leaf");
+    QTest::newRow("root-already-destroying") << false;
+    QTest::newRow("retired-ancestor-during-leaf-detach") << true;
+}
+
+void TestXdgShellWindow::testTransientRegistryDestructorReentry()
+{
+    QFETCH(bool, leaf);
+    using Result = TransientTileController::Result;
+    auto output = workspace()->outputs().first();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    auto manager = std::make_unique<TileManager>(output);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager.get(), desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QPointer<Tile> root(controller.rootTile());
+    QPointer<Tile> child(controller.tile());
+    Tile *removed = leaf ? child.data() : root.data();
+    bool called = false;
+    RegistryEventFilter filter(QEvent::ChildRemoved, [&](QObject *, QEvent *event) {
+        if (called || static_cast<QChildEvent *>(event)->child() != removed) {
+            return;
+        }
+        called = true;
+        QVERIFY(root);
+        QVERIFY(child);
+        manager->prepareForRemoval();
+        QCOMPARE(bool(root), !leaf);
+        QVERIFY(child);
+    }, leaf); // The leaf case deletes the watched root; do not dispatch to it afterward.
+    (leaf ? static_cast<QObject *>(root.data()) : static_cast<QObject *>(&controller))->installEventFilter(&filter);
+    delete removed;
+    QVERIFY(called);
+    QVERIFY(!root);
+    QVERIFY(!child);
+    QVERIFY(!controller.rootTile());
+}
+
+void TestXdgShellWindow::testTransientRegistryDrainSnapshots_data()
+{
+    QTest::addColumn<bool>("deleteManager");
+    QTest::newRow("retired-during-drain") << false;
+    QTest::newRow("manager-deleted-during-drain") << true;
+}
+
+void TestXdgShellWindow::testTransientRegistryDrainSnapshots()
+{
+    QFETCH(bool, deleteManager);
+    using Result = TransientTileController::Result;
+    auto desktops = VirtualDesktopManager::self();
+    const auto oldCount = desktops->count();
+    const auto restore = qScopeGuard([desktops, oldCount]() {
+        desktops->setCount(oldCount);
+    });
+    desktops->setCount(std::max(oldCount, uint(2)));
+    auto output = workspace()->outputs().first();
+    auto manager = std::make_unique<TileManager>(output);
+    TransientTileController first;
+    TransientTileController second;
+    QCOMPARE(first.createTree(manager.get(), desktops->desktops().first(), RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QCOMPARE(second.createTree(manager.get(), desktops->desktops().last(), RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QPointer<Tile> firstRoot(first.rootTile());
+    QPointer<Tile> secondRoot(second.rootTile());
+    bool called = false;
+    const auto retireOther = [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        if (firstRoot) {
+            delete first.tile();
+            QVERIFY(firstRoot);
+        } else {
+            delete second.tile();
+            QVERIFY(secondRoot);
+        }
+        if (deleteManager) {
+            manager.reset();
+        }
+    };
+    QObject callbackContext;
+    connect(firstRoot, &QObject::destroyed, &callbackContext, retireOther);
+    connect(secondRoot, &QObject::destroyed, &callbackContext, retireOther);
+    manager->prepareForRemoval();
+    QVERIFY(called);
+    QVERIFY(!firstRoot);
+    QVERIFY(!secondRoot);
+    QVERIFY(!first.rootTile());
+    QVERIFY(!second.rootTile());
+    QCOMPARE(bool(manager), !deleteManager);
+}
+
+void TestXdgShellWindow::testTransientRegistryTransactions_data()
+{
+    QTest::addColumn<bool>("replaceDuringConstruction");
+    QTest::newRow("final-registration-race") << true;
+    QTest::newRow("old-destroyed-callback-after-replacement") << false;
+}
+
+void TestXdgShellWindow::testTransientRegistryTransactions()
+{
+    QFETCH(bool, replaceDuringConstruction);
+    using Result = TransientTileController::Result;
+    auto output = workspace()->outputs().first();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    TileManager manager(output);
+    TransientTileController first;
+    TransientTileController replacement;
+    TransientTileController probe;
+    bool registered = false;
+    RegistryEventFilter filter(QEvent::ChildAdded, [&](QObject *, QEvent *event) {
+        auto root = qobject_cast<Tile *>(static_cast<QChildEvent *>(event)->child());
+        QVERIFY(root);
+        const auto createReplacement = [&]() {
+            QCOMPARE(replacement.createTree(&manager, desktop, RectF(0.5, 0, 0.5, 1)), Result::Accepted);
+            registered = true;
+        };
+        if (replaceDuringConstruction) {
+            createReplacement();
+        } else {
+            // Register this observer before the manager attaches its own destroyed callback.
+            connect(root, &QObject::destroyed, &replacement, createReplacement);
+        }
+    });
+    first.installEventFilter(&filter);
+    const auto result = first.createTree(&manager, desktop, RectF(0, 0, 0.5, 1));
+    if (replaceDuringConstruction) {
+        QCOMPARE(result, Result::Refused);
+        QVERIFY(!first.rootTile());
+    } else {
+        QCOMPARE(result, Result::Accepted);
+        QCOMPARE(first.clearTree(first.generation()), Result::Accepted);
+    }
+    QVERIFY(registered);
+    QVERIFY(replacement.rootTile());
+    QCOMPARE(probe.createTree(&manager, desktop, RectF(0, 0, 1, 1)), Result::Busy);
+    QCOMPARE(replacement.clearTree(replacement.generation()), Result::Accepted);
+    QCOMPARE(probe.createTree(&manager, desktop, RectF(0, 0, 1, 1)), Result::Accepted);
+}
+
+void TestXdgShellWindow::testTransientRegistryClosedRegistration()
+{
+    using Result = TransientTileController::Result;
+    auto output = workspace()->outputs().first();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    TileManager manager(output);
+    TransientTileController first;
+    TransientTileController replacement;
+    QCOMPARE(first.createTree(&manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    bool called = false;
+    connect(first.rootTile(), &QObject::destroyed, &replacement, [&]() {
+        called = true;
+        QVERIFY(!manager.tearingDown());
+        QCOMPARE(replacement.createTree(&manager, desktop, RectF(0.5, 0, 0.5, 1)), Result::Busy);
+    });
+    manager.prepareForRemoval();
+    QVERIFY(called);
+    QVERIFY(!first.rootTile());
+    QVERIFY(!replacement.rootTile());
+    QCOMPARE(replacement.createTree(&manager, desktop, RectF(0.5, 0, 0.5, 1)), Result::Busy);
+}
+
+void TestXdgShellWindow::testTransientRegistryDesktopRemoval()
+{
+    using Result = TransientTileController::Result;
+    auto desktops = VirtualDesktopManager::self();
+    const auto oldCount = desktops->count();
+    const auto restore = qScopeGuard([desktops, oldCount]() {
+        desktops->setCount(oldCount);
+    });
+    desktops->setCount(oldCount + 1);
+    auto output = workspace()->outputs().first();
+    auto current = desktops->currentDesktop(output);
+    auto removed = desktops->desktops().last();
+    QVERIFY(removed != current);
+    TileManager manager(output);
+    TransientTileController first;
+    TransientTileController replacement;
+    QCOMPARE(first.createTree(&manager, removed, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QPointer<Tile> root(first.rootTile());
+    connect(root, &QObject::destroyed, &replacement, [&]() {
+        QVERIFY(replacement.createTree(&manager, removed, RectF(0, 0, 0.5, 1)) != Result::Accepted);
+    });
+    desktops->setCount(oldCount);
+    QVERIFY(!root);
+    QVERIFY(!first.rootTile());
+    QCOMPARE(replacement.createTree(&manager, current, RectF(0, 0, 0.5, 1)), Result::Accepted);
+}
+
+void TestXdgShellWindow::testTransientRegistryForgetReentry_data()
+{
+    QTest::addColumn<int>("cause");
+    QTest::newRow("manager-deleted") << 0;
+    QTest::newRow("window-closed") << 1;
+    QTest::newRow("later-desktop-deleted") << 2;
+}
+
+void TestXdgShellWindow::testTransientRegistryForgetReentry()
+{
+    QFETCH(int, cause);
+    using Result = TransientTileController::Result;
+    auto desktops = VirtualDesktopManager::self();
+    auto output = workspace()->outputs().first();
+    const auto oldCount = desktops->count();
+    const QPointer<VirtualDesktop> oldCurrent(desktops->currentDesktop(output));
+    const auto restore = qScopeGuard([desktops, output, oldCount, oldCurrent]() {
+        desktops->setCount(oldCount);
+        if (oldCurrent) {
+            desktops->setCurrent(oldCurrent, output);
+        }
+    });
+    desktops->setCount(oldCount + 1);
+    desktops->setCurrent(desktops->desktops().first(), output);
+    QPointer<VirtualDesktop> lastDesktop(desktops->desktops().last());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.registry"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto manager = std::make_unique<TileManager>(window->moveResizeOutput());
+    auto desktop = desktops->currentDesktop(window->moveResizeOutput());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.registry");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager.get(), desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QPointer<Window> guard(window);
+    bool called = false;
+    QObject callbackContext;
+    connect(controller.tile(), &Tile::windowRemoved, &callbackContext, [&]() {
+        called = true;
+        if (cause == 0) {
+            manager.reset();
+        } else if (cause == 1) {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        } else {
+            desktops->setCount(oldCount);
+            QVERIFY(!desktops->desktops().contains(lastDesktop));
+            QCoreApplication::sendPostedEvents(lastDesktop, QEvent::DeferredDelete);
+            QVERIFY(!lastDesktop);
+        }
+        QVERIFY(guard);
+    });
+    manager->forgetWindow(window, nullptr);
+    QVERIFY(called);
+    if (cause == 0) {
+        QVERIFY(!manager);
+        QVERIFY(!controller.rootTile());
+    }
+    if (cause == 1) {
+        QVERIFY(!guard);
+        QVERIFY(!writer.isReserved(id));
+    } else {
+        if (cause == 2) {
+            QVERIFY(!lastDesktop);
+        }
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(writer.isReserved(id));
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QTRY_VERIFY(!guard);
+        QVERIFY(!writer.isReserved(id));
+    }
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)
