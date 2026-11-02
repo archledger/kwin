@@ -4,6 +4,13 @@ add_subdirectory(effect)
 add_subdirectory(integration)
 add_subdirectory(libinput)
 add_subdirectory(wayland)
+
+add_executable(testTransientPlacementWriter test_transientplacementwriter.cpp ../src/tiles/transientplacementwriter.cpp)
+target_include_directories(testTransientPlacementWriter PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(testTransientPlacementWriter Qt::Core Qt::Test KF6::ConfigCore)
+add_test(NAME kwin-testTransientPlacementWriter COMMAND testTransientPlacementWriter)
+set_tests_properties(kwin-testTransientPlacementWriter PROPERTIES TIMEOUT 30)
+ecm_mark_as_test(testTransientPlacementWriter)
 # drm autotests are broken on FreeBSD for yet unknown reasons
 # As the test isn't doing anything platform specific, only run it on Linux
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
