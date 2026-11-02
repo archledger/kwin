@@ -3592,6 +3592,11 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, Transient
     if (request) {
         request->m_geometryGeneration = generation;
         request->m_progress = TransientRequestProgress::Requested;
+        if (m_transientOwnership && m_transientOwnership->generation == request->m_ownerGeneration
+            && m_transientOwnership->nativeSequence == request->m_sequence) {
+            // Teardown callbacks must see this before any automatic geometry can be observed.
+            m_transientOwnership->progress = TransientRequestProgress::Requested;
+        }
     }
     setMoveResizeGeometry(rect);
     if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
@@ -4034,6 +4039,185 @@ void Window::cancelTransientRequest()
     if (m_activeTransientRequest) {
         m_activeTransientRequest->m_cancelled = true;
     }
+    if (m_transientOwnership) {
+        revokeTransientOwnership(m_transientOwnership->generation);
+    }
+}
+
+Window::TransientOwnership::TransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, quint64 providerRevision,
+                                               quint64 generation, std::unique_ptr<TransientTileRequest> request)
+    : writer(writer)
+    , provider(provider)
+    , providerRevision(providerRevision)
+    , generation(generation)
+    , floating(request->m_floating)
+    , target(request->m_target)
+    , tile(request->m_tile)
+    , manager(request->m_manager)
+    , output(request->m_output)
+    , desktop(request->m_desktop)
+    , initialGeometryGeneration(request->m_initialGeometryGeneration)
+    , request(std::move(request))
+{
+}
+
+quint64 Window::prepareTransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, const QString &key,
+                                          quint64 providerRevision, quint64 mapRevision, std::unique_ptr<TransientTileRequest> request)
+{
+    if (isDeleted() || m_transientOwnership || m_activeTransientRequest || !writer || !request
+        || request->m_window != this || !writer->isProviderCurrent(provider, providerRevision)
+        || !transientRequestTargetIsCurrent(*request) || !request->authorityIsCurrent()
+        || !canStartTransientTileRequest(request->m_target)
+        || m_geometryRequestGeneration != request->m_initialGeometryGeneration
+        || !exactFrameGeometry(frameGeometry(), request->m_floating)
+        || !exactFrameGeometry(moveResizeGeometry(), request->m_floating)) {
+        return 0;
+    }
+    const auto previous = std::max(m_transientOwnershipGeneration, m_lastTransientOwnershipGeneration);
+    if (previous == std::numeric_limits<quint64>::max()) {
+        return 0;
+    }
+    const auto generation = m_transientOwnershipGeneration = previous + 1;
+    request->m_ownerGeneration = generation;
+    request->m_sequence = 0;
+    auto ownership = std::make_unique<TransientOwnership>(writer, provider, providerRevision, generation, std::move(request));
+    const auto result = writer->reserve(provider, {internalId(), QString::number(generation), ownership->floating, providerRevision, mapRevision, key});
+    if (result != TransientPlacementWriter::Result::Accepted) {
+        return 0;
+    }
+    // QObject::destroyed runs after Window's fields have gone: capture no Window state here.
+    ownership->closeCleanup = connect(this, &QObject::destroyed, writer, [writer, id = internalId()]() {
+        if (!writer->forgetWindow(id)) {
+            qCWarning(KWIN_CORE) << "Failed to remove transient placement tracking for" << id;
+        }
+    });
+    m_transientOwnership = std::move(ownership);
+    return generation;
+}
+
+bool Window::activateTransientOwnership(quint64 generation)
+{
+    if (isDeleted() || !m_transientOwnership || m_transientOwnership->generation != generation
+        || m_transientOwnership->phase != TransientOwnershipPhase::Prepared) {
+        return false;
+    }
+    auto &ownership = *m_transientOwnership;
+    const auto &request = *ownership.request;
+    if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+        || !transientRequestTargetIsCurrent(request) || !request.authorityIsCurrent()
+        || !canStartTransientTileRequest(request.m_target)
+        || m_geometryRequestGeneration != request.m_initialGeometryGeneration
+        || !exactFrameGeometry(frameGeometry(), ownership.floating)
+        || !exactFrameGeometry(moveResizeGeometry(), ownership.floating)
+        || generation <= m_lastTransientOwnershipGeneration
+        || m_transientRequestSequence == std::numeric_limits<quint64>::max()
+        || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
+        return false;
+    }
+    if (ownership.writer->activateReservation(ownership.provider, internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+        return false;
+    }
+    // Seal the pre-request attempt before membership can emit its first notification.
+    ownership.nativeSequence = ++m_transientRequestSequence;
+    ownership.request->m_sequence = ownership.nativeSequence;
+    m_lastTransientOwnershipGeneration = generation;
+    ownership.phase = TransientOwnershipPhase::Owned;
+    return true;
+}
+
+Window::TransientRequestReceipt Window::applyTransientOwnership(quint64 generation)
+{
+    if (isDeleted() || !m_transientOwnership || m_transientOwnership->generation != generation
+        || m_transientOwnership->phase != TransientOwnershipPhase::Owned || m_transientOwnership->executing
+        || !m_transientOwnership->request) {
+        return {};
+    }
+    if (!m_transientOwnership->writer
+        || !m_transientOwnership->writer->isProviderCurrent(m_transientOwnership->provider, m_transientOwnership->providerRevision)
+        || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(generation))) {
+        revokeTransientOwnership(generation);
+        return {};
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    m_transientOwnership->executing = true;
+    const auto receipt = requestTransientTile(std::move(m_transientOwnership->request));
+    // Revocation during the call retains the record until its authoritative progress returns.
+    m_transientOwnership->executing = false;
+    m_transientOwnership->progress = receipt.progress;
+    if (receipt.outcome != TransientRequestOutcome::Applied || m_transientOwnership->phase != TransientOwnershipPhase::Owned) {
+        revokeTransientOwnership(generation);
+    }
+    return receipt;
+}
+
+bool Window::revokeTransientOwnership(quint64 generation)
+{
+    if (isDeleted() || !m_transientOwnership || m_transientOwnership->generation != generation) {
+        return false;
+    }
+    auto &ownership = *m_transientOwnership;
+    if (ownership.phase == TransientOwnershipPhase::Prepared) {
+        if (!ownership.writer || ownership.writer->cancelReservation(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+            return false;
+        }
+    } else {
+        // Stop old continuations before manual/removal observers are permitted to run.
+        ownership.phase = TransientOwnershipPhase::Restoring;
+        if (m_activeTransientRequest) {
+            m_activeTransientRequest->m_cancelled = true;
+        }
+        if (!ownership.writer || ownership.writer->beginRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted
+            || ownership.executing || ownership.progress != TransientRequestProgress::NoRequest) {
+            return false;
+        }
+        if (!ownership.noRequestProof && ownership.request) {
+            ownership.noRequestProof = makeTransientNoRequestProof(*ownership.request);
+        }
+        if (ownership.writer->finalizeNoRequest(ownership.noRequestProof) != TransientPlacementWriter::Result::Accepted) {
+            return false;
+        }
+    }
+    disconnect(ownership.closeCleanup);
+    m_transientOwnership.reset();
+    return true;
+}
+
+std::shared_ptr<const TransientNoRequestProof> Window::makeTransientNoRequestProof(const TransientTileRequest &request)
+{
+    if (request.m_window != this || request.m_windowId != internalId() || !request.m_sequence
+        || !request.m_ownerGeneration || request.m_progress != TransientRequestProgress::NoRequest) {
+        return {};
+    }
+    if (m_transientOwnership) {
+        if (m_transientOwnership->generation != request.m_ownerGeneration
+            || m_transientOwnership->nativeSequence != request.m_sequence
+            || m_transientOwnership->progress != TransientRequestProgress::NoRequest) {
+            return {};
+        }
+        if (m_transientOwnership->noRequestProof) {
+            return m_transientOwnership->noRequestProof;
+        }
+    }
+    const QPointer<Window> window(this);
+    const auto sequence = request.m_sequence;
+    auto proof = std::shared_ptr<const TransientNoRequestProof>(new TransientNoRequestProof(
+        request.m_windowId, request.m_ownerGeneration, sequence, [window, sequence]() {
+        if (!window || window->isDeleted()) {
+            return TransientNoRequestProof::Validity::Closing;
+        }
+        if (window->m_transientRequestSequence != sequence) {
+            return TransientNoRequestProof::Validity::Superseded;
+        }
+        return TransientNoRequestProof::Validity::Current;
+    }));
+    if (m_transientOwnership) {
+        // Internal finalization and returned receipts share this attempt's single consumed bit.
+        m_transientOwnership->noRequestProof = proof;
+    }
+    return proof;
 }
 
 bool Window::canStartTransientTileRequest(const RectF &target) const
@@ -4064,6 +4248,13 @@ bool Window::transientRequestTargetIsCurrent(const TransientTileRequest &request
 
 bool Window::transientRequestIsCurrent(const TransientTileRequest &request) const
 {
+    if (m_transientOwnership
+        && (m_transientOwnership->generation != request.m_ownerGeneration
+            || m_transientOwnership->phase != TransientOwnershipPhase::Owned || !m_transientOwnership->writer
+            || !m_transientOwnership->writer->isProviderCurrent(m_transientOwnership->provider, m_transientOwnership->providerRevision)
+            || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(request.m_ownerGeneration)))) {
+        return false;
+    }
     if (isDeleted() || m_activeTransientRequest != &request || request.m_cancelled
         || request.m_sequence != m_transientRequestSequence || !transientRequestTargetIsCurrent(request)
         || !request.authorityIsCurrent()) {
@@ -4101,25 +4292,18 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     const auto receipt = [&](TransientRequestOutcome outcome) {
         std::shared_ptr<const TransientNoRequestProof> proof;
         if (request->m_sequence && request->m_progress == TransientRequestProgress::NoRequest && outcome != TransientRequestOutcome::Applied) {
-            const QPointer<Window> window(this);
-            const auto sequence = request->m_sequence;
-            proof = std::shared_ptr<const TransientNoRequestProof>(new TransientNoRequestProof(
-                request->m_windowId, request->m_ownerGeneration, sequence, [window, sequence]() {
-                if (!window || window->isDeleted()) {
-                    return TransientNoRequestProof::Validity::Closing;
-                }
-                if (window->m_transientRequestSequence != sequence) {
-                    return TransientNoRequestProof::Validity::Superseded;
-                }
-                return TransientNoRequestProof::Validity::Current;
-            }));
+            proof = makeTransientNoRequestProof(*request);
         }
         return TransientRequestReceipt{outcome, request->m_progress, request->m_ownerGeneration,
                                        request->m_sequence, request->m_windowId, std::move(proof)};
     };
+    const bool prepared = m_transientOwnership && m_transientOwnership->executing
+        && m_transientOwnership->generation == request->m_ownerGeneration
+        && m_transientOwnership->nativeSequence == request->m_sequence;
     if (isDeleted() || m_activeTransientRequest || request->m_window != this || !request->m_ownerGeneration
-        || request->m_ownerGeneration <= m_lastTransientOwnershipGeneration
-        || m_transientRequestSequence == std::numeric_limits<quint64>::max()
+        || (m_transientOwnership && !prepared)
+        || (!prepared && (request->m_ownerGeneration <= m_lastTransientOwnershipGeneration || m_transientRequestSequence == std::numeric_limits<quint64>::max()))
+        || (prepared && (request->m_sequence != m_transientRequestSequence || m_transientOwnership->phase != TransientOwnershipPhase::Owned))
         || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
         return receipt(TransientRequestOutcome::Rejected);
     }
@@ -4128,8 +4312,10 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         unref();
     });
     // Consume ownership identity before preflight: rejection must not erase earlier Requested history.
-    m_lastTransientOwnershipGeneration = request->m_ownerGeneration;
-    request->m_sequence = ++m_transientRequestSequence;
+    if (!prepared) {
+        m_lastTransientOwnershipGeneration = request->m_ownerGeneration;
+        request->m_sequence = ++m_transientRequestSequence;
+    }
     if (!transientRequestTargetIsCurrent(*request) || !request->authorityIsCurrent()
         || !canStartTransientTileRequest(request->m_target)
         || m_geometryRequestGeneration != request->m_initialGeometryGeneration
