@@ -30,6 +30,7 @@
 #include "screenedge.h"
 #include "shadow.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transientplacementwriter.h"
 #include "useractions.h"
 #include "virtualdesktops.h"
 #include "wayland/output.h"
@@ -4098,10 +4099,26 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         return {};
     }
     const auto receipt = [&](TransientRequestOutcome outcome) {
+        std::shared_ptr<const TransientNoRequestProof> proof;
+        if (request->m_sequence && request->m_progress == TransientRequestProgress::NoRequest && outcome != TransientRequestOutcome::Applied) {
+            const QPointer<Window> window(this);
+            const auto sequence = request->m_sequence;
+            proof = std::shared_ptr<const TransientNoRequestProof>(new TransientNoRequestProof(
+                request->m_windowId, request->m_ownerGeneration, sequence, [window, sequence]() {
+                if (!window || window->isDeleted()) {
+                    return TransientNoRequestProof::Validity::Closing;
+                }
+                if (window->m_transientRequestSequence != sequence) {
+                    return TransientNoRequestProof::Validity::Superseded;
+                }
+                return TransientNoRequestProof::Validity::Current;
+            }));
+        }
         return TransientRequestReceipt{outcome, request->m_progress, request->m_ownerGeneration,
-                                       request->m_sequence, request->m_windowId};
+                                       request->m_sequence, request->m_windowId, std::move(proof)};
     };
     if (isDeleted() || m_activeTransientRequest || request->m_window != this || !request->m_ownerGeneration
+        || request->m_ownerGeneration <= m_lastTransientOwnershipGeneration
         || m_transientRequestSequence == std::numeric_limits<quint64>::max()
         || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
         return receipt(TransientRequestOutcome::Rejected);
@@ -4110,6 +4127,9 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
+    // Consume ownership identity before preflight: rejection must not erase earlier Requested history.
+    m_lastTransientOwnershipGeneration = request->m_ownerGeneration;
+    request->m_sequence = ++m_transientRequestSequence;
     if (!transientRequestTargetIsCurrent(*request) || !request->authorityIsCurrent()
         || !canStartTransientTileRequest(request->m_target)
         || m_geometryRequestGeneration != request->m_initialGeometryGeneration
@@ -4117,7 +4137,6 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         || !exactFrameGeometry(moveResizeGeometry(), request->m_floating)) {
         return receipt(TransientRequestOutcome::Rejected);
     }
-    request->m_sequence = ++m_transientRequestSequence;
     m_activeTransientRequest = request.get();
     bool applied = false;
     const auto finish = qScopeGuard([&]() {
