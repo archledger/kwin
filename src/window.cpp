@@ -64,6 +64,11 @@ namespace
 // Keep the same-version backport ABI-compatible with consumers built against stock headers.
 QHash<const Window *, RectF> s_notifiedRequestedGeometry;
 
+bool exactFrameGeometry(const RectF &left, const RectF &right)
+{
+    return left.x() == right.x() && left.y() == right.y() && left.width() == right.width() && left.height() == right.height();
+}
+
 }
 
 QHash<QString, std::weak_ptr<Decoration::DecorationPalette>> Window::s_palettes;
@@ -3478,8 +3483,13 @@ void Window::geometryResizeSubmitted(quint64 generation)
     }
 }
 
-void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
+void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, TransientTileRequest *request)
 {
+    if (!request) {
+        cancelTransientRequest();
+    } else if (m_activeTransientRequest != request || !transientRequestIsCurrent(*request)) {
+        return;
+    }
     if (isDeleted() || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
         return;
     }
@@ -3499,12 +3509,16 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
             m_geometryResizePending = false;
         }
     });
+    if (request) {
+        request->m_geometryGeneration = generation;
+        request->m_progress = TransientRequestProgress::Requested;
+    }
     setMoveResizeGeometry(rect);
-    if (!geometryRequestIsCurrent(generation)) {
+    if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
         return;
     }
     moveResizeInternal(rect, mode);
-    if (geometryRequestIsCurrent(generation)) {
+    if (geometryRequestIsCurrent(generation) && transientGeometryRequestIsCurrent(generation)) {
         notifyRequestedGeometryChanged();
     }
 }
@@ -3766,6 +3780,7 @@ void Window::setQuickTileModeAtCurrentPosition(QuickTileMode mode)
 
 void Window::setQuickTileMode(QuickTileMode mode, const QPointF &tileAtPoint)
 {
+    cancelTransientRequest();
     workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
 
     // sanitize the mode, ie. simplify "invalid" combinations
@@ -3839,6 +3854,10 @@ Tile *Window::requestedTile() const
 
 void Window::requestTile(Tile *tile)
 {
+    if (tile && tile->isTransient()) {
+        return;
+    }
+    cancelTransientRequest();
     if (isDeleted()) {
         return;
     }
@@ -3881,6 +3900,7 @@ void Window::requestTile(Tile *tile)
 
 void Window::forgetTile(Tile *tile)
 {
+    cancelTransientRequest();
     if (m_requestedTile != tile) {
         return;
     }
@@ -3894,6 +3914,11 @@ void Window::setTileCompatibility(Tile *tile)
 {
     qCWarning(KWIN_CORE) << "Writing to the property window.tile is deprecated: use tile.manage() instead";
 
+    if (tile && tile->isTransient()) {
+        return;
+    }
+    cancelTransientRequest();
+
     if (m_requestedTile == tile) {
         return;
     }
@@ -3906,6 +3931,151 @@ void Window::setTileCompatibility(Tile *tile)
     if (previousTile) {
         previousTile->unmanage(this);
     }
+}
+
+Window::TransientTileRequest::TransientTileRequest(Window *window, Tile *tile, quint64 ownershipGeneration)
+    : m_window(window)
+    , m_tile(tile)
+    , m_manager(tile ? tile->manager() : nullptr)
+    , m_output(m_manager ? m_manager->output() : nullptr)
+    , m_desktop(tile ? tile->desktop() : nullptr)
+    , m_floating(window ? window->moveResizeGeometry() : RectF())
+    , m_windowId(window ? window->internalId() : QUuid())
+    , m_ownerGeneration(ownershipGeneration)
+    , m_initialGeometryGeneration(window ? window->geometryRequestGeneration() : 0)
+{
+    if (m_tile && m_manager && m_output && m_desktop) {
+        m_target = m_tile->windowGeometry();
+    }
+}
+
+void Window::cancelTransientRequest()
+{
+    if (m_activeTransientRequest) {
+        m_activeTransientRequest->m_cancelled = true;
+    }
+}
+
+bool Window::canStartTransientTileRequest(const RectF &target) const
+{
+    return false;
+}
+
+bool Window::isTransientTileTargetFeasible(const RectF &target) const
+{
+    return false;
+}
+
+bool Window::transientRequestTargetIsCurrent(const TransientTileRequest &request) const
+{
+    if (request.m_window != this || !request.m_tile || !request.m_manager || !request.m_output || !request.m_desktop
+        || !request.m_tile->isTransient() || request.m_tile->manager() != request.m_manager
+        || request.m_manager->tearingDown() || request.m_manager->output() != request.m_output
+        || request.m_tile->desktop() != request.m_desktop
+        || !workspace()->outputs().contains(request.m_output)
+        || !VirtualDesktopManager::self()->desktops().contains(request.m_desktop)
+        || moveResizeOutput() != request.m_output || !request.m_tile->isActive() || !isOnDesktop(request.m_desktop)) {
+        return false;
+    }
+    return exactFrameGeometry(request.m_target, request.m_tile->windowGeometry())
+        && request.m_output->geometryF().contains(request.m_target)
+        && isTransientTileTargetFeasible(request.m_target);
+}
+
+bool Window::transientRequestIsCurrent(const TransientTileRequest &request) const
+{
+    if (isDeleted() || m_activeTransientRequest != &request || request.m_cancelled
+        || request.m_sequence != m_transientRequestSequence || !transientRequestTargetIsCurrent(request)
+        || !request.authorityIsCurrent()) {
+        return false;
+    }
+    if (request.m_associationInstalled) {
+        if (m_requestedTile != request.m_tile || (m_tile && m_tile != request.m_tile)) {
+            return false;
+        }
+    } else if (m_requestedTile || m_tile) {
+        return false;
+    }
+    if (request.m_progress == TransientRequestProgress::NoRequest) {
+        return m_geometryRequestGeneration == request.m_initialGeometryGeneration
+            && exactFrameGeometry(moveResizeGeometry(), request.m_floating)
+            && exactFrameGeometry(frameGeometry(), request.m_floating);
+    }
+    return m_geometryRequestGeneration == request.m_geometryGeneration
+        && exactFrameGeometry(moveResizeGeometry(), request.m_target);
+}
+
+bool Window::transientGeometryRequestIsCurrent(quint64 generation) const
+{
+    if (!m_activeTransientRequest || m_activeTransientRequest->m_geometryGeneration != generation) {
+        return true;
+    }
+    return transientRequestIsCurrent(*m_activeTransientRequest);
+}
+
+Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<TransientTileRequest> request)
+{
+    if (!request) {
+        return {};
+    }
+    const auto receipt = [&](TransientRequestOutcome outcome) {
+        return TransientRequestReceipt{outcome, request->m_progress, request->m_ownerGeneration,
+                                       request->m_sequence, request->m_windowId};
+    };
+    if (isDeleted() || m_activeTransientRequest || request->m_window != this || !request->m_ownerGeneration
+        || m_transientRequestSequence == std::numeric_limits<quint64>::max()
+        || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
+        return receipt(TransientRequestOutcome::Rejected);
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    if (!transientRequestTargetIsCurrent(*request) || !request->authorityIsCurrent()
+        || !canStartTransientTileRequest(request->m_target)
+        || m_geometryRequestGeneration != request->m_initialGeometryGeneration
+        || !exactFrameGeometry(frameGeometry(), request->m_floating)
+        || !exactFrameGeometry(moveResizeGeometry(), request->m_floating)) {
+        return receipt(TransientRequestOutcome::Rejected);
+    }
+    request->m_sequence = ++m_transientRequestSequence;
+    m_activeTransientRequest = request.get();
+    bool applied = false;
+    const auto finish = qScopeGuard([&]() {
+        // Remove only this attempt's association. Newer native placement and geometry win.
+        if (!applied && request->m_associationInstalled && request->m_tile && m_requestedTile == request->m_tile) {
+            m_requestedTile = nullptr;
+            if (!isDeleted()) {
+                doSetQuickTileMode();
+                if (!isDeleted()) {
+                    Q_EMIT requestedTileChanged();
+                }
+            }
+        }
+        if (m_activeTransientRequest == request.get()) {
+            m_activeTransientRequest = nullptr;
+        }
+    });
+    setGeometryRestore(request->m_floating);
+    if (!transientRequestIsCurrent(*request) || !canStartTransientTileRequest(request->m_target)) {
+        return receipt(TransientRequestOutcome::Superseded);
+    }
+    m_requestedTile = request->m_tile;
+    request->m_associationInstalled = true;
+    performMoveResize(request->m_target, MoveResizeMode::MoveResize, request.get());
+    if (!transientRequestIsCurrent(*request)) {
+        return receipt(TransientRequestOutcome::Superseded);
+    }
+    doSetQuickTileMode();
+    if (!transientRequestIsCurrent(*request)) {
+        return receipt(TransientRequestOutcome::Superseded);
+    }
+    Q_EMIT requestedTileChanged();
+    if (!transientRequestIsCurrent(*request)) {
+        return receipt(TransientRequestOutcome::Superseded);
+    }
+    applied = true;
+    return receipt(TransientRequestOutcome::Applied);
 }
 
 void Window::doSetQuickTileMode()

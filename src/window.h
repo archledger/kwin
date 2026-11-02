@@ -37,6 +37,7 @@
 #endif
 
 class QMouseEvent;
+class TestXdgShellWindow;
 
 namespace KDecoration3
 {
@@ -59,6 +60,8 @@ class Shadow;
 class SurfaceItem;
 class VirtualDesktop;
 class WindowItem;
+class TileManager;
+class TransientTileController;
 
 namespace Decoration
 {
@@ -1564,6 +1567,63 @@ Q_SIGNALS:
     void excludeFromCaptureChanged();
     void decorationPolicyChanged();
 
+private:
+    friend class TransientTileController;
+    friend class ::TestXdgShellWindow;
+
+    enum class TransientRequestOutcome {
+        Rejected,
+        Superseded,
+        Applied,
+    };
+    enum class TransientRequestProgress {
+        NoRequest,
+        Requested,
+    };
+    struct TransientRequestReceipt
+    {
+        TransientRequestOutcome outcome = TransientRequestOutcome::Rejected;
+        TransientRequestProgress progress = TransientRequestProgress::NoRequest;
+        quint64 ownershipGeneration = 0;
+        // Identifies this private attempt, not a geometry generation or Wayland serial.
+        quint64 nativeSequence = 0;
+        QUuid windowId;
+    };
+    class TransientTileRequest
+    {
+    public:
+        virtual ~TransientTileRequest() = default;
+
+    protected:
+        TransientTileRequest(Window *window, Tile *tile, quint64 ownershipGeneration);
+        // Read-only: validate published controller identity and full window context/membership.
+        virtual bool authorityIsCurrent() const = 0;
+
+    private:
+        friend class Window;
+        Q_DISABLE_COPY_MOVE(TransientTileRequest)
+        QPointer<Window> m_window;
+        QPointer<Tile> m_tile;
+        QPointer<TileManager> m_manager;
+        QPointer<LogicalOutput> m_output;
+        QPointer<VirtualDesktop> m_desktop;
+        RectF m_target;
+        RectF m_floating;
+        QUuid m_windowId;
+        quint64 m_ownerGeneration;
+        quint64 m_initialGeometryGeneration = 0;
+        quint64 m_geometryGeneration = 0;
+        quint64 m_sequence = 0;
+        TransientRequestProgress m_progress = TransientRequestProgress::NoRequest;
+        bool m_cancelled = false;
+        bool m_associationInstalled = false;
+    };
+
+    TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request);
+    bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
+    bool transientRequestIsCurrent(const TransientTileRequest &request) const;
+    void cancelTransientRequest();
+
 protected:
     Window();
 
@@ -1681,9 +1741,12 @@ protected:
         MoveResize = Move | Resize,
     };
     virtual void moveResizeInternal(const RectF &rect, MoveResizeMode mode) = 0;
-    void performMoveResize(const RectF &rect, MoveResizeMode mode);
+    void performMoveResize(const RectF &rect, MoveResizeMode mode, TransientTileRequest *request = nullptr);
     bool geometryRequestIsCurrent(quint64 generation) const;
     void geometryResizeSubmitted(quint64 generation);
+    bool transientGeometryRequestIsCurrent(quint64 generation) const;
+    virtual bool canStartTransientTileRequest(const RectF &target) const;
+    virtual bool isTransientTileTargetFeasible(const RectF &target) const;
 
     /**
      * @returns whether the Window is currently in move resize mode
@@ -1939,6 +2002,8 @@ protected:
     quint64 m_geometryRequestGeneration = 0;
     bool m_geometryResizePending = false;
     bool m_outputPropertiesPending = false;
+    TransientTileRequest *m_activeTransientRequest = nullptr;
+    quint64 m_transientRequestSequence = 0;
     RectF m_keyboardGeometryRestore;
     RectF m_maximizeGeometryRestore;
     RectF m_fullscreenGeometryRestore;
