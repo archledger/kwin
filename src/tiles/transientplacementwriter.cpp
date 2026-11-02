@@ -342,6 +342,45 @@ TransientPlacementWriter::Result TransientPlacementWriter::cancelReservation(con
     return Result::Accepted;
 }
 
+TransientPlacementWriter::Result TransientPlacementWriter::finalizeNoRequest(const std::shared_ptr<const TransientNoRequestProof> &proof)
+{
+    if (m_busy) {
+        return Result::Busy;
+    }
+    if (!proof || proof->m_consumed || proof->m_window.isNull() || !proof->m_generation || !proof->m_sequence || !proof->m_validity) {
+        return Result::InvalidRecord;
+    }
+    const auto tracked = m_windows.constFind(proof->m_window);
+    if (tracked == m_windows.cend()) {
+        return Result::UnknownWindow;
+    }
+    auto reservation = m_reservations.find(tracked->key);
+    if (reservation == m_reservations.end() || reservation->owner != proof->m_window
+        || reservation->generation != QString::number(proof->m_generation)) {
+        return Result::StaleGeneration;
+    }
+    if (reservation->phase == Phase::Prepared) {
+        return Result::Busy;
+    }
+    QScopedValueRollback<bool> transaction(m_busy, true);
+    switch (proof->m_validity()) {
+    case TransientNoRequestProof::Validity::Closing:
+        return Result::Busy;
+    case TransientNoRequestProof::Validity::Superseded:
+        return Result::StaleGeneration;
+    case TransientNoRequestProof::Validity::Current:
+        break;
+    }
+    // This path has no restoration event. Preserve later native intent without installing a watermark.
+    const auto deferred = reservation->deferred;
+    if (deferred && !applyRecord(tracked->key, deferred->frame, deferred->eventSequence)) {
+        return Result::InvalidRecord;
+    }
+    proof->m_consumed = true;
+    m_reservations.erase(reservation);
+    return Result::Accepted;
+}
+
 bool TransientPlacementWriter::ownsReservation(const QUuid &window, const QString &generation) const
 {
     const auto tracked = m_windows.constFind(window);

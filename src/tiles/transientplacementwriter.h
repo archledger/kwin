@@ -124,6 +124,7 @@ public:
     Result reserve(const QUuid &provider, const ReservationRequest &request);
     Result activateReservation(const QUuid &provider, const QUuid &window, const QString &generation);
     Result cancelReservation(const QUuid &window, const QString &generation);
+    Result finalizeNoRequest(const std::shared_ptr<const TransientNoRequestProof> &proof);
     bool ownsReservation(const QUuid &window, const QString &generation) const;
     Result beginRestore(const QUuid &window, const QString &generation);
     Result completeRestore(const QUuid &window, const QString &generation, quint64 eventSequence);
