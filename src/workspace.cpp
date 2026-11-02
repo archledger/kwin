@@ -55,6 +55,7 @@
 #include "scene/workspacescene.h"
 #include "tabletmodemanager.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transienttilecontroller.h"
 #include "useractions.h"
 #include "utils/envvar.h"
 #include "utils/kernel.h"
@@ -145,6 +146,7 @@ Workspace::Workspace()
     // and prior to TabBox, due to TabBox connecting to signals
     // actual initialization happens in init()
     VirtualDesktopManager::create(this);
+    m_transientTileController = std::make_unique<TransientTileController>();
     // dbus interface
     new VirtualDesktopManagerDBusInterface(VirtualDesktopManager::self());
 
@@ -493,6 +495,13 @@ void Workspace::cleanupX11()
 
 Workspace::~Workspace()
 {
+    // Close transient registration before any shutdown callback can run, including the scripts' teardown.
+    m_shuttingDown = true;
+    for (const auto &[output, manager] : m_tileManagers) {
+        if (manager) {
+            manager->closeTransientRegistration();
+        }
+    }
     m_scripting.reset();
 
     blockStackingUpdates(true);
@@ -508,6 +517,7 @@ Workspace::~Workspace()
     while (!m_windows.isEmpty()) {
         m_windows[0]->destroyWindow();
     }
+    m_transientTileController.reset();
 
     m_rulebook.reset();
     kwinApp()->config()->sync();
@@ -515,10 +525,14 @@ Workspace::~Workspace()
     m_placement.reset();
     delete m_windowKeysDialog;
 
+    const auto managers = std::exchange(m_tileManagers, {});
+    for (const auto &[output, manager] : managers) {
+        delete manager.data();
+    }
+
     if (m_placeholderOutput) {
         m_placeholderOutput->unref();
     }
-    m_tileManagers.clear();
 
     for (LogicalOutput *output : std::as_const(m_outputs)) {
         Q_EMIT outputRemoved(output);
@@ -1139,8 +1153,10 @@ void Workspace::updateWindowVisibilityAndActivateOnDesktopChange(VirtualDesktop 
 
         Tile *tile = nullptr;
         for (const auto &[tileOutput, manager] : m_tileManagers) {
-            if (Tile *candidate = manager->tileForWindow(window, newDesktop)) {
-                tile = candidate;
+            if (manager) {
+                if (Tile *candidate = manager->tileForWindow(window, newDesktop)) {
+                    tile = candidate;
+                }
             }
         }
 
@@ -1378,6 +1394,15 @@ static QString generateDescription(BackendOutput *output, const QList<BackendOut
 
 void Workspace::updateOutputs()
 {
+    if (m_shuttingDown) {
+        return;
+    }
+    // Repair a callback-deleted manager at a defined reconciliation boundary, not in getters.
+    for (LogicalOutput *output : std::as_const(m_outputs)) {
+        if (!tileManager(output)) {
+            m_tileManagers[output] = new TileManager(output);
+        }
+    }
     QHash<Window *, LogicalOutput *> oldMoveResizeOutputs;
     for (Window *window : m_windows) {
         if (window->isClient()) {
@@ -1461,7 +1486,7 @@ void Workspace::updateOutputs()
     const auto added = outputsSet - oldOutputsSet;
     for (LogicalOutput *output : added) {
         output->backendOutput()->ref();
-        m_tileManagers[output] = std::make_unique<TileManager>(output);
+        m_tileManagers[output] = new TileManager(output);
         Q_EMIT outputAdded(output);
         wakeUp |= !output->isPlaceholder() && !m_recentlyRemovedDpmsOffOutputs.contains(output->uuid());
     }
@@ -1472,18 +1497,26 @@ void Workspace::updateOutputs()
     for (LogicalOutput *output : removed) {
         Q_EMIT outputRemoved(output);
 
-        auto tileManager = std::move(m_tileManagers[output]);
+        const auto tileManager = m_tileManagers[output];
         m_tileManagers.erase(output);
+        const auto cleanup = qScopeGuard([tileManager]() {
+            delete tileManager.data();
+        });
 
         const auto desktops = VirtualDesktopManager::self()->desktops();
         for (VirtualDesktop *desktop : desktops) {
+            if (!tileManager) {
+                break;
+            }
             // Evacuate windows from the defunct custom tile tree.
-            tileManager->rootTile(desktop)->visitDescendants([](Tile *child) {
-                const QList<Window *> windows = child->windows();
-                for (Window *window : windows) {
-                    child->unmanage(window);
-                }
-            });
+            if (auto root = tileManager->rootTile(desktop)) {
+                root->visitDescendants([](Tile *child) {
+                    const QList<Window *> windows = child->windows();
+                    for (Window *window : windows) {
+                        child->unmanage(window);
+                    }
+                });
+            }
 
             // Migrate windows from the defunct quick tile to a quick tile tree on another output.
             static constexpr QuickTileMode quickTileModes[] = {
@@ -1498,6 +1531,9 @@ void Workspace::updateOutputs()
             };
 
             for (const QuickTileMode &quickTileMode : quickTileModes) {
+                if (!tileManager || !tileManager->quickRootTile(desktop)) {
+                    break;
+                }
                 Tile *quickTile = tileManager->quickRootTile(desktop)->tileForMode(quickTileMode);
                 const QList<Window *> windows = quickTile->windows();
                 if (windows.isEmpty()) {
@@ -1505,7 +1541,9 @@ void Workspace::updateOutputs()
                 }
 
                 LogicalOutput *bestOutput = outputAt(output->geometry().center());
-                Tile *bestTile = m_tileManagers[bestOutput]->quickRootTile(desktop)->tileForMode(quickTileMode);
+                const auto bestManager = this->tileManager(bestOutput);
+                const auto bestRoot = bestManager ? bestManager->quickRootTile(desktop) : nullptr;
+                Tile *bestTile = bestRoot ? bestRoot->tileForMode(quickTileMode) : nullptr;
 
                 if (bestTile) {
                     for (Window *window : windows) {
@@ -3153,7 +3191,7 @@ ScreenEdges *Workspace::screenEdges() const
 TileManager *Workspace::tileManager(LogicalOutput *output) const
 {
     if (auto search = m_tileManagers.find(output); search != m_tileManagers.end()) {
-        return search->second.get();
+        return search->second.data();
     } else {
         return nullptr;
     }
