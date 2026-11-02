@@ -94,6 +94,21 @@ public:
 private:
     friend class TransientTileController;
 
+    bool releaseTransientWindow(Window *window) override
+    {
+        const auto controller = m_controller;
+        if (!window || m_destroying || !controller || controller->m_shuttingDown
+            || controller->m_tile != this || controller->m_window != window
+            || !controller->m_membershipPublished || !m_windows.contains(window) || !controller->m_ownershipGeneration) {
+            return false;
+        }
+        const QPointer<TransientTile> guard(this);
+        const auto generation = controller->m_ownershipGeneration;
+        controller->releaseWindow(window, generation);
+        // Release reports removal even when native restoration or close cleanup is pending.
+        return !guard || !guard->m_windows.contains(window);
+    }
+
     bool addMember(Window *window)
     {
         if (m_destroying || !m_windows.isEmpty()) {
