@@ -141,6 +141,7 @@ public:
 
     VirtualDesktop *desktop() const;
     bool isActive() const;
+    bool isTransient() const;
 
     void setGeometryFromWindow(const RectF &geom);
     void setGeometryFromAbsolute(const RectF &geom);
@@ -260,6 +261,9 @@ public:
     template<class T>
     T *createChildAt(const RectF &relativeGeometry, int position)
     {
+        if (isTransient()) {
+            return nullptr;
+        }
         T *t = new T(m_tiling, static_cast<T *>(this));
         t->setRelativeGeometry(relativeGeometry);
         insertChild(position, t);
@@ -302,6 +306,14 @@ Q_SIGNALS:
     void childTileRemoved();
 
 protected:
+    enum class Type {
+        Native,
+        Transient,
+    };
+
+    // Transient tiles never use public layout or membership mutation paths.
+    Tile(TileManager *tiling, Tile *parentItem, Type type);
+
     void insertChild(int position, Tile *item);
     void removeChild(Tile *child);
 
@@ -318,6 +330,9 @@ protected:
     QSizeF m_minimumSize = QSizeF(0.15, 0.15);
     QuickTileMode m_quickTileMode = QuickTileFlag::None;
     qreal m_padding = 4.0;
+
+private:
+    const Type m_type;
 };
 
 } // namespace KWin

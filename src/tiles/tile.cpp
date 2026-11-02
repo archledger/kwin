@@ -22,9 +22,16 @@ namespace KWin
 {
 
 Tile::Tile(TileManager *tiling, Tile *parent)
+    : Tile(tiling, parent, Type::Native)
+{
+}
+
+Tile::Tile(TileManager *tiling, Tile *parent, Type type)
     : QObject(parent)
     , m_parentTile(parent)
     , m_tiling(tiling)
+    , m_quickTileMode(type == Type::Transient ? QuickTileFlag::Custom : QuickTileFlag::None)
+    , m_type(type)
 {
     if (m_parentTile) {
         m_padding = m_parentTile->padding();
@@ -43,6 +50,12 @@ Tile::~Tile()
     }
     if (m_parentTile) {
         m_parentTile->removeChild(this);
+    }
+
+    if (isTransient()) {
+        // The controller must detach members before destruction, never reassign them manually.
+        Q_ASSERT(m_windows.isEmpty());
+        return;
     }
 
     if (m_tiling->tearingDown()) {
@@ -77,9 +90,14 @@ bool Tile::isActive() const
     return m_desktop == VirtualDesktopManager::self()->currentDesktop(m_tiling->output());
 }
 
+bool Tile::isTransient() const
+{
+    return m_type == Type::Transient;
+}
+
 bool Tile::supportsResizeGravity(Gravity gravity)
 {
-    if (!m_parentTile) {
+    if (isTransient() || !m_parentTile) {
         return false;
     }
 
@@ -178,11 +196,17 @@ Gravity Tile::resolveResizeGravity(Gravity gravity)
 
 void Tile::setGeometryFromWindow(const RectF &geom)
 {
+    if (isTransient()) {
+        return;
+    }
     setGeometryFromAbsolute(geom + QMarginsF(m_padding, m_padding, m_padding, m_padding));
 }
 
 void Tile::setGeometryFromAbsolute(const RectF &geom)
 {
+    if (isTransient()) {
+        return;
+    }
     const RectF outGeom = m_tiling->output()->geometryF();
     const RectF relGeom((geom.x() - outGeom.x()) / outGeom.width(),
                         (geom.y() - outGeom.y()) / outGeom.height(),
@@ -194,6 +218,9 @@ void Tile::setGeometryFromAbsolute(const RectF &geom)
 
 void Tile::setRelativeGeometry(const RectF &geom)
 {
+    if (isTransient()) {
+        return;
+    }
     RectF constrainedGeom = geom;
     constrainedGeom.setWidth(std::max(constrainedGeom.width(), m_minimumSize.width()));
     constrainedGeom.setHeight(std::max(constrainedGeom.height(), m_minimumSize.height()));
@@ -294,7 +321,7 @@ bool Tile::isLayout() const
 bool Tile::canBeRemoved() const
 {
     // The root tile can *never* be removed
-    return m_parentTile;
+    return !isTransient() && m_parentTile;
 }
 
 qreal Tile::padding() const
@@ -305,6 +332,9 @@ qreal Tile::padding() const
 
 void Tile::setPadding(qreal padding)
 {
+    if (isTransient()) {
+        return;
+    }
     if (m_padding == padding) {
         return;
     }
@@ -332,6 +362,9 @@ QSizeF Tile::minimumSize() const
 
 void Tile::setMinimumSize(const QSizeF &size)
 {
+    if (isTransient()) {
+        return;
+    }
     QSizeF clampedSize = size;
     clampedSize.setWidth(std::clamp(size.width(), 0.0, 1.0));
     clampedSize.setHeight(std::clamp(size.height(), 0.0, 1.0));
@@ -353,6 +386,9 @@ QuickTileMode Tile::quickTileMode() const
 
 void Tile::setQuickTileMode(QuickTileMode mode)
 {
+    if (isTransient()) {
+        return;
+    }
     m_quickTileMode = mode;
 }
 
@@ -370,7 +406,7 @@ Tile *Tile::rootTile() const
 
 void Tile::resizeFromGravity(Gravity gravity, const QPointF &delta)
 {
-    if (!m_parentTile) {
+    if (isTransient() || !m_parentTile) {
         return;
     }
 
@@ -413,7 +449,7 @@ void Tile::resizeFromGravity(Gravity gravity, const QPointF &delta)
 
 void Tile::resizeByPixels(qreal delta, Qt::Edge edge)
 {
-    if (!m_parentTile) {
+    if (isTransient() || !m_parentTile) {
         return;
     }
 
@@ -447,6 +483,9 @@ void Tile::resizeByPixels(qreal delta, Qt::Edge edge)
 
 bool Tile::manage(Window *window)
 {
+    if (isTransient()) {
+        return false;
+    }
     if (!window->isResizable() || window->isAppletPopup()) {
         return false;
     }
@@ -497,6 +536,9 @@ bool Tile::manage(Window *window)
 
 bool Tile::unmanage(Window *window)
 {
+    if (isTransient()) {
+        return false;
+    }
     if (!remove(window)) {
         return false;
     }
@@ -509,6 +551,9 @@ bool Tile::unmanage(Window *window)
 
 void Tile::forget(Window *window)
 {
+    if (isTransient()) {
+        return;
+    }
     if (remove(window)) {
         window->forgetTile(this);
     }
@@ -567,6 +612,9 @@ void Tile::insertChild(int position, Tile *item)
 
 void Tile::destroyChild(Tile *tile)
 {
+    if (isTransient() || (tile && tile->isTransient())) {
+        return;
+    }
     removeChild(tile);
     delete tile;
 }
