@@ -18,8 +18,11 @@
 
 #include <QAbstractItemModel>
 #include <QObject>
+#include <QPointer>
+#include <QSet>
 
 #include <QJsonValue>
+#include <memory>
 
 class QTimer;
 
@@ -29,6 +32,9 @@ namespace KWin
 class LogicalOutput;
 class Tile;
 class TileModel;
+class TransientTile;
+class TransientTileController;
+class Workspace;
 
 /**
  * Custom tiling zones management per output.
@@ -60,6 +66,8 @@ public:
 
     Tile *tileForWindow(Window *window, VirtualDesktop *desktop);
     void forgetWindow(Window *window, VirtualDesktop *desktop);
+    // Native lifecycle boundary; not a scripting entry point.
+    void prepareForRemoval();
 
 Q_SIGNALS:
     void tileRemoved(KWin::Tile *tile);
@@ -67,6 +75,27 @@ Q_SIGNALS:
     void modelChanged(TileModel *model);
 
 private:
+    friend class TransientTile;
+    friend class TransientTileController;
+    friend class Workspace;
+
+    struct TransientRegistration
+    {
+        QPointer<Tile> root;
+        QPointer<TransientTileController> controller;
+        VirtualDesktop *desktop;
+        quint64 generation;
+        bool destroying = false;
+        bool draining = false;
+    };
+
+    bool canRegisterTransientRoot(VirtualDesktop *desktop) const;
+    std::shared_ptr<TransientRegistration> registerTransientRoot(Tile *root, TransientTileController *controller, quint64 generation);
+    bool unregisterTransientRoot(VirtualDesktop *desktop, Tile *root, TransientTileController *controller, quint64 generation);
+    void closeTransientRegistration();
+    void drainTransientRoots(VirtualDesktop *desktop = nullptr);
+    static void disposeTransientRoot(const std::shared_ptr<TransientRegistration> &registration);
+
     void readSettings(RootTile *rootTile);
     void saveSettings();
     QJsonObject tileToJSon(CustomTile *parentTile);
@@ -79,6 +108,10 @@ private:
 
     QHash<VirtualDesktop *, RootTile *> m_rootTiles;
     QHash<VirtualDesktop *, QuickRootTile *> m_quickRootTiles;
+    QHash<VirtualDesktop *, std::shared_ptr<TransientRegistration>> m_transientRoots;
+    QHash<Tile *, std::shared_ptr<TransientRegistration>> m_transientLifetime;
+    QSet<VirtualDesktop *> m_drainingDesktops;
+    bool m_transientRegistrationClosed = false;
 
     bool m_tearingDown = false;
     friend class CustomTile;
