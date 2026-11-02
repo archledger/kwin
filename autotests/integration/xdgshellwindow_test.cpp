@@ -58,6 +58,7 @@
 
 #include <linux/input.h>
 
+#include <array>
 #include <csignal>
 #include <cstdio>
 #include <functional>
@@ -375,6 +376,15 @@ private Q_SLOTS:
     void testOutputUpdatePlaceholderRoundTrip();
     void testOutputUpdateCallerLifetime();
     void testOutputUpdateCallerLifetime_data();
+    void testOutputRemovalDrain_data();
+    void testOutputRemovalDrain();
+    void testWorkspaceWindowContinuation_data();
+    void testWorkspaceWindowContinuation();
+    void testOutputRemovalBatch_data();
+    void testOutputRemovalBatch();
+    void testOutputRemovalPreservesNewerTile();
+    void testOutputRemovalMultiDesktop_data();
+    void testOutputRemovalMultiDesktop();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -7005,6 +7015,339 @@ void TestXdgShellWindow::testOutputUpdateCallerLifetime()
     QVERIFY(removed);
     QTRY_VERIFY(destroyed);
     QVERIFY(!disabled);
+}
+
+void TestXdgShellWindow::testOutputRemovalDrain_data()
+{
+    QTest::addColumn<int>("callback");
+    QTest::newRow("drain-before-notification") << 0;
+    QTest::newRow("manager-deleted-in-drain") << 1;
+    QTest::newRow("window-closed-in-drain") << 2;
+}
+
+void TestXdgShellWindow::testOutputRemovalDrain()
+{
+    QFETCH(int, callback);
+    QPointer<LogicalOutput> removed(workspace()->outputs().last());
+    workspace()->setActiveOutput(removed);
+    input()->pointer()->warp(removed->geometry().center());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.output-drain"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->moveResizeOutput(), removed.data());
+    QPointer<TileManager> manager(workspace()->tileManager(removed));
+    const auto desktop = VirtualDesktopManager::self()->currentDesktop(removed);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placements")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.output-drain");
+    const QRectF floating = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, floating, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto snapshot = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, snapshot.providerRevision, snapshot.mapRevision), TransientTileController::Result::Accepted);
+    QPointer<Tile> root(controller.rootTile());
+    QPointer<Window> guard(window);
+    bool notified = false;
+    bool released = false;
+    QObject callbackContext;
+    connect(window, &Window::requestedTileChanged, &callbackContext, [&]() {
+        if (released || !window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Restoring) {
+            return;
+        }
+        released = true;
+        if (callback == 1) {
+            delete manager.data();
+        } else if (callback == 2) {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }
+    });
+    connect(workspace(), &Workspace::outputRemoved, &callbackContext, [&](LogicalOutput *output) {
+        if (output != removed) {
+            return;
+        }
+        notified = true;
+        QVERIFY(released);
+        QVERIFY(!root);
+        QVERIFY(!controller.rootTile());
+        QVERIFY(guard);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(window->m_transientOwnership->floating, floating);
+        QVERIFY(writer.isReserved(id));
+    });
+    OutputConfiguration config;
+    config.changeSet(removed->backendOutput())->enabled = false;
+    QCOMPARE(workspace()->applyOutputConfiguration(config), OutputConfigurationError::None);
+    QVERIFY(notified);
+    QVERIFY(released);
+    QVERIFY(!root);
+    QVERIFY(!manager);
+    if (callback == 2) {
+        QTRY_VERIFY(!guard);
+    } else {
+        QVERIFY(guard);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(writer.isReserved(id));
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QTRY_VERIFY(!guard);
+    }
+    QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testWorkspaceWindowContinuation_data()
+{
+    QTest::addColumn<bool>("rearrange");
+    QTest::addColumn<bool>("closeCurrent");
+    QTest::newRow("output-setter-current") << false << true;
+    QTest::newRow("output-setter-later") << false << false;
+    QTest::newRow("rearrange-current") << true << true;
+    QTest::newRow("rearrange-later") << true << false;
+}
+
+void TestXdgShellWindow::testWorkspaceWindowContinuation()
+{
+    QFETCH(bool, rearrange);
+    QFETCH(bool, closeCurrent);
+    Test::setOutputConfig(QList<Test::OutputInfo>{
+        {.geometry = Rect(0, 0, 1280, 1024), .scale = 1},
+        {.geometry = Rect(1280, 0, 1280, 1024), .scale = 2},
+    });
+    const auto outputs = workspace()->outputs();
+    workspace()->setActiveOutput(outputs.last());
+    input()->pointer()->warp(outputs.last()->geometry().center());
+    std::array<std::unique_ptr<KWayland::Client::Surface>, 3> surfaces;
+    std::array<std::unique_ptr<Test::XdgToplevel>, 3> shells;
+    for (int i = 0; i < 3; ++i) {
+        surfaces[i] = Test::createSurface();
+        shells[i] = Test::createXdgToplevelSurface(surfaces[i].get());
+        auto window = Test::renderAndWaitForShown(surfaces[i].get(), QSize(200, 100), Qt::red);
+        QVERIFY(window);
+        QCOMPARE(window->moveResizeOutput(), outputs.last());
+        window->move(QPointF(2200, 500));
+    }
+    QPointer<Window> current;
+    QPointer<Window> target;
+    QList<QPointer<Window>> survivors;
+    {
+        const auto windows = rearrange ? workspace()->windows() : workspace()->stackingOrder();
+        QCOMPARE(windows.size(), 3);
+        current = windows[0];
+        target = closeCurrent ? windows[0] : windows[1];
+        for (Window *window : windows) {
+            if (window != target) {
+                survivors.append(window);
+            }
+            if (!rearrange) {
+                window->setOutput(outputs.first());
+                window->setMoveResizeOutput(outputs.first());
+            }
+        }
+    }
+    bool called = false;
+    bool closed = false;
+    bool updatedAfterClose = false;
+    QObject callbackContext;
+    connect(target, &Window::closed, &callbackContext, [&]() {
+        closed = true;
+    });
+    connect(target, &Window::outputChanged, &callbackContext, [&]() {
+        updatedAfterClose |= closed;
+    });
+    const auto closeTarget = [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        if (rearrange) {
+            QVERIFY(workspace()->m_inRearrange);
+        }
+        target->setSkipCloseAnimation(true);
+        target->destroyWindow();
+        if (!rearrange && closeCurrent) {
+            QVERIFY(target); // The caller must retain its current Window until the setter returns.
+        }
+    };
+    if (rearrange) {
+        connect(current, &Window::requestedGeometryChanged, &callbackContext, closeTarget);
+        OutputConfiguration config;
+        config.changeSet(outputs.last()->backendOutput())->enabled = false;
+        QCOMPARE(workspace()->applyOutputConfiguration(config), OutputConfigurationError::None);
+    } else {
+        connect(current, &Window::nextTargetScaleChanged, &callbackContext, closeTarget);
+        workspace()->desktopResized({});
+    }
+    QVERIFY(called);
+    QVERIFY(closed);
+    QVERIFY(!updatedAfterClose);
+    QTRY_VERIFY(!target);
+    const auto expectedOutput = rearrange ? outputs.first() : outputs.last();
+    for (const auto &survivor : survivors) {
+        QVERIFY(survivor);
+        QCOMPARE(survivor->moveResizeOutput(), expectedOutput);
+        QCOMPARE(survivor->output(), expectedOutput);
+        if (rearrange) {
+            QVERIFY(workspace()->clientArea(PlacementArea, survivor).contains(survivor->moveResizeGeometry()));
+        }
+    }
+}
+
+void TestXdgShellWindow::testOutputRemovalBatch_data()
+{
+    QTest::addColumn<bool>("deleteOther");
+    QTest::newRow("two-removed-contexts") << false;
+    QTest::newRow("other-manager-deleted-during-drain") << true;
+}
+
+void TestXdgShellWindow::testOutputRemovalBatch()
+{
+    QFETCH(bool, deleteOther);
+    Test::setOutputConfig({Rect(0, 0, 1280, 1024), Rect(1280, 0, 1280, 1024), Rect(2560, 0, 1280, 1024)});
+    const auto outputs = workspace()->outputs();
+    const auto desktop = VirtualDesktopManager::self()->currentDesktop(outputs.first());
+    std::array<TransientTileController, 2> controllers;
+    std::array<QPointer<TileManager>, 2> managers;
+    std::array<QPointer<Tile>, 2> roots;
+    for (int i = 0; i < 2; ++i) {
+        managers[i] = workspace()->tileManager(outputs[i]);
+        QCOMPARE(controllers[i].createTree(managers[i], desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        roots[i] = controllers[i].rootTile();
+    }
+    TransientTileController probe;
+    int drained = 0;
+    int notified = 0;
+    bool deletedOther = false;
+    QObject callbackContext;
+    for (int i = 0; i < 2; ++i) {
+        connect(&controllers[i], &TransientTileController::treeChanged, &callbackContext, [&, i]() {
+            if (controllers[i].rootTile()) {
+                return;
+            }
+            ++drained;
+            const int other = 1 - i;
+            QVERIFY(probe.createTree(managers[other], desktop, RectF(0, 0, 0.5, 1)) != TransientTileController::Result::Accepted);
+            if (deleteOther && !deletedOther) {
+                deletedOther = true;
+                delete managers[other].data();
+            }
+        });
+    }
+    connect(workspace(), &Workspace::outputRemoved, &callbackContext, [&](LogicalOutput *output) {
+        const int index = outputs.indexOf(output);
+        if (index >= 0 && index < 2) {
+            ++notified;
+            QVERIFY(!roots[index]);
+            QVERIFY(!controllers[index].rootTile());
+        }
+    });
+    OutputConfiguration config;
+    config.changeSet(outputs[0]->backendOutput())->enabled = false;
+    config.changeSet(outputs[1]->backendOutput())->enabled = false;
+    QCOMPARE(workspace()->applyOutputConfiguration(config), OutputConfigurationError::None);
+    QCOMPARE(notified, 2);
+    QCOMPARE(drained, 2);
+    QVERIFY(!managers[0] && !managers[1]);
+    QVERIFY(!probe.rootTile());
+    QCOMPARE(workspace()->outputs(), QList<LogicalOutput *>{outputs.last()});
+}
+
+void TestXdgShellWindow::testOutputRemovalPreservesNewerTile()
+{
+    const auto outputs = workspace()->outputs();
+    const auto removed = outputs.last();
+    workspace()->setActiveOutput(removed);
+    input()->pointer()->warp(removed->geometry().center());
+    std::array<std::unique_ptr<KWayland::Client::Surface>, 2> surfaces;
+    std::array<std::unique_ptr<Test::XdgToplevel>, 2> shells;
+    std::array<QPointer<Window>, 2> windows;
+    const auto source = workspace()->tileManager(removed)->quickTile(QuickTileFlag::Left);
+    for (int i = 0; i < 2; ++i) {
+        surfaces[i] = Test::createSurface();
+        shells[i] = Test::createXdgToplevelSurface(surfaces[i].get());
+        windows[i] = Test::renderAndWaitForShown(surfaces[i].get(), QSize(200, 100), Qt::red);
+        QVERIFY(windows[i]);
+        QVERIFY(source->manage(windows[i]));
+    }
+    const QPointer<Tile> destinationLeft = workspace()->tileManager(outputs.first())->quickTile(QuickTileFlag::Left);
+    const QPointer<Tile> destinationRight = workspace()->tileManager(outputs.first())->quickTile(QuickTileFlag::Right);
+    bool selectedNewerTile = false;
+    QObject callbackContext;
+    connect(destinationLeft, &Tile::windowAdded, &callbackContext, [&](Window *window) {
+        if (window == windows[0] && !selectedNewerTile) {
+            selectedNewerTile = true;
+            QVERIFY(destinationRight->manage(windows[1]));
+        }
+    });
+    OutputConfiguration config;
+    config.changeSet(removed->backendOutput())->enabled = false;
+    QCOMPARE(workspace()->applyOutputConfiguration(config), OutputConfigurationError::None);
+    QVERIFY(selectedNewerTile);
+    QVERIFY(windows[0] && windows[1]);
+    QCOMPARE(windows[0]->requestedTile(), destinationLeft.data());
+    QCOMPARE(windows[1]->requestedTile(), destinationRight.data());
+    QVERIFY(destinationRight->windows().contains(windows[1]));
+}
+
+void TestXdgShellWindow::testOutputRemovalMultiDesktop_data()
+{
+    QTest::addColumn<uint>("currentDesktop");
+    QTest::newRow("active-before-inactive") << uint(1);
+    QTest::newRow("inactive-before-active") << uint(2);
+}
+
+void TestXdgShellWindow::testOutputRemovalMultiDesktop()
+{
+    QFETCH(uint, currentDesktop);
+    auto desktops = VirtualDesktopManager::self();
+    const auto oldCount = desktops->count();
+    const auto restore = qScopeGuard([desktops, oldCount]() {
+        desktops->setCurrent(1);
+        desktops->setCount(oldCount);
+    });
+    desktops->setCount(2);
+    QVERIFY(desktops->setCurrent(currentDesktop) || desktops->current() == currentDesktop);
+    const auto outputs = workspace()->outputs();
+    const auto removed = outputs.last();
+    workspace()->setActiveOutput(removed);
+    input()->pointer()->warp(removed->geometry().center());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    window->setDesktops(desktops->desktops());
+    const auto firstDesktop = desktops->desktops().first();
+    const auto secondDesktop = desktops->desktops().last();
+    const auto source = workspace()->tileManager(removed);
+    QVERIFY(source->quickRootTile(firstDesktop)->tileForMode(QuickTileFlag::Left)->manage(window));
+    QVERIFY(source->quickRootTile(secondDesktop)->tileForMode(QuickTileFlag::Right)->manage(window));
+    const auto destination = workspace()->tileManager(outputs.first());
+    const QPointer<Tile> firstTile = destination->quickRootTile(firstDesktop)->tileForMode(QuickTileFlag::Left);
+    const QPointer<Tile> secondTile = destination->quickRootTile(secondDesktop)->tileForMode(QuickTileFlag::Right);
+    OutputConfiguration config;
+    config.changeSet(removed->backendOutput())->enabled = false;
+    QCOMPARE(workspace()->applyOutputConfiguration(config), OutputConfigurationError::None);
+    QVERIFY(firstTile->windows().contains(window));
+    QVERIFY(secondTile->windows().contains(window));
+    QCOMPARE(window->requestedTile(), currentDesktop == 1 ? firstTile.data() : secondTile.data());
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
 }
 
 int main(int argc, char *argv[])

@@ -101,6 +101,27 @@ X11EventFilter *X11EventFilterContainer::filter() const
 
 Workspace *Workspace::_self = nullptr;
 
+template<typename Callback>
+static void forEachLiveWindow(const QList<Window *> &windows, const Callback &callback)
+{
+    QList<QPointer<Window>> snapshot;
+    snapshot.reserve(windows.size());
+    for (Window *window : windows) {
+        snapshot.append(window);
+    }
+    for (const auto &guard : std::as_const(snapshot)) {
+        Window *window = guard.data();
+        if (!window || window->isDeleted()) {
+            continue;
+        }
+        window->ref();
+        const auto lifetime = qScopeGuard([window]() {
+            window->unref();
+        });
+        callback(window);
+    }
+}
+
 Workspace::Workspace()
     : QObject(nullptr)
     // Unsorted
@@ -1509,11 +1530,6 @@ void Workspace::updateOutputs()
             .wakeUp = !output->isPlaceholder() && !m_recentlyRemovedDpmsOffOutputs.contains(output->uuid()),
         });
     }
-    for (BackendOutput *output : availableOutputs) {
-        output->setAutoRotateAvailable(m_orientationSensor->isAvailable());
-        output->setAutoBrightnessAvailable(m_lightSensor->isAvailable());
-    }
-
     // we need to normalize output positions, as some applications
     // make assumptions about output positions starting at 0,0
     QPoint topLeftMostCoordinates = QPoint(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
@@ -1543,6 +1559,22 @@ void Workspace::updateOutputs()
     std::ranges::stable_sort(newOrder, [&priorities](LogicalOutput *left, LogicalOutput *right) {
         return priorities.value(left) < priorities.value(right);
     });
+    const QSet<LogicalOutput *> oldOutputsSet(oldLogicalOutputs.constBegin(), oldLogicalOutputs.constEnd());
+    const QSet<LogicalOutput *> outputsSet(newLogicalOutputs.constBegin(), newLogicalOutputs.constEnd());
+    const auto added = outputsSet - oldOutputsSet;
+    const auto removed = oldOutputsSet - outputsSet;
+    QHash<LogicalOutput *, QPointer<TileManager>> removedManagers;
+    for (LogicalOutput *output : removed) {
+        const QPointer<TileManager> manager = tileManager(output);
+        removedManagers.insert(output, manager);
+        if (manager) {
+            manager->closeTransientRegistration();
+        }
+    }
+    for (BackendOutput *output : availableOutputs) {
+        output->setAutoRotateAvailable(m_orientationSensor->isAvailable());
+        output->setAutoBrightnessAvailable(m_lightSensor->isAvailable());
+    }
     m_outputs = newLogicalOutputs;
     for (const auto &state : states) {
         state.logical->setData(state.position - topLeftMostCoordinates, state.modeSize,
@@ -1558,10 +1590,6 @@ void Workspace::updateOutputs()
 
     updateOutputOrder(newOrder);
 
-    const QSet<LogicalOutput *> oldOutputsSet(oldLogicalOutputs.constBegin(), oldLogicalOutputs.constEnd());
-    const QSet<LogicalOutput *> outputsSet(m_outputs.constBegin(), m_outputs.constEnd());
-
-    const auto added = outputsSet - oldOutputsSet;
     for (const auto &state : states) {
         // Repair deleted managers only at this explicit reconciliation boundary.
         if (!tileManager(state.logical)) {
@@ -1575,29 +1603,69 @@ void Workspace::updateOutputs()
 
     m_placementTracker->inhibit();
 
-    const auto removed = oldOutputsSet - outputsSet;
+    struct PlacementState
+    {
+        QPointer<Window> window;
+        QPointer<Tile> requestedTile;
+        quint64 geometryGeneration;
+        bool hadRequestedTile;
+    };
+    const auto capturePlacement = [](Window *window) {
+        return PlacementState{window, window->requestedTile(), window->geometryRequestGeneration(), bool(window->requestedTile())};
+    };
+    const auto matchesPlacement = [](Window *window, const PlacementState &state) {
+        return state.window == window && (!state.hadRequestedTile || state.requestedTile)
+            && window->requestedTile() == state.requestedTile && window->geometryRequestGeneration() == state.geometryGeneration;
+    };
+    const auto originalPlacements = [&]() {
+        QHash<Window *, PlacementState> result;
+        for (Window *window : std::as_const(m_windows)) {
+            result.insert(window, capturePlacement(window));
+        }
+        return result;
+    }();
+    auto expectedPlacements = originalPlacements;
+
     for (LogicalOutput *output : removed) {
+        const auto tileManager = removedManagers.value(output);
+        const auto cleanup = qScopeGuard([this, output, tileManager]() {
+            delete tileManager.data();
+            const auto entry = m_tileManagers.find(output);
+            if (entry != m_tileManagers.end() && entry->second == tileManager) {
+                m_tileManagers.erase(entry);
+            }
+        });
+        if (tileManager) {
+            tileManager->prepareForRemoval();
+        }
         Q_EMIT outputRemoved(output);
 
-        const auto tileManager = m_tileManagers[output];
-        m_tileManagers.erase(output);
-        const auto cleanup = qScopeGuard([tileManager]() {
-            delete tileManager.data();
-        });
-
-        const auto desktops = VirtualDesktopManager::self()->desktops();
-        for (VirtualDesktop *desktop : desktops) {
+        QList<QPointer<VirtualDesktop>> desktops;
+        for (VirtualDesktop *desktop : VirtualDesktopManager::self()->desktops()) {
+            desktops.append(desktop);
+        }
+        for (const auto &desktop : std::as_const(desktops)) {
             if (!tileManager) {
                 break;
             }
+            if (!desktop) {
+                continue;
+            }
             // Evacuate windows from the defunct custom tile tree.
+            QList<QPointer<Tile>> customTiles;
             if (auto root = tileManager->rootTile(desktop)) {
-                root->visitDescendants([](Tile *child) {
-                    const QList<Window *> windows = child->windows();
-                    for (Window *window : windows) {
-                        child->unmanage(window);
-                    }
+                root->visitDescendants([&customTiles](Tile *child) {
+                    customTiles.append(child);
                 });
+            }
+            for (const auto &child : std::as_const(customTiles)) {
+                if (tileManager && child) {
+                    forEachLiveWindow(child->windows(), [child, tileManager](Window *window) {
+                        if (tileManager && child && child->windows().contains(window)) {
+                            child->unmanage(window);
+                        }
+                    });
+                }
             }
 
             // Migrate windows from the defunct quick tile to a quick tile tree on another output.
@@ -1613,24 +1681,44 @@ void Workspace::updateOutputs()
             };
 
             for (const QuickTileMode &quickTileMode : quickTileModes) {
-                if (!tileManager || !tileManager->quickRootTile(desktop)) {
+                if (!tileManager || !desktop || !tileManager->quickRootTile(desktop)) {
                     break;
                 }
-                Tile *quickTile = tileManager->quickRootTile(desktop)->tileForMode(quickTileMode);
-                const QList<Window *> windows = quickTile->windows();
-                if (windows.isEmpty()) {
+                const QPointer<Tile> quickTile = tileManager->quickRootTile(desktop)->tileForMode(quickTileMode);
+                if (!quickTile || quickTile->windows().isEmpty()) {
                     continue;
                 }
 
                 LogicalOutput *bestOutput = outputAt(oldGeometries.value(output).center());
-                const auto bestManager = this->tileManager(bestOutput);
+                const QPointer<TileManager> bestManager = this->tileManager(bestOutput);
                 const auto bestRoot = bestManager ? bestManager->quickRootTile(desktop) : nullptr;
-                Tile *bestTile = bestRoot ? bestRoot->tileForMode(quickTileMode) : nullptr;
+                const QPointer<Tile> bestTile = bestRoot ? bestRoot->tileForMode(quickTileMode) : nullptr;
 
                 if (bestTile) {
-                    for (Window *window : windows) {
-                        bestTile->manage(window);
-                    }
+                    forEachLiveWindow(quickTile->windows(), [&](Window *window) {
+                        const auto original = originalPlacements.constFind(window);
+                        if (original == originalPlacements.cend() || original->window != window
+                            || !tileManager || !bestManager || !quickTile || !bestTile || !quickTile->windows().contains(window)) {
+                            return;
+                        }
+                        const auto expected = expectedPlacements.value(window);
+                        if (!matchesPlacement(window, expected)) {
+                            return;
+                        }
+                        const auto target = bestTile->windowGeometry();
+                        if (!bestTile->manage(window) || window->isDeleted()
+                            || !tileManager || !bestManager || !quickTile || !bestTile || !bestTile->windows().contains(window)) {
+                            return;
+                        }
+                        if (matchesPlacement(window, expected)) {
+                            return;
+                        }
+                        // Advance only this verified migration, never another Window changed by a callback.
+                        if (bestTile->isActive() && window->requestedTile() == bestTile && window->moveResizeGeometry() == target
+                            && window->geometryRequestGeneration() > expected.geometryGeneration) {
+                            expectedPlacements.insert(window, capturePlacement(window));
+                        }
+                    });
                 }
             }
         }
@@ -2488,18 +2576,16 @@ void Workspace::desktopResized(const QHash<Window *, LogicalOutput *> &oldOutput
         setActiveOutput(m_outputs[0]);
     }
 
-    const auto stack = stackingOrder();
-    for (Window *window : stack) {
+    const auto updateWindowOutputs = [this](Window *window) {
         window->setMoveResizeOutput(outputAt(window->moveResizeGeometry().center()));
-        window->setOutput(outputAt(window->frameGeometry().center()));
-    }
+        if (!window->isDeleted()) {
+            window->setOutput(outputAt(window->frameGeometry().center()));
+        }
+    };
+    forEachLiveWindow(stackingOrder(), updateWindowOutputs);
 
     // TODO: Track uninitialized windows in the Workspace too.
-    const auto windows = waylandServer()->windows();
-    for (Window *window : windows) {
-        window->setMoveResizeOutput(outputAt(window->moveResizeGeometry().center()));
-        window->setOutput(outputAt(window->frameGeometry().center()));
-    }
+    forEachLiveWindow(waylandServer()->windows(), updateWindowOutputs);
 
     // restore cursor position
     const auto oldCursorOutput = std::find_if(m_oldScreenGeometries.cbegin(), m_oldScreenGeometries.cend(), [](const auto &geometry) {
@@ -2647,11 +2733,11 @@ void Workspace::rearrange(const QHash<Window *, LogicalOutput *> &oldOutputs)
         }
 #endif
 
-        for (auto it = m_windows.constBegin(); it != m_windows.constEnd(); ++it) {
-            if ((*it)->isClient()) {
-                (*it)->checkWorkspacePosition(RectF(), oldOutputs.value(*it, nullptr));
+        forEachLiveWindow(m_windows, [&oldOutputs](Window *window) {
+            if (window->isClient()) {
+                window->checkWorkspacePosition(RectF(), oldOutputs.value(window, nullptr));
             }
-        }
+        });
 
         m_oldRestrictedArea.clear(); // reset, no longer valid or needed
         m_inRearrange = false;
