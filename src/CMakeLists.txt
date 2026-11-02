@@ -223,6 +223,7 @@ target_sources(kwin PRIVATE
     tiles/tile.cpp
     tiles/tilemanager.cpp
     tiles/transientplacementwriter.cpp
+    tiles/transienttilecontroller.cpp
     touch_input.cpp
     useractionprompt.cpp
     useractions.cpp
