@@ -46,6 +46,7 @@
 #include <QDir>
 #include <QFile>
 #include <QPointer>
+#include <QProcess>
 #include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -63,11 +64,39 @@
 #include <linux/input.h>
 
 #include <csignal>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <type_traits>
 
 using namespace KWin;
+
+struct WorkspaceShutdownObservation
+{
+    void require(bool condition, const QString &message)
+    {
+        if (!condition) {
+            failures.append(message);
+        }
+    }
+
+    bool armed = false;
+    bool windowClosed = false;
+    bool workspaceDestroyed = false;
+    int outputsRemoved = 0;
+    QStringList failures;
+    QPointer<TransientTileController> controller;
+    QList<QPointer<TileManager>> managers;
+    std::unique_ptr<QTemporaryDir> directory;
+    std::unique_ptr<TransientPlacementWriter> writer;
+    std::unique_ptr<TransientTileController> challenger;
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    // Last declared, so captured state survives all observer disconnections.
+    std::unique_ptr<QObject> context;
+};
+
+static WorkspaceShutdownObservation *shutdownObservation = nullptr;
 
 class RegistryEventFilter : public QObject
 {
@@ -342,6 +371,15 @@ private Q_SLOTS:
     void testTransientRegistryDesktopRemoval();
     void testTransientRegistryForgetReentry_data();
     void testTransientRegistryForgetReentry();
+    void testWorkspaceIdleController();
+    void testWorkspaceMissingTileManager();
+    void testMissingManagerTilingRequests();
+    void testMissingManagerOutputTransfer_data();
+    void testMissingManagerOutputTransfer();
+    void testQuickTileCallbackWins_data();
+    void testQuickTileCallbackWins();
+    void testWorkspaceShutdown_data();
+    void testWorkspaceShutdown();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -496,7 +534,9 @@ void TestXdgShellWindow::init()
 
 void TestXdgShellWindow::cleanup()
 {
-    Test::destroyWaylandConnection();
+    if (!shutdownObservation || !shutdownObservation->armed) {
+        Test::destroyWaylandConnection();
+    }
 }
 
 void TestXdgShellWindow::testDecorationSettingsReentry_data()
@@ -7194,5 +7234,351 @@ void TestXdgShellWindow::testTransientRegistryForgetReentry()
     }
 }
 
-WAYLANDTEST_MAIN(TestXdgShellWindow)
+void TestXdgShellWindow::testWorkspaceIdleController()
+{
+    const auto controller = workspace()->m_transientTileController.get();
+    QVERIFY(controller);
+    QVERIFY(!controller->rootTile());
+    QVERIFY(!controller->tile());
+    QCOMPARE(controller->generation(), quint64(0));
+}
+
+void TestXdgShellWindow::testWorkspaceMissingTileManager()
+{
+    const auto output = workspace()->outputs().first();
+    QPointer<TileManager> manager(workspace()->tileManager(output));
+    QVERIFY(manager);
+    QCOMPARE(manager->parent(), output);
+    delete manager.data();
+    QVERIFY(!manager);
+    QVERIFY(!workspace()->tileManager(output));
+    QVERIFY(!workspace()->rootTile(output));
+
+    // Lookup is read-only. Explicit output reconciliation replaces a missing manager.
+    QVERIFY(output->findChildren<TileManager *>(QString(), Qt::FindDirectChildrenOnly).isEmpty());
+    OutputConfiguration config;
+    QVERIFY(workspace()->applyOutputConfiguration(config).has_value());
+    manager = workspace()->tileManager(output);
+    QVERIFY(manager);
+    QCOMPARE(manager->parent(), output);
+    QCOMPARE(output->findChildren<TileManager *>(QString(), Qt::FindDirectChildrenOnly).size(), 1);
+    QCOMPARE(workspace()->tileManager(output), manager.data());
+}
+
+void TestXdgShellWindow::testMissingManagerTilingRequests()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const auto outputs = workspace()->outputs();
+    const auto unavailable = outputs.last();
+    auto source = workspace()->tileManager(outputs.first())->quickTile(QuickTileFlag::Left);
+    QVERIFY(source->manage(window));
+    QCOMPARE(window->requestedTile(), source);
+    delete workspace()->tileManager(unavailable);
+    QVERIFY(!workspace()->tileManager(unavailable));
+    const auto pos = unavailable->geometry().center();
+    window->setQuickTileMode(QuickTileFlag::Right, pos);
+    QCOMPARE(window->requestedTile(), source);
+    window->setQuickTileMode(QuickTileFlag::Custom, pos);
+    QCOMPARE(window->requestedTile(), source);
+    QVERIFY(window->quickTileGeometry(QuickTileFlag::Custom, pos).isEmpty());
+    QCOMPARE(window->quickTileGeometry(QuickTileFlag::Left, pos), workspace()->clientArea(MaximizeArea, window, pos));
+    window->setQuickTileMode(QuickTileFlag::None, pos);
+    QVERIFY(!window->requestedTile());
+    window->moveResize(RectF(pos.x(), pos.y(), 200, 100));
+    const auto geometry = window->moveResizeGeometry();
+    window->handleCustomQuickTileShortcut(QuickTileFlag::Right);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), geometry);
+    window->exitQuickTileMode();
+}
+
+void TestXdgShellWindow::testMissingManagerOutputTransfer_data()
+{
+    QTest::addColumn<int>("callback");
+    QTest::newRow("ordinary-transfer") << 0;
+    QTest::newRow("newer-placement") << 1;
+    QTest::newRow("closed-window") << 2;
+    QTest::newRow("newer-floating-geometry") << 3;
+}
+
+void TestXdgShellWindow::testMissingManagerOutputTransfer()
+{
+    QFETCH(int, callback);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const auto outputs = workspace()->outputs();
+    const auto unavailable = outputs.last();
+    auto manager = workspace()->tileManager(outputs.first());
+    auto source = manager->quickTile(QuickTileFlag::Left);
+    auto replacement = manager->quickTile(QuickTileFlag::Right);
+    QVERIFY(source->manage(window));
+    QCOMPARE(window->requestedTile(), source);
+    delete workspace()->tileManager(unavailable);
+    QVERIFY(!workspace()->tileManager(unavailable));
+    QPointer<Window> guard(window);
+    bool called = false;
+    RectF callbackGeometry;
+    RectF callbackRestore;
+    QObject callbackContext;
+    connect(source, &Tile::windowRemoved, &callbackContext, [&]() {
+        called = true;
+        if (callback == 1) {
+            QVERIFY(replacement->manage(window));
+            callbackRestore = window->geometryRestore();
+        } else if (callback == 2) {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        } else if (callback == 3) {
+            window->requestTile(nullptr);
+            window->moveResize(RectF(120, 170, 320, 210));
+            callbackGeometry = window->moveResizeGeometry();
+        }
+    });
+    window->sendToOutput(unavailable);
+    QVERIFY(called);
+    if (callback == 2) {
+        QVERIFY(!guard);
+    } else if (callback == 1) {
+        QCOMPARE(window->requestedTile(), replacement);
+        QCOMPARE(window->moveResizeGeometry(), replacement->windowGeometry());
+        QCOMPARE(window->geometryRestore(), callbackRestore);
+    } else if (callback == 3) {
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->moveResizeGeometry(), callbackGeometry);
+    } else {
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!source->windows().contains(window));
+        QCOMPARE(window->moveResizeOutput(), unavailable);
+    }
+}
+
+void TestXdgShellWindow::testQuickTileCallbackWins_data()
+{
+    QTest::addColumn<bool>("floating");
+    QTest::newRow("newer-tile") << false;
+    QTest::newRow("newer-floating-geometry") << true;
+}
+
+void TestXdgShellWindow::testQuickTileCallbackWins()
+{
+    QFETCH(bool, floating);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.quicktile-reentry"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const auto manager = workspace()->tileManager(window->moveResizeOutput());
+    const auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placements")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.quicktile-reentry");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, window->frameGeometry(), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto snapshot = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, snapshot.providerRevision, snapshot.mapRevision), TransientTileController::Result::Accepted);
+    bool called = false;
+    RectF newerGeometry;
+    QObject callbackContext;
+    connect(controller.tile(), &Tile::windowRemoved, &callbackContext, [&]() {
+        called = true;
+        if (floating) {
+            window->moveResize(RectF(120, 170, 320, 210));
+        } else {
+            window->setQuickTileModeAtCurrentPosition(QuickTileFlag::Left);
+        }
+        newerGeometry = window->moveResizeGeometry();
+    });
+    window->setQuickTileModeAtCurrentPosition(QuickTileFlag::Right);
+    QVERIFY(called);
+    QCOMPARE(window->moveResizeGeometry(), newerGeometry);
+    if (floating) {
+        QVERIFY(!window->requestedTile());
+    } else {
+        QCOMPARE(window->requestedTile(), manager->quickTile(QuickTileFlag::Left));
+    }
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testWorkspaceShutdown_data()
+{
+    QTest::addColumn<bool>("deleteManager");
+    QTest::newRow("intact-managers") << false;
+    QTest::newRow("manager-deleted-during-close") << true;
+}
+
+void TestXdgShellWindow::testWorkspaceShutdown()
+{
+    QFETCH(bool, deleteManager);
+    if (!qEnvironmentVariableIsSet("KWIN_TEST_WORKSPACE_SHUTDOWN")) {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString runtime = directory.filePath(QStringLiteral("runtime"));
+        QVERIFY(QDir().mkdir(runtime));
+        QVERIFY(QFile::setPermissions(runtime, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QStringLiteral("KWIN_TEST_WORKSPACE_SHUTDOWN"), QStringLiteral("1"));
+        environment.insert(QStringLiteral("XDG_RUNTIME_DIR"), runtime);
+        environment.insert(QStringLiteral("XDG_CONFIG_HOME"), directory.filePath(QStringLiteral("config")));
+        environment.insert(QStringLiteral("XDG_CACHE_HOME"), directory.filePath(QStringLiteral("cache")));
+        QProcess child;
+        child.setProcessEnvironment(environment);
+        child.setProcessChannelMode(QProcess::MergedChannels);
+        child.start(QStringLiteral("dbus-run-session"), {QStringLiteral("--"), QCoreApplication::applicationFilePath(), QStringLiteral("testWorkspaceShutdown:%1").arg(QString::fromLatin1(QTest::currentDataTag()))});
+        QVERIFY(child.waitForStarted());
+        QVERIFY(child.waitForFinished(30000));
+        const auto report = child.readAll();
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(child.exitCode() == 0, report.constData());
+        QVERIFY2(report.contains("Workspace shutdown observations: PASS"), report.constData());
+        return;
+    }
+
+    auto &observation = *shutdownObservation;
+    const auto cleanupUnarmed = qScopeGuard([&observation]() {
+        if (!observation.armed) {
+            observation.context.reset();
+            observation.challenger.reset();
+            observation.shell.reset();
+            observation.surface.reset();
+            observation.writer.reset();
+            observation.directory.reset();
+        }
+    });
+    observation.directory = std::make_unique<QTemporaryDir>();
+    QVERIFY(observation.directory->isValid());
+    observation.writer = std::make_unique<TransientPlacementWriter>(observation.directory->filePath(QStringLiteral("placements")));
+    observation.challenger = std::make_unique<TransientTileController>();
+    observation.context = std::make_unique<QObject>();
+    observation.surface = Test::createSurface();
+    observation.shell = Test::createXdgToplevelSurface(observation.surface.get());
+    observation.shell->set_app_id(QStringLiteral("org.example.workspace-shutdown"));
+    QSignalSpy configure(observation.shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(observation.surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    observation.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(observation.surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const auto outputs = workspace()->outputs();
+    for (auto output : outputs) {
+        observation.managers.append(workspace()->tileManager(output));
+    }
+    observation.controller = workspace()->m_transientTileController.get();
+    QVERIFY(observation.controller);
+    const auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    const auto manager = workspace()->tileManager(window->moveResizeOutput());
+    const QPointer<TileManager> challengeManager = observation.managers.last();
+    QVERIFY(challengeManager && challengeManager != manager);
+    QCOMPARE(observation.challenger->createTree(challengeManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    QCOMPARE(observation.challenger->clearTree(observation.challenger->generation()), TransientTileController::Result::Accepted);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.workspace-shutdown");
+    const auto provider = observation.writer->registerProvider(observation.context.get());
+    QVERIFY(observation.writer->trackWindow(id, key));
+    QCOMPARE(observation.writer->record(provider, 1, {id, window->frameGeometry(), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    QCOMPARE(observation.controller->createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto snapshot = observation.writer->snapshot();
+    QCOMPARE(observation.controller->admit(observation.controller->generation(), window, observation.writer.get(), provider, key,
+                                           snapshot.providerRevision, snapshot.mapRevision),
+             TransientTileController::Result::Accepted);
+
+    connect(window, &Window::closed, observation.context.get(), [&, window, manager, challengeManager, desktop, deleteManager, id]() {
+        observation.windowClosed = true;
+        observation.require(bool(window->m_transientOwnership), QStringLiteral("Window record lost during close"));
+        observation.require(observation.writer->isReserved(id), QStringLiteral("Close-time writer barrier lost"));
+        observation.require(observation.challenger->createTree(challengeManager, desktop, RectF(0, 0, 0.5, 1)) == TransientTileController::Result::Busy,
+                            QStringLiteral("Registration remained open during shutdown"));
+        QSignalSpy changed(workspace(), &Workspace::outputsChanged);
+        workspace()->updateOutputs();
+        observation.require(changed.isEmpty(), QStringLiteral("Output reconciliation ran during shutdown"));
+        if (deleteManager) {
+            const auto output = manager->output();
+            delete manager;
+            observation.require(!workspace()->tileManager(output), QStringLiteral("Deleted manager remained in lookup"));
+        }
+    });
+    for (auto guarded : observation.managers) {
+        const bool deletedDuringClose = deleteManager && guarded == manager;
+        connect(guarded, &QObject::destroyed, observation.context.get(), [&, deletedDuringClose]() {
+            if (!deletedDuringClose) {
+                observation.require(!observation.controller, QStringLiteral("Surviving manager destroyed before controller"));
+            }
+        });
+    }
+    connect(workspace(), &Workspace::outputRemoved, observation.context.get(), [&](LogicalOutput *) {
+        ++observation.outputsRemoved;
+        observation.require(!observation.controller, QStringLiteral("Controller survived output removal"));
+        for (const auto &manager : observation.managers) {
+            observation.require(!manager, QStringLiteral("Manager survived output removal"));
+        }
+    });
+    connect(workspace(), &QObject::destroyed, observation.context.get(), [&, id]() {
+        observation.workspaceDestroyed = true;
+        observation.require(!observation.writer->isReserved(id), QStringLiteral("Writer barrier survived Window destruction"));
+        observation.shell.reset();
+        observation.surface.reset();
+        Test::destroyWaylandConnection();
+        observation.writer.reset();
+    });
+    observation.armed = true;
+}
+
+int main(int argc, char *argv[])
+{
+    setenv("QT_QPA_PLATFORM", "wayland-org.kde.kwin.qpa", true);
+    setenv("QT_QPA_PLATFORM_PLUGIN_PATH", QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath().toLocal8Bit().constData(), true);
+    setenv("KWIN_FORCE_OWN_QPA", "1", true);
+    qunsetenv("KDE_FULL_SESSION");
+    qunsetenv("KDE_SESSION_VERSION");
+    qunsetenv("XDG_SESSION_DESKTOP");
+    qunsetenv("XDG_CURRENT_DESKTOP");
+    WorkspaceShutdownObservation observation;
+    shutdownObservation = &observation;
+    int result;
+    {
+        KWin::WaylandTestApplication app(argc, argv, false);
+        qunsetenv("QT_QPA_PLATFORM");
+        qunsetenv("QT_QPA_PLATFORM_PLUGIN_PATH");
+        qunsetenv("KWIN_FORCE_OWN_QPA");
+        app.setAttribute(Qt::AA_Use96Dpi, true);
+        TestXdgShellWindow tc;
+        result = QTest::qExec(&tc, argc, argv);
+    }
+    if (qEnvironmentVariableIsSet("KWIN_TEST_WORKSPACE_SHUTDOWN")) {
+        observation.require(observation.armed, QStringLiteral("Shutdown fixture was not armed"));
+        observation.require(observation.windowClosed, QStringLiteral("Window close not observed"));
+        observation.require(observation.workspaceDestroyed, QStringLiteral("Workspace destruction not observed"));
+        observation.require(observation.outputsRemoved == observation.managers.size(), QStringLiteral("Output removal incomplete"));
+        if (observation.failures.isEmpty()) {
+            // Keep the post-destructor verdict independent of Qt's message handler.
+            std::puts("Workspace shutdown observations: PASS");
+        } else {
+            for (const auto &failure : observation.failures) {
+                std::fprintf(stderr, "Workspace shutdown observation failed: %s\n", qPrintable(failure));
+            }
+            result = 1;
+        }
+    }
+    return result;
+}
 #include "xdgshellwindow_test.moc"
