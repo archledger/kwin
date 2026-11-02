@@ -43,6 +43,8 @@
 #include <QPointer>
 #include <QScopeGuard>
 
+#include <cmath>
+
 namespace KWin
 {
 
@@ -82,6 +84,12 @@ WindowType XdgSurfaceWindow::windowType() const
 XdgSurfaceConfigure *XdgSurfaceWindow::lastAcknowledgedConfigure() const
 {
     return m_lastAcknowledgedConfigure.get();
+}
+
+bool XdgSurfaceWindow::hasPendingNativeGeometry() const
+{
+    return m_configureTimer->isActive() || !m_configureEvents.isEmpty() || m_lastAcknowledgedConfigure
+        || m_lastAcknowledgedConfigureSerial.has_value();
 }
 
 void XdgSurfaceWindow::scheduleConfigure()
@@ -157,7 +165,7 @@ void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode
 {
     const auto generation = geometryRequestGeneration();
     Q_EMIT frameGeometryAboutToChange();
-    if (!geometryRequestIsCurrent(generation)) {
+    if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
         return;
     }
 
@@ -712,6 +720,48 @@ void XdgToplevelWindow::handleRoleCommit()
         }
         commitTile(tile);
     }
+}
+
+bool XdgToplevelWindow::canStartTransientTileRequest(const RectF &target) const
+{
+    if (!m_isInitialized || !readyForPainting() || !frameGeometry().isValid() || !moveResizeGeometry().isValid()) {
+        return false;
+    }
+    for (qreal value : {frameGeometry().x(), frameGeometry().y(), frameGeometry().width(), frameGeometry().height()}) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    return !hasPendingNativeGeometry() && !requestedTile() && !tile() && isTransientTileTargetFeasible(target);
+}
+
+bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
+{
+    if (isDeleted() || !isNormalWindow() || !isMovable() || !isResizable() || isInteractiveMoveResize()
+        || isFullScreen() || isRequestedFullScreen() || maximizeMode() != MaximizeRestore || requestedMaximizeMode() != MaximizeRestore) {
+        return false;
+    }
+    for (qreal value : {target.x(), target.y(), target.width(), target.height()}) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    if (target.width() <= 0 || target.height() <= 0) {
+        return false;
+    }
+    const auto constrained = constrainFrameSize(target.size());
+    if (constrained.width() != target.width() || constrained.height() != target.height()) {
+        return false;
+    }
+    const auto snappedFrame = snapToPixels(target.size(), nextTargetScale());
+    if (snappedFrame.width() != target.width() || snappedFrame.height() != target.height()) {
+        return false;
+    }
+    const auto client = nextFrameSizeToClientSize(snappedFrame);
+    const auto snappedClient = surface()->snappedSize(client);
+    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(snappedClient, nextTargetScale()));
+    return client.width() == snappedClient.width() && client.height() == snappedClient.height()
+        && roundTrip.width() == target.width() && roundTrip.height() == target.height();
 }
 
 void XdgToplevelWindow::doMinimize()

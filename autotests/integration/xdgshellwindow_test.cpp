@@ -16,6 +16,7 @@
 #include "decorations/settings.h"
 #include "effect/effecthandler.h"
 #include "pointer_input.h"
+#include "tiles/tilemanager.h"
 #include "virtualdesktops.h"
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
@@ -86,9 +87,65 @@ private:
     bool m_consume;
 };
 
+class RequestTestTile : public Tile
+{
+public:
+    explicit RequestTestTile(Window *window, TileManager *manager = nullptr)
+        : Tile(manager ? manager : workspace()->tileManager(window->moveResizeOutput()), nullptr, Type::Transient)
+        , m_window(window)
+    {
+        m_desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+        m_relativeGeometry = RectF(0.25, 0.25, 0.5, 0.5);
+        m_padding = 0;
+        m_windows.append(window);
+    }
+
+    ~RequestTestTile() override
+    {
+        m_windows.clear();
+        if (m_window && !m_window->isDeleted()) {
+            m_window->forgetTile(this);
+        }
+    }
+
+    void setTargetForTest(const RectF &absolute)
+    {
+        const auto output = manager()->output()->geometryF();
+        m_relativeGeometry = RectF((absolute.x() - output.x()) / output.width(), (absolute.y() - output.y()) / output.height(),
+                                   absolute.width() / output.width(), absolute.height() / output.height());
+    }
+
+private:
+    QPointer<Window> m_window;
+};
+
 class TestXdgShellWindow : public QObject
 {
     Q_OBJECT
+
+    struct RequestAuthority
+    {
+        QPointer<QObject> owner;
+        bool valid = true;
+    };
+
+    class RequestForTest : public Window::TransientTileRequest
+    {
+    public:
+        RequestForTest(Window *window, Tile *tile, std::shared_ptr<RequestAuthority> authority)
+            : TransientTileRequest(window, tile, 7)
+            , m_authority(std::move(authority))
+        {
+        }
+
+    private:
+        bool authorityIsCurrent() const override
+        {
+            return m_authority->owner && m_authority->valid;
+        }
+        std::shared_ptr<RequestAuthority> m_authority;
+    };
+
 private Q_SLOTS:
     void initTestCase();
     void init();
@@ -189,6 +246,25 @@ private Q_SLOTS:
     void testNestedOutputPropertySync();
     void testGeometryNotificationNetZero();
     void testOutputScaleCallbackClose();
+    void testPrivateTransientRequest();
+    void testTransientRequestCancellation_data();
+    void testTransientRequestCancellation();
+    void testTransientRequestUnmapped();
+    void testTransientRequestPendingCallback();
+    void testTransientRequestCommitReplacement();
+    void testTransientRequestNoOpCancellation_data();
+    void testTransientRequestNoOpCancellation();
+    void testTransientRequestPrivateReentry();
+    void testTransientRequestNewTileWins();
+    void testTransientRequestPendingStates_data();
+    void testTransientRequestPendingStates();
+    void testTransientRequestConstraints_data();
+    void testTransientRequestConstraints();
+    void testTransientRequestFractional_data();
+    void testTransientRequestFractional();
+    void testTransientRequestDecorated();
+    void testTransientRequestRequestedRevocation_data();
+    void testTransientRequestRequestedRevocation();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -4201,6 +4277,511 @@ void TestXdgShellWindow::testOutputScaleCallbackClose()
     window->moveResize(RectF(1400, 100, 200, 100));
     QVERIFY(closed);
     QTRY_VERIFY(guard.isNull());
+}
+
+void TestXdgShellWindow::testPrivateTransientRequest()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    const auto original = window->moveResizeGeometry();
+    window->requestTile(&tile);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), original);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QCOMPARE(receipt.ownershipGeneration, quint64(7));
+    QCOMPARE(receipt.windowId, window->internalId());
+    QCOMPARE(window->requestedTile(), &tile);
+    QCOMPARE(window->moveResizeGeometry(), tile.windowGeometry());
+}
+
+void TestXdgShellWindow::testTransientRequestCancellation_data()
+{
+    QTest::addColumn<bool>("afterRequest");
+    QTest::newRow("restore-field") << false;
+    QTest::newRow("geometry-request") << true;
+}
+
+void TestXdgShellWindow::testTransientRequestCancellation()
+{
+    QFETCH(bool, afterRequest);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    const auto original = window->moveResizeGeometry();
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    bool cancelled = false;
+    const auto signal = afterRequest ? &Window::frameGeometryAboutToChange : &Window::maximizeGeometryRestoreChanged;
+    connect(window, signal, &context, [&]() {
+        if (!cancelled) {
+            cancelled = true;
+            window->requestTile(nullptr);
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QVERIFY(cancelled);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, afterRequest ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), original);
+}
+
+void TestXdgShellWindow::testTransientRequestUnmapped()
+{
+    QSignalSpy created(waylandServer(), &WaylandServer::windowCreated);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(created.count(), 1);
+    auto window = created.first().first().value<Window *>();
+    QVERIFY(window);
+    QVERIFY(!window->readyForPainting());
+    QVERIFY(!window->canStartTransientTileRequest(RectF(200, 200, 400, 300)));
+}
+
+void TestXdgShellWindow::testTransientRequestPendingCallback()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    const auto original = window->moveResizeGeometry();
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    bool changed = false;
+    connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+        if (!changed) {
+            changed = true;
+            window->setActive(!window->isActive());
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QVERIFY(changed);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), original);
+}
+
+void TestXdgShellWindow::testTransientRequestCommitReplacement()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    bool committed = false;
+    RectF replacement;
+    connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+        if (!committed) {
+            committed = true;
+            Test::render(surface.get(), QSize(220, 120), Qt::blue);
+            QVERIFY(Test::waylandSync());
+            replacement = window->moveResizeGeometry();
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QVERIFY(committed);
+    QVERIFY(replacement != tile.windowGeometry());
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), replacement);
+}
+
+void TestXdgShellWindow::testTransientRequestNoOpCancellation_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("forget-nonmatching") << 0;
+    QTest::newRow("equal-compatibility") << 1;
+    QTest::newRow("equal-quick-mode") << 2;
+    QTest::newRow("equal-geometry") << 3;
+    QTest::newRow("authority-destroyed") << 4;
+    QTest::newRow("target-changed") << 5;
+    QTest::newRow("tile-destroyed") << 6;
+    QTest::newRow("manager-destroyed") << 7;
+}
+
+void TestXdgShellWindow::testTransientRequestNoOpCancellation()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto manager = std::make_unique<TileManager>(window->moveResizeOutput());
+    auto tile = std::make_unique<RequestTestTile>(window, manager.get());
+    QVERIFY(window->canStartTransientTileRequest(tile->windowGeometry()));
+    const auto original = window->moveResizeGeometry();
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    auto owner = std::make_unique<QObject>();
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = owner.get();
+    QObject context;
+    bool cancelled = false;
+    connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+        if (cancelled) {
+            return;
+        }
+        cancelled = true;
+        switch (action) {
+        case 0:
+            QVERIFY(window->requestedTile() != tile.get());
+            window->forgetTile(tile.get());
+            break;
+        case 1:
+            window->setTileCompatibility(nullptr);
+            break;
+        case 2:
+            window->setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
+            break;
+        case 3:
+            window->moveResize(original);
+            break;
+        case 4:
+            owner.reset();
+            break;
+        case 5:
+            tile->setTargetForTest(RectF(100, 100, 400, 300));
+            break;
+        case 6:
+            tile.reset();
+            break;
+        case 7:
+            manager.reset();
+            break;
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, tile.get(), authority));
+    QVERIFY(cancelled);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), original);
+}
+
+void TestXdgShellWindow::testTransientRequestPrivateReentry()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    Window::TransientRequestReceipt nested;
+    bool attempted = false;
+    connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+        if (!attempted) {
+            attempted = true;
+            nested = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QVERIFY(attempted);
+    QCOMPARE(nested.outcome, Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(nested.progress, Window::TransientRequestProgress::NoRequest);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QCOMPARE(window->requestedTile(), &tile);
+}
+
+void TestXdgShellWindow::testTransientRequestNewTileWins()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    auto quick = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+    QVERIFY(quick);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    bool changed = false;
+    connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+        if (!changed) {
+            changed = true;
+            quick->manage(window);
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QVERIFY(changed);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QCOMPARE(window->requestedTile(), quick);
+    QCOMPARE(window->moveResizeGeometry(), quick->windowGeometry());
+}
+
+void TestXdgShellWindow::testTransientRequestPendingStates_data()
+{
+    QTest::addColumn<int>("state");
+    QTest::newRow("timer") << 0;
+    QTest::newRow("sent") << 1;
+    QTest::newRow("acked-without-commit") << 2;
+}
+
+void TestXdgShellWindow::testTransientRequestPendingStates()
+{
+    QFETCH(int, state);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    const auto original = window->moveResizeGeometry();
+    configure.clear();
+    window->setActive(!window->isActive());
+    if (state > 0) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+    }
+    if (state == 2) {
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        QVERIFY(Test::waylandSync());
+    }
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), original);
+    QVERIFY(!window->canStartTransientTileRequest(tile.windowGeometry()));
+}
+
+void TestXdgShellWindow::testTransientRequestConstraints_data()
+{
+    QTest::addColumn<bool>("fixedWidth");
+    QTest::addColumn<bool>("fits");
+    QTest::newRow("fixed-width-fits") << true << true;
+    QTest::newRow("fixed-width-reject") << true << false;
+    QTest::newRow("fixed-height-fits") << false << true;
+    QTest::newRow("fixed-height-reject") << false << false;
+}
+
+void TestXdgShellWindow::testTransientRequestConstraints()
+{
+    QFETCH(bool, fixedWidth);
+    QFETCH(bool, fits);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    auto shell = Test::createXdgToplevelSurface(surface.get(), [fixedWidth](Test::XdgToplevel *toplevel) {
+        toplevel->set_min_size(fixedWidth ? 200 : 0, fixedWidth ? 0 : 100);
+        toplevel->set_max_size(fixedWidth ? 200 : 0, fixedWidth ? 0 : 100);
+    });
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->isResizable());
+    RequestTestTile tile(window);
+    const RectF target(100, 100, fits && fixedWidth ? 200 : 400, fits && !fixedWidth ? 100 : 300);
+    tile.setTargetForTest(target);
+    QCOMPARE(window->isTransientTileTargetFeasible(tile.windowGeometry()), fits);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto original = window->moveResizeGeometry();
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(receipt.outcome, fits ? Window::TransientRequestOutcome::Applied : Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(receipt.progress, fits ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
+    QCOMPARE(window->moveResizeGeometry(), fits ? target : original);
+}
+
+void TestXdgShellWindow::testTransientRequestFractional_data()
+{
+    QTest::addColumn<bool>("fits");
+    QTest::newRow("snapped") << true;
+    QTest::newRow("nonrepresentable") << false;
+}
+
+void TestXdgShellWindow::testTransientRequestFractional()
+{
+    QFETCH(bool, fits);
+    Test::OutputInfo output;
+    output.geometry = Rect(0, 0, 1280, 1024);
+    output.scale = 1.25;
+    Test::setOutputConfig(QList<Test::OutputInfo>{output});
+    workspace()->setActiveOutput(QPoint(100, 100));
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->nextTargetScale(), 1.25);
+    RequestTestTile tile(window);
+    tile.setTargetForTest(RectF(100, 100, fits ? 200 : 201, fits ? 100 : 101));
+    QCOMPARE(window->isTransientTileTargetFeasible(tile.windowGeometry()), fits);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(receipt.outcome, fits ? Window::TransientRequestOutcome::Applied : Window::TransientRequestOutcome::Rejected);
+}
+
+void TestXdgShellWindow::testTransientRequestDecorated()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    auto shell = Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly);
+    auto decoration = Test::createXdgToplevelDecorationV1(shell.get());
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    configure.clear();
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    tile.setTargetForTest(RectF(100, 100, 400, 300));
+    QVERIFY(window->canStartTransientTileRequest(tile.windowGeometry()));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(window->moveResizeGeometry(), tile.windowGeometry());
+}
+
+void TestXdgShellWindow::testTransientRequestRequestedRevocation_data()
+{
+    QTest::addColumn<int>("cause");
+    QTest::newRow("owner") << 0;
+    QTest::newRow("tile") << 1;
+    QTest::newRow("manager") << 2;
+    QTest::newRow("window") << 3;
+}
+
+void TestXdgShellWindow::testTransientRequestRequestedRevocation()
+{
+    QFETCH(int, cause);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto manager = std::make_unique<TileManager>(window->moveResizeOutput());
+    auto tile = std::make_unique<RequestTestTile>(window, manager.get());
+    auto owner = std::make_unique<QObject>();
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = owner.get();
+    const auto target = tile->windowGeometry();
+    QPointer<Window> guard(window);
+    QObject context;
+    bool revoked = false;
+    connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+        if (revoked) {
+            return;
+        }
+        revoked = true;
+        if (cause == 0) {
+            owner.reset();
+        } else if (cause == 1) {
+            tile.reset();
+        } else if (cause == 2) {
+            manager.reset();
+        } else {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }
+    });
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, tile.get(), authority));
+    QVERIFY(revoked);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    if (guard) {
+        QVERIFY(!guard->requestedTile());
+        QCOMPARE(guard->moveResizeGeometry(), target);
+    }
+    if (cause == 3) {
+        QTRY_VERIFY(guard.isNull());
+    }
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)

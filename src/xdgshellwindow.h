@@ -72,6 +72,7 @@ protected:
     virtual void handleRoleDestroyed();
 
     XdgSurfaceConfigure *lastAcknowledgedConfigure() const;
+    bool hasPendingNativeGeometry() const;
     void scheduleConfigure();
     void sendConfigure();
 
@@ -193,6 +194,8 @@ protected:
     void doSetNextTargetScale() override;
     void doSetPreferredBufferTransform() override;
     void doSetPreferredColorDescription() override;
+    bool canStartTransientTileRequest(const RectF &target) const override;
+    bool isTransientTileTargetFeasible(const RectF &target) const override;
 
 private:
     void handleWindowTitleChanged();
