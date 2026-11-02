@@ -62,6 +62,7 @@ class VirtualDesktop;
 class WindowItem;
 class TileManager;
 class TransientTileController;
+class TransientNoRequestProof;
 
 namespace Decoration
 {
@@ -1761,6 +1762,7 @@ private:
         // Identifies this private attempt, not a geometry generation or Wayland serial.
         quint64 nativeSequence = 0;
         QUuid windowId;
+        std::shared_ptr<const TransientNoRequestProof> noRequestProof;
     };
     class TransientTileRequest
     {
@@ -2178,6 +2180,7 @@ protected:
     bool m_outputPropertiesPending = false;
     TransientTileRequest *m_activeTransientRequest = nullptr;
     quint64 m_transientRequestSequence = 0;
+    quint64 m_lastTransientOwnershipGeneration = 0;
     RectF m_keyboardGeometryRestore;
     RectF m_maximizeGeometryRestore;
     RectF m_fullscreenGeometryRestore;
