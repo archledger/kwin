@@ -16,8 +16,11 @@
 #include "workspace.h"
 
 #include <QFileInfo>
+#include <QScopeGuard>
 
 #include <csignal>
+#include <limits>
+#include <utility>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -211,24 +214,29 @@ RectF WaylandWindow::frameRectToBufferRect(const RectF &rect) const
 
 void WaylandWindow::updateGeometry(const RectF &rect)
 {
+    if (isDeleted() || m_geometryUpdateGeneration == std::numeric_limits<quint64>::max()) {
+        return;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     const RectF oldClientGeometry = m_clientGeometry;
     const RectF oldFrameGeometry = m_frameGeometry;
     const RectF oldBufferGeometry = m_bufferGeometry;
     LogicalOutput *oldOutput = m_output;
-
-    m_clientGeometry = frameRectToClientRect(rect);
-    m_frameGeometry = rect;
-    m_bufferGeometry = frameRectToBufferRect(rect);
+    const RectF clientGeometry = frameRectToClientRect(rect);
+    const RectF bufferGeometry = frameRectToBufferRect(rect);
 
     WaylandGeometryTypes changedGeometries;
 
-    if (m_clientGeometry != oldClientGeometry) {
+    if (clientGeometry != oldClientGeometry) {
         changedGeometries |= WaylandGeometryClient;
     }
-    if (m_frameGeometry != oldFrameGeometry) {
+    if (rect != oldFrameGeometry) {
         changedGeometries |= WaylandGeometryFrame;
     }
-    if (m_bufferGeometry != oldBufferGeometry) {
+    if (bufferGeometry != oldBufferGeometry) {
         changedGeometries |= WaylandGeometryBuffer;
     }
 
@@ -236,20 +244,67 @@ void WaylandWindow::updateGeometry(const RectF &rect)
         return;
     }
 
-    m_output = workspace()->outputAt(rect.center());
+    const auto generation = ++m_geometryUpdateGeneration;
+    auto &pending = m_pendingGeometryNotifications;
+    if ((changedGeometries & WaylandGeometryBuffer) && !pending.buffer) {
+        pending.buffer = oldBufferGeometry;
+    }
+    if ((changedGeometries & WaylandGeometryClient) && !pending.client) {
+        pending.client = oldClientGeometry;
+    }
+    if ((changedGeometries & WaylandGeometryFrame) && !pending.frame) {
+        pending.frame = oldFrameGeometry;
+    }
+    auto nextOutput = workspace()->outputAt(rect.center());
+    if (oldOutput != nextOutput && !pending.outputPending) {
+        pending.outputPending = true;
+        pending.outputWasNull = !oldOutput;
+        pending.output = oldOutput;
+    }
+    m_clientGeometry = clientGeometry;
+    m_frameGeometry = rect;
+    m_bufferGeometry = bufferGeometry;
+    m_output = nextOutput;
     updateWindowRules(Rules::Position | Rules::Size);
 
-    if (changedGeometries & WaylandGeometryBuffer) {
-        Q_EMIT bufferGeometryChanged(oldBufferGeometry);
+    const auto current = [&]() {
+        if (isDeleted()) {
+            pending = {};
+            return false;
+        }
+        return generation == m_geometryUpdateGeneration;
+    };
+    if (!current()) {
+        return;
     }
-    if (changedGeometries & WaylandGeometryClient) {
-        Q_EMIT clientGeometryChanged(oldClientGeometry);
+    // A newer committed update inherits fields that have not yet been announced.
+    if (auto old = std::exchange(pending.buffer, std::nullopt); old && *old != m_bufferGeometry) {
+        Q_EMIT bufferGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
     }
-    if (changedGeometries & WaylandGeometryFrame) {
-        Q_EMIT frameGeometryChanged(oldFrameGeometry);
+    if (auto old = std::exchange(pending.client, std::nullopt); old && *old != m_clientGeometry) {
+        Q_EMIT clientGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
     }
-    if (oldOutput != m_output) {
-        Q_EMIT outputChanged(oldOutput);
+    if (auto old = std::exchange(pending.frame, std::nullopt); old && *old != m_frameGeometry) {
+        Q_EMIT frameGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
+    }
+    if (pending.outputPending) {
+        const auto output = pending.output;
+        const bool wasNull = pending.outputWasNull;
+        pending.outputPending = false;
+        pending.output.clear();
+        // A destroyed old output is not evidence of a net-zero transition.
+        if ((!wasNull && !output) || output.data() != m_output) {
+            Q_EMIT outputChanged(output.data());
+        }
     }
 }
 
