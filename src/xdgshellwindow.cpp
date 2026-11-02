@@ -41,6 +41,7 @@
 #include <KDecoration3/Decoration>
 
 #include <QPointer>
+#include <QScopeGuard>
 
 namespace KWin
 {
@@ -102,6 +103,13 @@ void XdgSurfaceWindow::handleConfigureAcknowledged(quint32 serial)
 
 void XdgSurfaceWindow::handleCommit()
 {
+    if (isDeleted()) {
+        return;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     if (!m_shellSurface->isConfigured()) {
         return;
     }
@@ -122,9 +130,15 @@ void XdgSurfaceWindow::handleCommit()
 
     if (const XdgSurfaceConfigure *configureEvent = lastAcknowledgedConfigure()) {
         setTargetScale(configureEvent->scale);
+        if (isDeleted()) {
+            return;
+        }
     }
 
     handleRoleCommit();
+    if (isDeleted()) {
+        return;
+    }
     m_lastAcknowledgedConfigure.reset();
     m_lastAcknowledgedConfigureSerial.reset();
 
@@ -141,7 +155,11 @@ void XdgSurfaceWindow::handleRoleCommit()
 
 void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
 {
+    const auto generation = geometryRequestGeneration();
     Q_EMIT frameGeometryAboutToChange();
+    if (!geometryRequestIsCurrent(generation)) {
+        return;
+    }
 
     if (mode != MoveResizeMode::Move) {
         // xdg-shell doesn't support fractional sizes, so the requested
@@ -151,6 +169,7 @@ void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode
         const QSizeF roundedRequestedClientSize = surface()->snappedSize(requestedClientSize);
 
         const QSizeF roundedClientSize = surface()->snappedSize(clientSize());
+        geometryResizeSubmitted(generation);
         if (roundedRequestedClientSize == roundedClientSize) {
             const RectF snappedRect = RectF(rect.topLeft(), nextClientSizeToFrameSize(snapToPixels(roundedClientSize, nextTargetScale())));
             updateGeometry(m_configureGravity.apply(snappedRect, rect));
@@ -620,12 +639,20 @@ XdgSurfaceConfigure *XdgToplevelWindow::sendRoleConfigure()
 void XdgToplevelWindow::handleRoleCommit()
 {
     if (auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure())) {
-        if (configureEvent->decoration) {
-            configureEvent->decoration->apply(configureEvent->decorationState);
+        const auto nextDecoration = configureEvent->decoration;
+        const auto nextState = configureEvent->decorationState;
+        if (nextDecoration) {
+            nextDecoration->apply(nextState);
+            if (isDeleted()) {
+                return;
+            }
         }
 
-        if (decoration() != configureEvent->decoration.get()) {
-            setDecoration(configureEvent->decoration);
+        if (decoration() != nextDecoration.get()) {
+            setDecoration(nextDecoration);
+            if (isDeleted()) {
+                return;
+            }
             updateShadow();
         }
     }
@@ -665,14 +692,25 @@ void XdgToplevelWindow::handleRoleCommit()
 
     if (!m_configureTimer->isActive() && m_configureEvents.isEmpty()) {
         setMoveResizeGeometry(frameGeometry);
+        if (isDeleted()) {
+            return;
+        }
     }
 
     updateGeometry(frameGeometry);
+    if (isDeleted()) {
+        return;
+    }
 
     auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure());
     if (configureEvent) {
-        handleStatesAcknowledged(configureEvent->states);
-        commitTile(configureEvent->tile);
+        const auto states = configureEvent->states;
+        const QPointer<Tile> tile = configureEvent->tile;
+        handleStatesAcknowledged(states);
+        if (isDeleted()) {
+            return;
+        }
+        commitTile(tile);
     }
 }
 
@@ -920,9 +958,15 @@ void XdgToplevelWindow::handleStatesAcknowledged(const XdgToplevelInterface::Sta
             maximizeMode = MaximizeMode(maximizeMode | MaximizeVertical);
         }
         updateMaximizeMode(maximizeMode);
+        if (isDeleted()) {
+            return;
+        }
     }
     if (delta & XdgToplevelInterface::State::FullScreen) {
         updateFullScreenMode(states & XdgToplevelInterface::State::FullScreen);
+        if (isDeleted()) {
+            return;
+        }
     }
 
     m_acknowledgedStates = states;

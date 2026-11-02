@@ -965,6 +965,8 @@ public:
      * within its possibilities.
      */
     void moveResize(const RectF &geometry);
+    // Native request identity, including no-op intents; this is not a scripting property.
+    quint64 geometryRequestGeneration() const;
 
     /*!
      * Returns \c true if the window has already been placed in the workspace; otherwise returns \c false.
@@ -1856,6 +1858,9 @@ protected:
         MoveResize = Move | Resize,
     };
     virtual void moveResizeInternal(const RectF &rect, MoveResizeMode mode) = 0;
+    void performMoveResize(const RectF &rect, MoveResizeMode mode);
+    bool geometryRequestIsCurrent(quint64 generation) const;
+    void geometryResizeSubmitted(quint64 generation);
 
     /*!
      * Returns whether the Window is currently in move resize mode
@@ -2028,6 +2033,16 @@ protected:
     RectF m_frameGeometry;
     RectF m_clientGeometry;
     RectF m_bufferGeometry;
+    quint64 m_geometryUpdateGeneration = 0;
+    struct PendingGeometryNotifications
+    {
+        std::optional<RectF> buffer;
+        std::optional<RectF> client;
+        std::optional<RectF> frame;
+        QPointer<LogicalOutput> output;
+        bool outputPending = false;
+        bool outputWasNull = false;
+    } m_pendingGeometryNotifications;
     bool ready_for_painting;
     bool m_hidden = false;
     bool m_hiddenByShowDesktop = false;
@@ -2099,6 +2114,9 @@ protected:
     // geometry
     LogicalOutput *m_moveResizeOutput = nullptr;
     RectF m_moveResizeGeometry;
+    quint64 m_geometryRequestGeneration = 0;
+    bool m_geometryResizePending = false;
+    bool m_outputPropertiesPending = false;
     RectF m_keyboardGeometryRestore;
     RectF m_maximizeGeometryRestore;
     RectF m_fullscreenGeometryRestore;
