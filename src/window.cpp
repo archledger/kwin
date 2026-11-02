@@ -3915,6 +3915,37 @@ QuickTileMode Window::requestedQuickTileMode() const
 
 void Window::commitTile(Tile *tile)
 {
+    if (tile && tile->isTransient()) {
+        return;
+    }
+    commitTileInternal(tile);
+}
+
+quint64 Window::requestedTransientTileGeneration() const
+{
+    // Keep the origin even when QObject destruction clears the requested Tile pointer.
+    return m_requestedTransientTileGeneration;
+}
+
+void Window::commitTileFromConfigure(Tile *tile, quint64 transientGeneration)
+{
+    if (!transientGeneration) {
+        commitTile(tile);
+        return;
+    }
+    if (isDeleted() || !tile || !tile->isTransient() || !m_transientOwnership
+        || m_transientOwnership->phase != TransientOwnershipPhase::Owned
+        || m_transientOwnership->generation != transientGeneration || m_transientOwnership->tile != tile
+        || m_requestedTransientTileGeneration != transientGeneration || m_requestedTile != tile
+        || !m_transientOwnership->writer
+        || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(transientGeneration))) {
+        return;
+    }
+    commitTileInternal(tile);
+}
+
+void Window::commitTileInternal(Tile *tile)
+{
     if (m_tile == tile) {
         return;
     }
@@ -3951,6 +3982,7 @@ void Window::requestTile(Tile *tile)
     }
 
     if (m_requestedTile == tile) {
+        m_requestedTransientTileGeneration = 0;
         return;
     }
 
@@ -3967,6 +3999,7 @@ void Window::requestTile(Tile *tile)
     }
 
     m_requestedTile = tile;
+    m_requestedTransientTileGeneration = 0;
     if (tile) {
         moveResize(tile->windowGeometry());
     } else {
@@ -3994,6 +4027,7 @@ void Window::forgetTile(Tile *tile)
     }
 
     m_requestedTile = nullptr;
+    m_requestedTransientTileGeneration = 0;
     doSetQuickTileMode();
     Q_EMIT requestedTileChanged();
 }
@@ -4008,6 +4042,7 @@ void Window::setTileCompatibility(Tile *tile)
     cancelTransientRequest();
 
     if (m_requestedTile == tile) {
+        m_requestedTransientTileGeneration = 0;
         return;
     }
 
@@ -4330,8 +4365,10 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     bool applied = false;
     const auto finish = qScopeGuard([&]() {
         // Remove only this attempt's association. Newer native placement and geometry win.
-        if (!applied && request->m_associationInstalled && request->m_tile && m_requestedTile == request->m_tile) {
+        if (!applied && request->m_associationInstalled && request->m_tile && m_requestedTile == request->m_tile
+            && m_requestedTransientTileGeneration == request->m_ownerGeneration) {
             m_requestedTile = nullptr;
+            m_requestedTransientTileGeneration = 0;
             if (!isDeleted()) {
                 doSetQuickTileMode();
                 if (!isDeleted()) {
@@ -4348,6 +4385,7 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         return receipt(TransientRequestOutcome::Superseded);
     }
     m_requestedTile = request->m_tile;
+    m_requestedTransientTileGeneration = request->m_ownerGeneration;
     request->m_associationInstalled = true;
     performMoveResize(request->m_target, MoveResizeMode::MoveResize, request.get());
     if (!transientRequestIsCurrent(*request)) {
