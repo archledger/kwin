@@ -13,6 +13,7 @@
 #include "core/outputconfiguration.h"
 #include "decorations/decorationbridge.h"
 #include "decorations/settings.h"
+#include "effect/effecthandler.h"
 #include "pointer_input.h"
 #include "virtualdesktops.h"
 #include "wayland/clientconnection.h"
@@ -36,6 +37,7 @@
 #include <KWayland/Client/surface.h>
 
 #include <QDBusConnection>
+#include <QPointer>
 
 // system
 #include <sys/socket.h>
@@ -127,6 +129,9 @@ private Q_SLOTS:
     void testRemoveActiveDesktopBeforeMap();
     void testRemoveActiveOutputBeforeInitialCommit();
     void testRemoveActiveOutputBeforeMap();
+    void testRequestedGeometrySettlesOnCommit();
+    void testRequestedGeometryAfterMappingDestroysWindow();
+    void testRequestedGeometryReentrantMove();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -2992,6 +2997,129 @@ void TestXdgShellWindow::testRemoveActiveOutputBeforeMap()
     // The window should have been evacuated from the second output to the first output.
     QCOMPARE(window->output(), outputs[0]);
     QCOMPARE(window->moveResizeOutput(), outputs[0]);
+}
+
+void TestXdgShellWindow::testRequestedGeometrySettlesOnCommit()
+{
+    // This test verifies that the requested geometry stays ahead of the frame geometry while a
+    // configure event is outstanding, and that it is reset to the frame geometry on a commit with
+    // nothing outstanding, even if the client chose a smaller size than requested.
+
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy toplevelConfigureRequestedSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+    QSignalSpy surfaceConfigureRequestedSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 1);
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+
+    const QPointF position = window->pos();
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), window->frameGeometry());
+    QSignalSpy frameGeometryChangedSpy(window, &Window::frameGeometryChanged);
+    QSignalSpy requestedGeometryChangedSpy(window, &Window::requestedGeometryChanged);
+
+    // Request two sizes, one configure event each.
+    const RectF first(position, QSizeF(300, 200));
+    window->moveResize(first);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 2);
+    QCOMPARE(toplevelConfigureRequestedSpy.last().at(0).toSize(), QSize(300, 200));
+    const quint32 firstSerial = surfaceConfigureRequestedSpy.last().at(0).value<quint32>();
+
+    const RectF second(position, QSizeF(400, 300));
+    window->moveResize(second);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 3);
+    QCOMPARE(toplevelConfigureRequestedSpy.last().at(0).toSize(), QSize(400, 300));
+    const quint32 secondSerial = surfaceConfigureRequestedSpy.last().at(0).value<quint32>();
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), second);
+    QCOMPARE(requestedGeometryChangedSpy.count(), 2);
+    QCOMPARE(window->frameGeometry().size(), QSizeF(200, 100));
+
+    // The client answers the first configure event; the second one is still outstanding.
+    requestedGeometryChangedSpy.clear();
+    shellSurface->xdgSurface()->ack_configure(firstSerial);
+    Test::render(surface.get(), QSize(300, 200), Qt::blue);
+    QVERIFY(frameGeometryChangedSpy.wait());
+    QCOMPARE(window->frameGeometry(), first);
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), second);
+    QVERIFY(requestedGeometryChangedSpy.isEmpty());
+
+    // The client answers the second configure event with a smaller size than requested.
+    shellSurface->xdgSurface()->ack_configure(secondSerial);
+    Test::render(surface.get(), QSize(350, 250), Qt::blue);
+    QVERIFY(frameGeometryChangedSpy.wait());
+    QCOMPARE(window->frameGeometry(), RectF(position, QSizeF(350, 250)));
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), window->frameGeometry());
+    QCOMPARE(requestedGeometryChangedSpy.count(), 1);
+}
+
+void TestXdgShellWindow::testRequestedGeometryAfterMappingDestroysWindow()
+{
+    // A native mapping handler may destroy a window synchronously. The commit handler must not
+    // access it afterward, including reading the cached requested geometry without emitting.
+    // A running open animation keeps a destroyed window alive until it ends, so no effect may be
+    // loaded while this case runs; they are restored afterward.
+    QVERIFY(effects);
+    const QStringList loadedEffects = effects->loadedEffects();
+    for (const QString &name : loadedEffects) {
+        effects->unloadEffect(name);
+    }
+    const auto restoreEffects = qScopeGuard([&loadedEffects]() {
+        for (const QString &name : loadedEffects) {
+            effects->loadEffect(name);
+        }
+    });
+    QVERIFY(effects->loadedEffects().isEmpty());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    QPointer<Window> mappedWindow;
+    bool destroyedDuringMap = false;
+    QObject context;
+    connect(workspace(), &Workspace::windowAdded, &context, [&](Window *window) {
+        mappedWindow = window;
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        destroyedDuringMap = true;
+    });
+
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QTRY_VERIFY(destroyedDuringMap);
+    QVERIFY(mappedWindow.isNull());
+}
+
+void TestXdgShellWindow::testRequestedGeometryReentrantMove()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configureRequestedSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(configureRequestedSpy.wait());
+    shellSurface->xdgSurface()->ack_configure(configureRequestedSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+
+    const QPointF first = window->pos() + QPointF(10, 10);
+    const QPointF second = first + QPointF(20, 20);
+    int notifications = 0;
+    QObject context;
+    connect(window, &Window::requestedGeometryChanged, &context, [&] {
+        if (++notifications == 1) {
+            window->move(second);
+        }
+    });
+
+    window->move(first);
+    QCOMPARE(notifications, 2);
+    QCOMPARE(window->frameGeometry().topLeft(), second);
+    QCOMPARE(window->property("requestedGeometry").value<RectF>().topLeft(), second);
+    window->move(second);
+    QCOMPARE(notifications, 2);
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)

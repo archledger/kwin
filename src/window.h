@@ -608,6 +608,8 @@ class KWIN_EXPORT Window : public QObject
      *
      * The geometry of this Window. Be aware that depending on resize mode the frameGeometryChanged
      * signal might be emitted at each resize step or only at the end of the resize operation.
+     *
+     * \sa requestedGeometry
      */
     Q_PROPERTY(KWin::RectF frameGeometry READ frameGeometry WRITE moveResize NOTIFY frameGeometryChanged)
 
@@ -765,6 +767,25 @@ class KWIN_EXPORT Window : public QObject
      * The Tile this window is associated to, if any
      */
     Q_PROPERTY(KWin::Tile *tile READ requestedTile WRITE setTileCompatibility NOTIFY tileChanged)
+
+    /*!
+     * \qmlproperty RectF Window::requestedGeometry
+     *
+     * The geometry KWin most recently asked this Window to take, whereas frameGeometry is the
+     * geometry it currently has. They differ while a Wayland client has not yet committed in
+     * response to a geometry-changing configure event, and on X11 while a synchronized resize is
+     * in progress. An empty size means that the client has been asked to choose its own size.
+     *
+     * On xdg-shell windows (including picture-in-picture windows), KWin synchronizes this with
+     * frameGeometry on a commit when no configure event is pending or scheduled. On other windows
+     * they can stay different, for example because of pixel rounding, and it is not meaningful
+     * for unmanaged X11 windows.
+     *
+     * Compare rectangles by their x, y, width and height.
+     *
+     * \sa frameGeometry
+     */
+    Q_PROPERTY(KWin::RectF requestedGeometry READ moveResizeGeometry NOTIFY requestedGeometryChanged)
 
     /*!
      * \qmlproperty bool Window::inputMethod
@@ -1654,6 +1675,12 @@ Q_SIGNALS:
      */
     void tileChanged(KWin::Tile *tile);
     void requestedTileChanged();
+    /**
+     * This signal is emitted when the requested geometry (moveResizeGeometry()) differs from the
+     * value it was last emitted for, after KWin has processed the move, resize or commit that
+     * changed it.
+     */
+    void requestedGeometryChanged();
 
     void fullScreenChanged();
     void skipTaskbarChanged();
@@ -1882,6 +1909,13 @@ protected:
         return m_interactiveMoveResize.initialGeometry;
     }
     void setMoveResizeGeometry(const RectF &geo);
+    /**
+     * Emits requestedGeometryChanged() if moveResizeGeometry() differs from the value it was last
+     * emitted for. Call it once the operation that may have changed the requested geometry is
+     * complete, not from setMoveResizeGeometry(): a handler that moves the window would otherwise
+     * be overridden by the rest of the operation.
+     */
+    void notifyRequestedGeometryChanged();
     void setInteractiveMoveResizeGravity(Gravity gravity)
     {
         m_interactiveMoveResize.gravity = gravity;
