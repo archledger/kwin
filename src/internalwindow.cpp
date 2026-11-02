@@ -47,6 +47,7 @@ InternalWindow::InternalWindow(QWindow *handle)
     updateShadow();
 
     setMoveResizeGeometry(m_handle->geometry());
+    notifyRequestedGeometryChanged();
     commitGeometry(m_handle->geometry());
 
     updateDecoration(true);

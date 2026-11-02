@@ -134,7 +134,7 @@ public:
     }
     RegionF opaque() const override
     {
-        return hasAlphaChannel() ? RegionF{} : rect();
+        return hasAlphaChannel() || opacity() != 1.0 ? RegionF{} : rect();
     }
     void setScanoutHint(DrmDevice *device, const FormatModifierMap &drmFormats) override
     {
@@ -558,7 +558,8 @@ Rect OffscreenQuickView::geometry() const
 
 void OffscreenQuickView::setOpacity(qreal opacity)
 {
-    d->m_item->setOpacity(opacity);
+    d->m_view->setOpacity(opacity);
+    d->m_item->setOpacity(d->m_view->opacity());
 }
 
 qreal OffscreenQuickView::opacity() const

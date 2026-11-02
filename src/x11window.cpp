@@ -3810,6 +3810,7 @@ void X11Window::doInteractiveResizeSync(const RectF &rect)
         setMoveResizeGeometry(moveResizeFrameGeometry);
         sendSyncRequest();
         configure(nativeBufferGeometry);
+        notifyRequestedGeometryChanged();
     }
 }
 
