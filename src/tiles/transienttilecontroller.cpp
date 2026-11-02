@@ -85,6 +85,9 @@ public:
 
     ~TransientTile() override
     {
+        if (m_registration) {
+            m_registration->destroying = true;
+        }
         m_destroying = true;
         if (m_controller) {
             m_controller->nodeAboutToBeDestroyed(this);
@@ -188,6 +191,7 @@ private:
     }
 
     QPointer<TransientTileController> m_controller;
+    std::shared_ptr<TileManager::TransientRegistration> m_registration;
     bool m_destroying = false;
 };
 
@@ -391,6 +395,9 @@ TransientTileController::Result TransientTileController::createTree(TileManager 
     if (!validContext(manager, desktop)) {
         return Result::InvalidContext;
     }
+    if (!manager->canRegisterTransientRoot(desktop)) {
+        return Result::Busy;
+    }
     if (!validGeometry(geometry)) {
         return Result::InvalidGeometry;
     }
@@ -429,6 +436,11 @@ TransientTileController::Result TransientTileController::createTree(TileManager 
     m_manager = contextManager;
     m_desktop = contextDesktop;
     ++m_generation;
+    root->m_registration = contextManager->registerTransientRoot(root, this, m_generation);
+    if (!root->m_registration) {
+        resetTree();
+        return Result::Refused;
+    }
     m_managerDestroyed = connect(contextManager, &QObject::destroyed, this, [this]() {
         clearTree(m_generation);
     });
@@ -484,6 +496,9 @@ TransientTileController::Result TransientTileController::clearTree(quint64 gener
 
 void TransientTileController::resetTree()
 {
+    if (m_manager && m_root) {
+        m_manager->unregisterTransientRoot(m_desktop, m_root, this, m_generation);
+    }
     disconnect(m_managerDestroyed);
     disconnect(m_desktopDestroyed);
     m_root.clear();
