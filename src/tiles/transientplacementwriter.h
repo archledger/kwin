@@ -13,13 +13,49 @@
 #include <QTimer>
 #include <QUuid>
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 
 class KConfig;
 
 namespace KWin
 {
+
+class Window;
+class TransientPlacementWriter;
+
+// Only Window can mint evidence that an exact native ownership attempt issued no geometry.
+class TransientNoRequestProof final
+{
+public:
+    ~TransientNoRequestProof() = default;
+
+private:
+    friend class Window;
+    friend class TransientPlacementWriter;
+    Q_DISABLE_COPY_MOVE(TransientNoRequestProof)
+
+    enum class Validity {
+        Current,
+        Closing,
+        Superseded,
+    };
+    TransientNoRequestProof(const QUuid &window, quint64 generation, quint64 sequence, std::function<Validity()> validity)
+        : m_window(window)
+        , m_generation(generation)
+        , m_sequence(sequence)
+        , m_validity(std::move(validity))
+    {
+    }
+
+    const QUuid m_window;
+    const quint64 m_generation;
+    const quint64 m_sequence;
+    const std::function<Validity()> m_validity;
+    mutable bool m_consumed = false;
+};
 
 // Compositor-thread-only. Event ordering/origin comes from the native adapter, never QML claims.
 // This writer is not instantiated by the desktop until its native integration is ready.
