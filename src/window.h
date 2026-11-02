@@ -63,6 +63,7 @@ class WindowItem;
 class TileManager;
 class TransientTileController;
 class TransientNoRequestProof;
+class TransientPlacementWriter;
 
 namespace Decoration
 {
@@ -1621,6 +1622,42 @@ private:
         bool m_associationInstalled = false;
     };
 
+    enum class TransientOwnershipPhase {
+        Prepared,
+        Owned,
+        Restoring,
+    };
+    struct TransientOwnership
+    {
+        TransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, quint64 providerRevision,
+                           quint64 generation, std::unique_ptr<TransientTileRequest> request);
+
+        QPointer<TransientPlacementWriter> writer;
+        const QUuid provider;
+        const quint64 providerRevision;
+        const quint64 generation;
+        const RectF floating;
+        const RectF target;
+        const QPointer<Tile> tile;
+        const QPointer<TileManager> manager;
+        const QPointer<LogicalOutput> output;
+        const QPointer<VirtualDesktop> desktop;
+        const quint64 initialGeometryGeneration;
+        TransientOwnershipPhase phase = TransientOwnershipPhase::Prepared;
+        TransientRequestProgress progress = TransientRequestProgress::NoRequest;
+        quint64 nativeSequence = 0;
+        bool executing = false;
+        QMetaObject::Connection closeCleanup;
+        std::shared_ptr<const TransientNoRequestProof> noRequestProof;
+        std::unique_ptr<TransientTileRequest> request;
+    };
+
+    quint64 prepareTransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, const QString &key,
+                                      quint64 providerRevision, quint64 mapRevision, std::unique_ptr<TransientTileRequest> request);
+    bool activateTransientOwnership(quint64 generation);
+    TransientRequestReceipt applyTransientOwnership(quint64 generation);
+    bool revokeTransientOwnership(quint64 generation);
+    std::shared_ptr<const TransientNoRequestProof> makeTransientNoRequestProof(const TransientTileRequest &request);
     TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request);
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
@@ -2007,6 +2044,8 @@ protected:
     TransientTileRequest *m_activeTransientRequest = nullptr;
     quint64 m_transientRequestSequence = 0;
     quint64 m_lastTransientOwnershipGeneration = 0;
+    quint64 m_transientOwnershipGeneration = 0;
+    std::unique_ptr<TransientOwnership> m_transientOwnership;
     RectF m_keyboardGeometryRestore;
     RectF m_maximizeGeometryRestore;
     RectF m_fullscreenGeometryRestore;
