@@ -16,6 +16,7 @@
 #include "decorations/settings.h"
 #include "pointer_input.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transientplacementwriter.h"
 #include "virtualdesktops.h"
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
@@ -48,6 +49,7 @@
 #include <linux/input.h>
 
 #include <csignal>
+#include <type_traits>
 
 using namespace KWin;
 
@@ -96,8 +98,8 @@ class TestXdgShellWindow : public QObject
     class RequestForTest : public Window::TransientTileRequest
     {
     public:
-        RequestForTest(Window *window, Tile *tile, std::shared_ptr<RequestAuthority> authority)
-            : TransientTileRequest(window, tile, 7)
+        RequestForTest(Window *window, Tile *tile, std::shared_ptr<RequestAuthority> authority, quint64 generation = 7)
+            : TransientTileRequest(window, tile, generation)
             , m_authority(std::move(authority))
         {
         }
@@ -219,6 +221,7 @@ private Q_SLOTS:
     void testTransientRequestDecorated();
     void testTransientRequestRequestedRevocation_data();
     void testTransientRequestRequestedRevocation();
+    void testTransientNoRequestProofReplay();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -3503,6 +3506,7 @@ void TestXdgShellWindow::testPrivateTransientRequest()
     const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
     QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
     QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    QVERIFY(!receipt.noRequestProof);
     QCOMPARE(receipt.ownershipGeneration, quint64(7));
     QCOMPARE(receipt.windowId, window->internalId());
     QCOMPARE(window->requestedTile(), &tile);
@@ -3548,6 +3552,7 @@ void TestXdgShellWindow::testTransientRequestCancellation()
     QVERIFY(cancelled);
     QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Superseded);
     QCOMPARE(receipt.progress, afterRequest ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
+    QCOMPARE(bool(receipt.noRequestProof), !afterRequest);
     QVERIFY(!window->requestedTile());
     QCOMPARE(window->moveResizeGeometry(), original);
 }
@@ -3983,6 +3988,35 @@ void TestXdgShellWindow::testTransientRequestRequestedRevocation()
     if (cause == 3) {
         QTRY_VERIFY(guard.isNull());
     }
+}
+
+void TestXdgShellWindow::testTransientNoRequestProofReplay()
+{
+    static_assert(!std::is_copy_constructible_v<TransientNoRequestProof>);
+    static_assert(!std::is_move_constructible_v<TransientNoRequestProof>);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto requested = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority, 7));
+    QCOMPARE(requested.progress, Window::TransientRequestProgress::Requested);
+    QVERIFY(!requested.noRequestProof);
+    const auto repeated = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority, 7));
+    QCOMPARE(repeated.outcome, Window::TransientRequestOutcome::Rejected);
+    QVERIFY(!repeated.noRequestProof);
+    const auto rejected = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority, 8));
+    QCOMPARE(rejected.outcome, Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(rejected.progress, Window::TransientRequestProgress::NoRequest);
+    QVERIFY(rejected.noRequestProof);
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)
