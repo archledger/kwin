@@ -1662,6 +1662,7 @@ private:
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     void cancelTransientRequest();
+    void commitTileInternal(Tile *tile);
 
 protected:
     Window();
@@ -1784,6 +1785,8 @@ protected:
     bool geometryRequestIsCurrent(quint64 generation) const;
     void geometryResizeSubmitted(quint64 generation);
     bool transientGeometryRequestIsCurrent(quint64 generation) const;
+    quint64 requestedTransientTileGeneration() const;
+    void commitTileFromConfigure(Tile *tile, quint64 transientGeneration);
     virtual bool canStartTransientTileRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
 
@@ -2027,6 +2030,7 @@ protected:
     Layer m_layer = UnknownLayer;
     bool m_delayedRaise = false;
     QPointer<Tile> m_requestedTile;
+    quint64 m_requestedTransientTileGeneration = 0;
     QPointer<Tile> m_tile;
 
     // electric border/quick tiling

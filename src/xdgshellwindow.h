@@ -116,6 +116,7 @@ public:
     std::shared_ptr<KDecoration3::DecorationState> decorationState;
     XdgToplevelInterface::States states;
     QPointer<Tile> tile = nullptr;
+    quint64 transientOwnershipGeneration = 0;
 };
 
 class XdgToplevelSessionData

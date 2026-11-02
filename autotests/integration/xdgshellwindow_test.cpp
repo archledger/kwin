@@ -83,6 +83,13 @@ public:
                                    absolute.width() / output.width(), absolute.height() / output.height());
     }
 
+    void abandonWithoutForgetForTest()
+    {
+        // Model native node destruction before the later structural-release leaf is wired.
+        m_windows.clear();
+        m_window.clear();
+    }
+
 private:
     QPointer<Window> m_window;
 };
@@ -245,6 +252,9 @@ private Q_SLOTS:
     void testTransientOwnershipWriterLoss();
     void testTransientOwnershipExhaustion();
     void testTransientOwnershipApplied();
+    void testTransientConfigureProvenance_data();
+    void testTransientConfigureProvenance();
+    void testTransientAssociationOrigin();
 };
 
 void TestXdgShellWindow::testXdgPopupReactive_data()
@@ -4842,6 +4852,158 @@ void TestXdgShellWindow::testTransientOwnershipApplied()
     window->destroyWindow();
     QTRY_VERIFY(!guard);
     QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testTransientConfigureProvenance_data()
+{
+    QTest::addColumn<int>("mode");
+    QTest::newRow("owned") << 0;
+    QTest::newRow("revoked-live-tile") << 1;
+    QTest::newRow("deleted-after-configure") << 2;
+    QTest::newRow("deleted-before-configure") << 3;
+}
+
+void TestXdgShellWindow::testTransientConfigureProvenance()
+{
+    QFETCH(int, mode);
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    auto tile = std::make_unique<RequestTestTile>(window);
+    const auto output = tile->manager()->output()->geometryF();
+    tile->setTargetForTest(RectF(output.x(), output.y(), output.width() / 2, output.height()));
+    QVERIFY(tile->anchors() != Qt::Edges());
+    const auto target = tile->windowGeometry();
+    QPointer<Tile> tileGuard(tile.get());
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto snapshot = writer.snapshot();
+    const auto generation = window->prepareTransientOwnership(&writer, token, QStringLiteral("app"), snapshot.providerRevision, snapshot.mapRevision,
+                                                              std::make_unique<RequestForTest>(window, tile.get(), authority, 0));
+    QVERIFY(generation);
+    QVERIFY(window->activateTransientOwnership(generation));
+    const auto receipt = window->applyTransientOwnership(generation);
+    QCOMPARE(receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
+    Tile ordinary(workspace()->tileManager(window->moveResizeOutput()));
+    if (mode == 3) {
+        tile->abandonWithoutForgetForTest();
+        tile.reset();
+        QVERIFY(!tileGuard);
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        // A native association seam, not a claim that a newer client configure committed first.
+        window->commitTile(&ordinary);
+        QCOMPARE(window->tile(), &ordinary);
+    }
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    const auto oldSerial = configure.last().at(0).value<quint32>();
+    if (mode == 0) {
+        QCOMPARE(window->requestedTile(), tile.get());
+        QVERIFY(writer.ownsReservation(id, QString::number(generation)));
+        window->commitTileFromConfigure(tile.get(), generation + 1);
+        QVERIFY(!window->tile());
+    }
+    if (mode == 1 || mode == 2) {
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        window->forgetTile(tile.get());
+        if (mode == 2) {
+            tile.reset();
+            QVERIFY(!tileGuard);
+        }
+        window->commitTile(&ordinary);
+        QCOMPARE(window->tile(), &ordinary);
+    }
+    shell->xdgSurface()->ack_configure(oldSerial);
+    Test::render(surface.get(), target.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    if (mode == 0) {
+        QCOMPARE(window->tile(), tile.get());
+        QVERIFY(writer.ownsReservation(id, QString::number(generation)));
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        QCOMPARE(window->requestedTile(), tile.get());
+        window->forgetTile(tile.get());
+        QVERIFY(!window->requestedTile());
+    } else {
+        QCOMPARE(window->tile(), &ordinary);
+        QVERIFY(writer.isReserved(id));
+        if (mode == 3) {
+            window->forgetTile(nullptr);
+        }
+    }
+    // A later genuine ordinary untile configure must still commit its null association.
+    if (configure.last().at(0).value<quint32>() == oldSerial) {
+        QVERIFY(configure.wait());
+    }
+    QVERIFY(configure.last().at(0).value<quint32>() != oldSerial);
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), target.size().toSize(), Qt::green);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(!window->tile());
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testTransientAssociationOrigin()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    auto tile = std::make_unique<RequestTestTile>(window);
+    const auto target = tile->windowGeometry();
+    window->commitTile(tile.get());
+    QVERIFY(!window->tile()); // Untagged callers cannot commit a transient association.
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QCOMPARE(window->requestTransientTile(std::make_unique<RequestForTest>(window, tile.get(), authority, 7)).outcome,
+             Window::TransientRequestOutcome::Applied);
+    QCOMPARE(window->requestedTransientTileGeneration(), quint64(7));
+    QCOMPARE(window->requestTransientTile(std::make_unique<RequestForTest>(window, tile.get(), authority, 8)).outcome,
+             Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(window->m_lastTransientOwnershipGeneration, quint64(8));
+    QCOMPARE(window->requestedTransientTileGeneration(), quint64(7));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), target.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(tile);
+    QVERIFY(!window->tile()); // A raw receipt with a live tile is not committed ownership.
+    tile->abandonWithoutForgetForTest();
+    tile.reset();
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->requestedTransientTileGeneration(), quint64(7));
+    QVERIFY(!window->tile());
+    window->requestTile(nullptr);
+    QCOMPARE(window->requestedTransientTileGeneration(), quint64(0));
 }
 
 WAYLANDTEST_MAIN(TestXdgShellWindow)
