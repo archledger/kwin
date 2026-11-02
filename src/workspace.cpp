@@ -146,6 +146,9 @@ Workspace::Workspace()
     // actual initialization happens in init()
     VirtualDesktopManager::create(this);
     m_transientTileController = std::make_unique<TransientTileController>();
+    m_outputUpdateTimer.setSingleShot(true);
+    m_outputUpdateTimer.setInterval(0);
+    connect(&m_outputUpdateTimer, &QTimer::timeout, this, &Workspace::updateOutputs);
     // dbus interface
     new VirtualDesktopManagerDBusInterface(VirtualDesktopManager::self());
 
@@ -475,6 +478,8 @@ void Workspace::cleanupX11()
 Workspace::~Workspace()
 {
     m_shuttingDown = true;
+    m_outputUpdateTimer.stop();
+    m_outputUpdatePending = false;
     for (const auto &[output, manager] : m_tileManagers) {
         if (manager) {
             manager->closeTransientRegistration();
@@ -523,6 +528,15 @@ OutputConfigurationError Workspace::applyOutputConfiguration(OutputConfiguration
 {
     assignBrightnessDevices(config);
     const auto backendOutputs = kwinApp()->outputBackend()->outputs();
+    // Disabled outputs may disappear during reconciliation but remain in this snapshot.
+    for (BackendOutput *output : backendOutputs) {
+        output->ref();
+    }
+    const auto releaseBackends = qScopeGuard([backendOutputs]() {
+        for (BackendOutput *output : backendOutputs) {
+            output->unref();
+        }
+    });
     if (config.source == OutputConfiguration::Source::User) {
         // if the user adjusted brightness setting of an output,
         // adjust its brightness map to fit the new preference
@@ -641,6 +655,15 @@ void Workspace::updateXwaylandScale()
 void Workspace::updateOutputConfiguration()
 {
     const auto outputs = kwinApp()->outputBackend()->outputs();
+    // The nested application must not invalidate later policy/bookkeeping reads.
+    for (BackendOutput *output : outputs) {
+        output->ref();
+    }
+    const auto releaseOutputs = qScopeGuard([outputs]() {
+        for (BackendOutput *output : outputs) {
+            output->unref();
+        }
+    });
     if (outputs.empty()) {
         // nothing to do
         updateOutputOrder();
@@ -1362,27 +1385,73 @@ void Workspace::updateOutputs()
     if (m_shuttingDown) {
         return;
     }
-    // Repair a callback-deleted manager at a defined reconciliation boundary, not in getters.
-    for (LogicalOutput *output : std::as_const(m_outputs)) {
-        if (!tileManager(output)) {
-            m_tileManagers[output] = new TileManager(output);
+    if (m_updatingOutputs) {
+        m_outputUpdatePending = true;
+        return;
+    }
+    m_outputUpdateTimer.stop();
+    m_outputUpdatePending = false;
+    m_updatingOutputs = true;
+    // Run last: destruction callbacks during lifetime cleanup still belong to this pass.
+    const auto finish = qScopeGuard([this]() {
+        m_updatingOutputs = false;
+        if (m_outputUpdatePending && !m_shuttingDown) {
+            m_outputUpdateTimer.start();
         }
+    });
+
+    QList<BackendOutput *> retainedBackends;
+    QList<LogicalOutput *> retainedOutputs;
+    QList<Window *> retainedWindows;
+    const auto release = qScopeGuard([&]() {
+        for (Window *window : std::as_const(retainedWindows)) {
+            window->unref();
+        }
+        for (LogicalOutput *output : std::as_const(retainedOutputs)) {
+            output->unref();
+        }
+        for (BackendOutput *output : std::as_const(retainedBackends)) {
+            output->unref();
+        }
+    });
+    const auto retainBackend = [&](BackendOutput *output) {
+        if (!retainedBackends.contains(output)) {
+            output->ref();
+            retainedBackends.append(output);
+        }
+    };
+    const auto retainOutput = [&](LogicalOutput *output) {
+        retainBackend(output->backendOutput());
+        if (!retainedOutputs.contains(output)) {
+            output->ref();
+            retainedOutputs.append(output);
+        }
+    };
+    const auto availableOutputs = kwinApp()->outputBackend()->outputs();
+    const auto oldLogicalOutputs = m_outputs;
+    QHash<LogicalOutput *, Rect> oldGeometries;
+    QHash<LogicalOutput *, QString> oldIds;
+    for (BackendOutput *output : availableOutputs) {
+        retainBackend(output);
+    }
+    for (LogicalOutput *output : oldLogicalOutputs) {
+        retainOutput(output);
+        oldGeometries.insert(output, output->geometry());
+        oldIds.insert(output, output->uuid());
     }
     QHash<Window *, LogicalOutput *> oldMoveResizeOutputs;
     for (Window *window : m_windows) {
+        window->ref();
+        retainedWindows.append(window);
         if (window->isClient()) {
             oldMoveResizeOutputs[window] = window->moveResizeOutput();
         }
     }
-
-    const auto availableOutputs = kwinApp()->outputBackend()->outputs();
-    const auto oldLogicalOutputs = m_outputs;
+    const bool removedWhileDpmsOff = m_dpms == DpmsState::Off;
     QList<BackendOutput *> newBackendOutputs;
     bool wakeUp = false;
 
     for (BackendOutput *output : availableOutputs) {
-        output->setAutoRotateAvailable(m_orientationSensor->isAvailable());
-        output->setAutoBrightnessAvailable(m_lightSensor->isAvailable());
         if (!wantsToManage(output)) {
             continue;
         }
@@ -1403,6 +1472,7 @@ void Workspace::updateOutputs()
             input()->installInputEventFilter(m_placeholderFilter.get());
         }
         newBackendOutputs.append(m_placeholderOutput);
+        retainBackend(m_placeholderOutput);
     } else {
         if (m_placeholderOutput) {
             m_placeholderOutput->unref();
@@ -1411,31 +1481,74 @@ void Workspace::updateOutputs()
         }
     }
 
-    // Re-create m_outputs list, creating new outputs as necessary
-    // Removed outputs will be unreferenced later
-    m_outputs.clear();
+    struct OutputState
+    {
+        BackendOutput *backend;
+        QPoint position;
+        QSize modeSize;
+        uint32_t refreshRate;
+        OutputTransform transform;
+        double scale;
+        QString description;
+        uint32_t priority;
+        bool wakeUp;
+        LogicalOutput *logical = nullptr;
+        bool added = false;
+    };
+    QList<OutputState> states;
+    for (BackendOutput *output : newBackendOutputs) {
+        states.append(OutputState{
+            .backend = output,
+            .position = output->position(),
+            .modeSize = output->modeSize(),
+            .refreshRate = output->refreshRate(),
+            .transform = output->transform(),
+            .scale = output->scale(),
+            .description = generateDescription(output, newBackendOutputs),
+            .priority = output->priority(),
+            .wakeUp = !output->isPlaceholder() && !m_recentlyRemovedDpmsOffOutputs.contains(output->uuid()),
+        });
+    }
+    for (BackendOutput *output : availableOutputs) {
+        output->setAutoRotateAvailable(m_orientationSensor->isAvailable());
+        output->setAutoBrightnessAvailable(m_lightSensor->isAvailable());
+    }
+
     // we need to normalize output positions, as some applications
     // make assumptions about output positions starting at 0,0
     QPoint topLeftMostCoordinates = QPoint(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
-    for (BackendOutput *output : newBackendOutputs) {
-        topLeftMostCoordinates.setX(std::min(topLeftMostCoordinates.x(), output->position().x()));
-        topLeftMostCoordinates.setY(std::min(topLeftMostCoordinates.y(), output->position().y()));
+    for (const auto &state : states) {
+        topLeftMostCoordinates.setX(std::min(topLeftMostCoordinates.x(), state.position.x()));
+        topLeftMostCoordinates.setY(std::min(topLeftMostCoordinates.y(), state.position.y()));
     }
-    for (BackendOutput *output : newBackendOutputs) {
-        const auto existing = std::ranges::find_if(oldLogicalOutputs, [output](LogicalOutput *logical) {
-            return output == logical->backendOutput();
+    QList<LogicalOutput *> newLogicalOutputs;
+    QHash<LogicalOutput *, uint32_t> priorities;
+    for (auto &state : states) {
+        const auto existing = std::ranges::find_if(oldLogicalOutputs, [&state](LogicalOutput *logical) {
+            return state.backend == logical->backendOutput();
         });
         if (existing == oldLogicalOutputs.end()) {
-            m_outputs.push_back(new LogicalOutput(output));
+            state.logical = new LogicalOutput(state.backend);
+            state.added = true;
+            // Separate Workspace ownership from the temporary pass references.
+            state.backend->ref();
         } else {
-            m_outputs.push_back(*existing);
+            state.logical = *existing;
         }
-        // update geometry
-        m_outputs.back()->setData(output->position() - topLeftMostCoordinates, output->modeSize(),
-                                  output->refreshRate(), output->transform(), output->scale(),
-                                  generateDescription(output, newBackendOutputs));
-        if (existing != oldLogicalOutputs.end()) {
-            Q_EMIT m_outputs.back()->changed();
+        retainOutput(state.logical);
+        newLogicalOutputs.append(state.logical);
+        priorities.insert(state.logical, state.priority);
+    }
+    QList<LogicalOutput *> newOrder = newLogicalOutputs;
+    std::ranges::stable_sort(newOrder, [&priorities](LogicalOutput *left, LogicalOutput *right) {
+        return priorities.value(left) < priorities.value(right);
+    });
+    m_outputs = newLogicalOutputs;
+    for (const auto &state : states) {
+        state.logical->setData(state.position - topLeftMostCoordinates, state.modeSize,
+                               state.refreshRate, state.transform, state.scale, state.description);
+        if (!state.added) {
+            Q_EMIT state.logical->changed();
         }
     }
 
@@ -1443,17 +1556,21 @@ void Workspace::updateOutputs()
         setActiveOutput(m_outputs[0]);
     }
 
-    updateOutputOrder();
+    updateOutputOrder(newOrder);
 
     const QSet<LogicalOutput *> oldOutputsSet(oldLogicalOutputs.constBegin(), oldLogicalOutputs.constEnd());
     const QSet<LogicalOutput *> outputsSet(m_outputs.constBegin(), m_outputs.constEnd());
 
     const auto added = outputsSet - oldOutputsSet;
-    for (LogicalOutput *output : added) {
-        output->backendOutput()->ref();
-        m_tileManagers[output] = new TileManager(output);
-        Q_EMIT outputAdded(output);
-        wakeUp |= !output->isPlaceholder() && !m_recentlyRemovedDpmsOffOutputs.contains(output->uuid());
+    for (const auto &state : states) {
+        // Repair deleted managers only at this explicit reconciliation boundary.
+        if (!tileManager(state.logical)) {
+            m_tileManagers[state.logical] = new TileManager(state.logical);
+        }
+        if (added.contains(state.logical)) {
+            Q_EMIT outputAdded(state.logical);
+            wakeUp |= state.wakeUp;
+        }
     }
 
     m_placementTracker->inhibit();
@@ -1505,7 +1622,7 @@ void Workspace::updateOutputs()
                     continue;
                 }
 
-                LogicalOutput *bestOutput = outputAt(output->geometry().center());
+                LogicalOutput *bestOutput = outputAt(oldGeometries.value(output).center());
                 const auto bestManager = this->tileManager(bestOutput);
                 const auto bestRoot = bestManager ? bestManager->quickRootTile(desktop) : nullptr;
                 Tile *bestTile = bestRoot ? bestRoot->tileForMode(quickTileMode) : nullptr;
@@ -1527,9 +1644,10 @@ void Workspace::updateOutputs()
     Q_EMIT outputsChanged();
 
     for (LogicalOutput *output : removed) {
-        if (m_dpms == Workspace::DpmsState::Off) {
-            m_recentlyRemovedDpmsOffOutputs.push_back(output->uuid());
-            QTimer::singleShot(s_dpmsTimeout, [this, uuid = output->uuid()]() {
+        if (removedWhileDpmsOff) {
+            const auto uuid = oldIds.value(output);
+            m_recentlyRemovedDpmsOffOutputs.push_back(uuid);
+            QTimer::singleShot(s_dpmsTimeout, this, [this, uuid]() {
                 m_recentlyRemovedDpmsOffOutputs.removeOne(uuid);
             });
         }
@@ -2663,12 +2781,21 @@ LogicalOutput *Workspace::xineramaIndexToOutput(int index) const
 
 void Workspace::updateOutputOrder()
 {
-    auto previousOutputOrder = std::move(m_outputOrder);
-    m_outputOrder = m_outputs;
-    std::ranges::stable_sort(m_outputOrder, [](LogicalOutput *l, LogicalOutput *r) {
+    if (m_updatingOutputs) {
+        m_outputUpdatePending = true;
+        return;
+    }
+    auto order = m_outputs;
+    std::ranges::stable_sort(order, [](LogicalOutput *l, LogicalOutput *r) {
         return l->backendOutput()->priority() < r->backendOutput()->priority();
     });
-    if (m_outputOrder != previousOutputOrder) {
+    updateOutputOrder(order);
+}
+
+void Workspace::updateOutputOrder(const QList<LogicalOutput *> &order)
+{
+    if (m_outputOrder != order) {
+        m_outputOrder = order;
         Q_EMIT outputOrderChanged();
     }
 }
