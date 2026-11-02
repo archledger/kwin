@@ -31,6 +31,7 @@
 #include "shadow.h"
 #include "tiles/tilemanager.h"
 #include "tiles/transientplacementwriter.h"
+#include "tiles/transienttilecontroller.h"
 #include "useractions.h"
 #include "virtualdesktops.h"
 #include "wayland/output.h"
@@ -65,6 +66,12 @@ QHash<const Window *, RectF> s_notifiedRequestedGeometry;
 bool exactFrameGeometry(const RectF &left, const RectF &right)
 {
     return left.x() == right.x() && left.y() == right.y() && left.width() == right.width() && left.height() == right.height();
+}
+
+quint64 nextAssociationChange(quint64 current)
+{
+    // Saturate rather than allowing an old pending notification to match a wrapped identity.
+    return current == std::numeric_limits<quint64>::max() ? current : current + 1;
 }
 
 }
@@ -3938,21 +3945,32 @@ void Window::commitTileFromConfigure(Tile *tile, quint64 transientGeneration)
         || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(transientGeneration))) {
         return;
     }
+    m_transientOwnership->committed = true;
     commitTileInternal(tile);
 }
 
 void Window::commitTileInternal(Tile *tile)
 {
-    if (m_tile == tile) {
+    if (isDeleted() || m_tile == tile) {
         return;
     }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const QPointer<Tile> committed(tile);
 
     QuickTileMode oldTileMode = quickTileMode();
 
     m_tile = tile;
+    m_committedTileChange = nextAssociationChange(m_committedTileChange);
+    const auto change = m_committedTileChange;
 
     Q_EMIT tileChanged(tile);
 
+    if (isDeleted() || m_tile != committed || m_committedTileChange != change || change == std::numeric_limits<quint64>::max()) {
+        return;
+    }
     if (oldTileMode != quickTileMode()) {
         Q_EMIT quickTileModeChanged();
     }
@@ -3997,6 +4015,7 @@ void Window::requestTile(Tile *tile)
 
     m_requestedTile = tile;
     m_requestedTransientTileGeneration = 0;
+    m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
     if (tile) {
         moveResize(tile->windowGeometry());
     } else {
@@ -4025,6 +4044,7 @@ void Window::forgetTile(Tile *tile)
 
     m_requestedTile = nullptr;
     m_requestedTransientTileGeneration = 0;
+    m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
     doSetQuickTileMode();
     Q_EMIT requestedTileChanged();
 }
@@ -4190,22 +4210,116 @@ Window::TransientRequestReceipt Window::applyTransientOwnership(quint64 generati
 
 bool Window::revokeTransientOwnership(quint64 generation)
 {
-    if (isDeleted() || !m_transientOwnership || m_transientOwnership->generation != generation) {
+    if (!m_transientOwnership || m_transientOwnership->generation != generation) {
+        return false;
+    }
+    if (const auto controller = m_transientOwnership->controller) {
+        return controller->releaseWindow(this, generation);
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    if (!beginTransientRelease(generation)) {
+        return false;
+    }
+    const auto changes = detachTransientAssociation(generation);
+    notifyTransientAssociation(generation, changes);
+    return finishTransientRelease(generation);
+}
+
+bool Window::beginTransientRelease(quint64 generation)
+{
+    if (!m_transientOwnership || m_transientOwnership->generation != generation || m_transientOwnership->releasing) {
         return false;
     }
     auto &ownership = *m_transientOwnership;
-    if (ownership.phase == TransientOwnershipPhase::Prepared) {
-        if (!ownership.writer || ownership.writer->cancelReservation(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
-            return false;
-        }
-    } else {
-        // Stop old continuations before manual/removal observers are permitted to run.
+    ownership.releasing = true;
+    ownership.releaseWriterReady = bool(ownership.writer);
+    if (ownership.phase != TransientOwnershipPhase::Prepared) {
         ownership.phase = TransientOwnershipPhase::Restoring;
         if (m_activeTransientRequest) {
             m_activeTransientRequest->m_cancelled = true;
         }
-        if (!ownership.writer || ownership.writer->beginRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted
-            || ownership.executing || ownership.progress != TransientRequestProgress::NoRequest) {
+        ownership.releaseWriterReady = ownership.writer
+            && ownership.writer->beginRestore(internalId(), QString::number(generation)) == TransientPlacementWriter::Result::Accepted;
+    }
+    return true;
+}
+
+Window::TransientAssociationChanges Window::detachTransientAssociation(quint64 generation)
+{
+    TransientAssociationChanges changes;
+    if (!m_transientOwnership || m_transientOwnership->generation != generation || !m_transientOwnership->releasing) {
+        return changes;
+    }
+    auto &ownership = *m_transientOwnership;
+    const auto owned = ownership.tile;
+    const auto oldMode = quickTileMode();
+    if (m_requestedTransientTileGeneration == generation && (m_requestedTile == owned || !m_requestedTile)) {
+        m_requestedTile.clear();
+        m_requestedTransientTileGeneration = 0;
+        m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
+        changes.requestedChanged = true;
+    }
+    if ((owned && m_tile == owned) || (!owned && !m_tile && ownership.committed)) {
+        m_tile.clear();
+        m_committedTileChange = nextAssociationChange(m_committedTileChange);
+        changes.committedChanged = true;
+    }
+    changes.modeChanged = changes.committedChanged && (oldMode != quickTileMode() || (!owned && ownership.committed));
+    ownership.committed = false;
+    changes.requested = m_requestedTile;
+    changes.committed = m_tile;
+    changes.requestedChange = m_requestedTileChange;
+    changes.committedChange = m_committedTileChange;
+    return changes;
+}
+
+void Window::notifyTransientAssociation(quint64 generation, const TransientAssociationChanges &changes)
+{
+    const auto current = [&]() {
+        return !isDeleted() && m_transientOwnership && m_transientOwnership->generation == generation
+            && m_transientOwnership->releasing;
+    };
+    const auto requestedCurrent = [&]() {
+        return current() && changes.requestedChange != std::numeric_limits<quint64>::max()
+            && m_requestedTileChange == changes.requestedChange && m_requestedTile == changes.requested;
+    };
+    const auto committedCurrent = [&]() {
+        return current() && changes.committedChange != std::numeric_limits<quint64>::max()
+            && m_committedTileChange == changes.committedChange && m_tile == changes.committed;
+    };
+    if (changes.requestedChanged && requestedCurrent()) {
+        doSetQuickTileMode();
+        if (requestedCurrent()) {
+            Q_EMIT requestedTileChanged();
+        }
+    }
+    if (changes.committedChanged && committedCurrent()) {
+        Q_EMIT tileChanged(changes.committed);
+    }
+    if (changes.modeChanged && committedCurrent()) {
+        Q_EMIT quickTileModeChanged();
+    }
+}
+
+bool Window::finishTransientRelease(quint64 generation)
+{
+    if (!m_transientOwnership || m_transientOwnership->generation != generation || !m_transientOwnership->releasing) {
+        return false;
+    }
+    auto &ownership = *m_transientOwnership;
+    ownership.releasing = false;
+    if (isDeleted() || !ownership.writer || !ownership.releaseWriterReady) {
+        return false;
+    }
+    if (ownership.phase == TransientOwnershipPhase::Prepared) {
+        if (ownership.writer->cancelReservation(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+            return false;
+        }
+    } else {
+        if (ownership.executing || ownership.progress != TransientRequestProgress::NoRequest) {
             return false;
         }
         if (!ownership.noRequestProof && ownership.request) {
@@ -4366,6 +4480,7 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
             && m_requestedTransientTileGeneration == request->m_ownerGeneration) {
             m_requestedTile = nullptr;
             m_requestedTransientTileGeneration = 0;
+            m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
             if (!isDeleted()) {
                 doSetQuickTileMode();
                 if (!isDeleted()) {
@@ -4383,6 +4498,7 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     }
     m_requestedTile = request->m_tile;
     m_requestedTransientTileGeneration = request->m_ownerGeneration;
+    m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
     request->m_associationInstalled = true;
     performMoveResize(request->m_target, MoveResizeMode::MoveResize, request.get());
     if (!transientRequestIsCurrent(*request)) {

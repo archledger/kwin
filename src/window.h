@@ -1816,13 +1816,28 @@ private:
         const QPointer<LogicalOutput> output;
         const QPointer<VirtualDesktop> desktop;
         const quint64 initialGeometryGeneration;
+        QPointer<TransientTileController> controller;
         TransientOwnershipPhase phase = TransientOwnershipPhase::Prepared;
         TransientRequestProgress progress = TransientRequestProgress::NoRequest;
         quint64 nativeSequence = 0;
         bool executing = false;
+        bool releasing = false;
+        bool releaseWriterReady = false;
+        bool committed = false;
         QMetaObject::Connection closeCleanup;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
         std::unique_ptr<TransientTileRequest> request;
+    };
+
+    struct TransientAssociationChanges
+    {
+        QPointer<Tile> requested;
+        QPointer<Tile> committed;
+        quint64 requestedChange = 0;
+        quint64 committedChange = 0;
+        bool requestedChanged = false;
+        bool committedChanged = false;
+        bool modeChanged = false;
     };
 
     quint64 prepareTransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, const QString &key,
@@ -1830,6 +1845,10 @@ private:
     bool activateTransientOwnership(quint64 generation);
     TransientRequestReceipt applyTransientOwnership(quint64 generation);
     bool revokeTransientOwnership(quint64 generation);
+    bool beginTransientRelease(quint64 generation);
+    TransientAssociationChanges detachTransientAssociation(quint64 generation);
+    void notifyTransientAssociation(quint64 generation, const TransientAssociationChanges &changes);
+    bool finishTransientRelease(quint64 generation);
     std::shared_ptr<const TransientNoRequestProof> makeTransientNoRequestProof(const TransientTileRequest &request);
     TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request);
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
@@ -2206,6 +2225,8 @@ protected:
     QPointer<Tile> m_requestedTile;
     quint64 m_requestedTransientTileGeneration = 0;
     QPointer<Tile> m_tile;
+    quint64 m_requestedTileChange = 0;
+    quint64 m_committedTileChange = 0;
 
     // electric border/quick tiling
     std::optional<ElectricBorderMode> m_electricMode = std::nullopt;
