@@ -78,6 +78,8 @@ private Q_SLOTS:
     void tileAndMaximize();
     void evacuateFromRemovedDesktop();
     void splitFromSingleTileBelowRoot();
+    void requestedGeometryAfterUntileBeforeCommit();
+    void requestedGeometryChangedAfterX11Tile();
 
 private:
     void createSimpleLayout();
@@ -913,6 +915,114 @@ void TilesTest::splitFromSingleTileBelowRoot()
     QCOMPARE(leafTiles.count(), 2);
     QCOMPARE(m_rootTile->childCount(), 2);
     QCOMPARE(topLevelTiles[0]->childCount(), 2);
+}
+
+void TilesTest::requestedGeometryAfterUntileBeforeCommit()
+{
+    // A client may acknowledge a tile configure and commit the matching buffer only after the
+    // window has been untiled. The committed frame then has the tile's size while the floating
+    // geometry has already been requested again. requestedGeometry tells the two apart until
+    // the client has answered the restore configure.
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy surfaceConfigureRequestedSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigureRequestedSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(100, 100), Qt::cyan);
+    QVERIFY(window);
+    QSignalSpy frameGeometryChangedSpy(window, &Window::frameGeometryChanged);
+    QSignalSpy requestedGeometryChangedSpy(window, &Window::requestedGeometryChanged);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 1);
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(100, 100), Qt::cyan);
+    QVERIFY(Test::waylandSync());
+
+    const RectF floatingGeometry = window->frameGeometry();
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), floatingGeometry);
+    requestedGeometryChangedSpy.clear();
+
+    // Tile the window: the tile's geometry is requested at once, the frame follows on commit.
+    auto tile = qobject_cast<CustomTile *>(m_rootTile->childTiles().first());
+    QVERIFY(tile);
+    const RectF tileGeometry = tile->windowGeometry();
+    QVERIFY(tileGeometry.size() != floatingGeometry.size());
+    QVERIFY(tile->manage(window));
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 2);
+    const quint32 tileSerial = surfaceConfigureRequestedSpy.last().at(0).value<quint32>();
+    const QSize tileSize = toplevelConfigureRequestedSpy.last().first().value<QSize>();
+    QCOMPARE(tileSize, tileGeometry.size().toSize());
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), tileGeometry);
+    QCOMPARE(requestedGeometryChangedSpy.count(), 1);
+    QCOMPARE(window->frameGeometry(), floatingGeometry);
+
+    // The client acknowledges the tile configure, but the window is untiled before it commits.
+    shellSurface->xdgSurface()->ack_configure(tileSerial);
+    requestedGeometryChangedSpy.clear();
+    QVERIFY(tile->unmanage(window));
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    QCOMPARE(surfaceConfigureRequestedSpy.count(), 3);
+    const quint32 restoreSerial = surfaceConfigureRequestedSpy.last().at(0).value<quint32>();
+    QCOMPARE(toplevelConfigureRequestedSpy.last().first().value<QSize>(), floatingGeometry.size().toSize());
+    QCOMPARE(window->requestedTile(), nullptr);
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), floatingGeometry);
+    QCOMPARE(requestedGeometryChangedSpy.count(), 1);
+
+    // The late commit of the acknowledged tile configure gives the frame the tile's size, but
+    // the requested geometry stays the floating one.
+    frameGeometryChangedSpy.clear();
+    Test::render(surface.get(), tileSize, Qt::blue);
+    QVERIFY(frameGeometryChangedSpy.wait());
+    QCOMPARE(window->frameGeometry().size(), tileGeometry.size());
+    QCOMPARE(window->tile(), tile);
+    QCOMPARE(window->requestedTile(), nullptr);
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), floatingGeometry);
+    QVERIFY(window->frameGeometry() != window->property("requestedGeometry").value<RectF>());
+
+    // Once the client answers the restore configure, the two are equal again, and the
+    // requested geometry has not changed on the way.
+    requestedGeometryChangedSpy.clear();
+    shellSurface->xdgSurface()->ack_configure(restoreSerial);
+    Test::render(surface.get(), floatingGeometry.size().toSize(), Qt::cyan);
+    QVERIFY(frameGeometryChangedSpy.wait());
+    QCOMPARE(window->frameGeometry(), floatingGeometry);
+    QCOMPARE(window->property("requestedGeometry").value<RectF>(), floatingGeometry);
+    QVERIFY(requestedGeometryChangedSpy.isEmpty());
+}
+
+void TilesTest::requestedGeometryChangedAfterX11Tile()
+{
+#if KWIN_BUILD_X11
+    // An X11 window's frame follows a tile at once. requestedGeometryChanged comes after the
+    // change has been applied, so a handler already sees the new frame geometry.
+    Test::XcbConnectionPtr c = Test::createX11Connection();
+    QVERIFY(!xcb_connection_has_error(c.get()));
+    X11Window *window = createWindow(c.get(), Rect(0, 0, 100, 200));
+    QVERIFY(window);
+    const RectF originalGeometry = window->frameGeometry();
+
+    auto tile = qobject_cast<CustomTile *>(m_rootTile->childTiles().first());
+    QVERIFY(tile);
+    int notifications = 0;
+    RectF frameGeometryAtNotification;
+    RectF requestedGeometryAtNotification;
+    QObject context;
+    connect(window, &Window::requestedGeometryChanged, &context, [&] {
+        ++notifications;
+        frameGeometryAtNotification = window->frameGeometry();
+        requestedGeometryAtNotification = window->property("requestedGeometry").value<RectF>();
+    });
+
+    QVERIFY(tile->manage(window));
+    QCOMPARE(notifications, 1);
+    QCOMPARE(window->frameGeometry(), tile->windowGeometry());
+    QVERIFY(window->frameGeometry() != originalGeometry);
+    QCOMPARE(frameGeometryAtNotification, window->frameGeometry());
+    QCOMPARE(requestedGeometryAtNotification, tile->windowGeometry());
+#else
+    QSKIP("KWin was built without X11 support");
+#endif
 }
 
 }

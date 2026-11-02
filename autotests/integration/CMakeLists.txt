@@ -115,6 +115,8 @@ if (KWIN_BUILD_GAMECONTROLLER)
 endif()
 integrationTest(NAME testDecorationInput SRCS decoration_input_test.cpp LIBS KDecoration3::KDecoration KDecoration3::KDecoration3Private)
 integrationTest(NAME testInternalWindow SRCS internal_window.cpp)
+integrationTest(NAME testOffscreenQuickView SRCS offscreenquickview_test.cpp
+    PROPERTIES ENVIRONMENT "KWIN_FORCE_SW_CURSOR=1")
 integrationTest(NAME testTouchInput SRCS touch_input_test.cpp)
 integrationTest(NAME testInputStackingOrder SRCS input_stacking_order.cpp)
 integrationTest(NAME testPointerInput SRCS pointer_input.cpp LIBS Libdrm::Libdrm OPTIONAL_LIBS XCB::ICCCM)
