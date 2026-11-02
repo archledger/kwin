@@ -3582,7 +3582,8 @@ RectF Window::quickTileGeometry(QuickTileMode mode, const QPointF &pos) const
     LogicalOutput *output = workspace()->outputAt(pos);
 
     if (mode & QuickTileFlag::Custom) {
-        Tile *tile = workspace()->rootTile(output)->pick(pos);
+        const auto root = workspace()->rootTile(output);
+        Tile *tile = root ? root->pick(pos) : nullptr;
         if (tile) {
             return tile->windowGeometry();
         } else {
@@ -3590,7 +3591,8 @@ RectF Window::quickTileGeometry(QuickTileMode mode, const QPointF &pos) const
         }
     }
 
-    Tile *tile = workspace()->tileManager(output)->quickTile(mode);
+    const auto manager = workspace()->tileManager(output);
+    Tile *tile = manager ? manager->quickTile(mode) : nullptr;
     if (tile) {
         return tile->windowGeometry();
     }
@@ -3599,9 +3601,21 @@ RectF Window::quickTileGeometry(QuickTileMode mode, const QPointF &pos) const
 
 void Window::exitQuickTileMode()
 {
-    const auto outputs = workspace()->outputs();
-    for (LogicalOutput *output : outputs) {
-        workspace()->tileManager(output)->forgetWindow(this, nullptr);
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    QList<QPointer<LogicalOutput>> outputs;
+    for (auto output : workspace()->outputs()) {
+        outputs.append(output);
+    }
+    for (const auto &output : outputs) {
+        if (isDeleted()) {
+            return;
+        }
+        if (auto manager = output ? workspace()->tileManager(output) : nullptr) {
+            manager->forgetWindow(this, nullptr);
+        }
     }
 }
 
@@ -3754,7 +3768,8 @@ void Window::handleCustomQuickTileShortcut(QuickTileMode mode)
         return;
     }
     // if window is not tiled already, set it to nearest one
-    Tile *tileAtPoint = workspace()->rootTile(workspace()->outputAt(moveResizeGeometry().center()))->pick(moveResizeGeometry().center());
+    const auto root = workspace()->rootTile(workspace()->outputAt(moveResizeGeometry().center()));
+    Tile *tileAtPoint = root ? root->pick(moveResizeGeometry().center()) : nullptr;
     if (!tileAtPoint) {
         return;
     }
@@ -3793,9 +3808,6 @@ void Window::setQuickTileModeAtCurrentPosition(QuickTileMode mode)
 
 void Window::setQuickTileMode(QuickTileMode mode, const QPointF &tileAtPoint)
 {
-    cancelTransientRequest();
-    workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
-
     // sanitize the mode, ie. simplify "invalid" combinations
     if ((mode & QuickTileFlag::Horizontal) == QuickTileMode(QuickTileFlag::Horizontal)) {
         mode &= ~QuickTileMode(QuickTileFlag::Horizontal);
@@ -3804,11 +3816,30 @@ void Window::setQuickTileMode(QuickTileMode mode, const QPointF &tileAtPoint)
         mode &= ~QuickTileMode(QuickTileFlag::Vertical);
     }
 
-    Tile *tile = nullptr;
+    QPointer<Tile> tile;
     if (mode == QuickTileMode(QuickTileFlag::Custom)) {
-        tile = workspace()->rootTile(workspace()->outputAt(tileAtPoint))->pick(tileAtPoint);
-    } else {
-        tile = workspace()->tileManager(workspace()->outputAt(tileAtPoint))->quickTile(mode);
+        const auto root = workspace()->rootTile(workspace()->outputAt(tileAtPoint));
+        tile = root ? root->pick(tileAtPoint) : nullptr;
+    } else if (mode != QuickTileMode(QuickTileFlag::None)) {
+        const auto manager = workspace()->tileManager(workspace()->outputAt(tileAtPoint));
+        tile = manager ? manager->quickTile(mode) : nullptr;
+    }
+    if (!tile && mode != QuickTileMode(QuickTileFlag::None)) {
+        return;
+    }
+
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const auto generation = geometryRequestGeneration();
+    cancelTransientRequest();
+    if (!geometryRequestIsCurrent(generation)) {
+        return;
+    }
+    workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
+    if (!geometryRequestIsCurrent(generation) || (!tile && mode != QuickTileMode(QuickTileFlag::None))) {
+        return;
     }
 
     if (m_requestedTile != tile) {
@@ -4492,6 +4523,10 @@ RectF Window::ensureSpecialStateGeometry(const RectF &geometry)
 
 void Window::sendToOutput(LogicalOutput *newOutput)
 {
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     newOutput = rules()->checkOutput(newOutput);
     if (isActive()) {
         workspace()->setActiveOutput(newOutput);
@@ -4512,10 +4547,20 @@ void Window::sendToOutput(LogicalOutput *newOutput)
     const RectF oldScreenArea = workspace()->clientArea(MaximizeArea, this, moveResizeOutput());
     const RectF screenArea = workspace()->clientArea(MaximizeArea, this, newOutput);
 
-    if (requestedQuickTileMode() == QuickTileMode(QuickTileFlag::Custom)) {
-        workspace()->tileManager(moveResizeOutput())->forgetWindow(this, nullptr);
+    const auto destinationManager = workspace()->tileManager(newOutput);
+    if (requestedQuickTileMode() == QuickTileMode(QuickTileFlag::Custom) || !destinationManager) {
+        const auto generation = geometryRequestGeneration();
+        if (auto manager = workspace()->tileManager(moveResizeOutput()); requestedQuickTileMode() == QuickTileMode(QuickTileFlag::Custom) && manager) {
+            manager->forgetWindow(this, nullptr);
+        } else if (auto oldTile = m_requestedTile) {
+            oldTile->forget(this);
+        }
+        // A release callback may close the Window or choose a newer placement.
+        if (isDeleted() || m_requestedTile || geometryRequestGeneration() != generation) {
+            return;
+        }
     } else {
-        Tile *newTile = workspace()->tileManager(newOutput)->quickTile(requestedQuickTileMode());
+        Tile *newTile = destinationManager->quickTile(requestedQuickTileMode());
         if (newTile) {
             newTile->manage(this);
         }

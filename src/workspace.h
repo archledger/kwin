@@ -23,6 +23,7 @@
 #include <netwm_def.h>
 // Qt
 #include <QList>
+#include <QPointer>
 #include <QStringList>
 #include <QTimer>
 // std
@@ -35,6 +36,7 @@ class KStartupInfo;
 class KStartupInfoData;
 class KStartupInfoId;
 class QLightSensor;
+class TestXdgShellWindow;
 
 namespace KWin
 {
@@ -88,6 +90,7 @@ class Placement;
 class OutputConfiguration;
 class RootTile;
 class TileManager;
+class TransientTileController;
 class OutputConfigurationStore;
 class LidSwitchTracker;
 class DpmsInputEventFilter;
@@ -577,6 +580,7 @@ Q_SIGNALS:
     void dpmsStateChanged(std::chrono::milliseconds animationTime);
 
 private:
+    friend class ::TestXdgShellWindow;
     void init();
     void initShortcuts();
     template<typename Slot>
@@ -739,7 +743,10 @@ private:
 
     PlaceholderOutput *m_placeholderOutput = nullptr;
     std::unique_ptr<PlaceholderInputEventFilter> m_placeholderFilter;
-    std::map<LogicalOutput *, std::unique_ptr<TileManager>> m_tileManagers;
+    // LogicalOutput owns its manager; callbacks may destroy it independently.
+    std::map<LogicalOutput *, QPointer<TileManager>> m_tileManagers;
+    std::unique_ptr<TransientTileController> m_transientTileController;
+    bool m_shuttingDown = false;
     std::unique_ptr<OutputConfigurationStore> m_outputConfigStore;
     std::unique_ptr<LidSwitchTracker> m_lidSwitchTracker;
     std::unique_ptr<OrientationSensor> m_orientationSensor;
