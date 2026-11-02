@@ -534,10 +534,15 @@ bool Tile::manage(Window *window)
     return true;
 }
 
+bool Tile::releaseTransientWindow(Window *)
+{
+    return false;
+}
+
 bool Tile::unmanage(Window *window)
 {
     if (isTransient()) {
-        return false;
+        return releaseTransientWindow(window);
     }
     if (!remove(window)) {
         return false;
@@ -552,6 +557,7 @@ bool Tile::unmanage(Window *window)
 void Tile::forget(Window *window)
 {
     if (isTransient()) {
+        releaseTransientWindow(window);
         return;
     }
     if (remove(window)) {
