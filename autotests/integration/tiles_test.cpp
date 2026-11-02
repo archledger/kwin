@@ -11,6 +11,7 @@
 #include "core/output.h"
 #include "pointer_input.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transienttilecontroller.h"
 #include "utils/gravity.h"
 #include "wayland_server.h"
 #include "window.h"
@@ -23,13 +24,34 @@
 #endif
 
 #include <QAbstractItemModelTester>
+#include <QChildEvent>
 #include <QPointer>
+
+#include <functional>
+#include <limits>
 
 Q_DECLARE_METATYPE(KWin::QuickTileMode)
 Q_DECLARE_METATYPE(KWin::MaximizeMode)
 
 namespace KWin
 {
+
+class ChildEventFilter : public QObject
+{
+public:
+    std::function<void(QObject *, QObject *)> childAdded;
+
+protected:
+    bool eventFilter(QObject *object, QEvent *event) override
+    {
+        if (event->type() == QEvent::ChildAdded) {
+            QPointer<QObject> guard(object);
+            childAdded(object, static_cast<QChildEvent *>(event)->child());
+            return !guard;
+        }
+        return false;
+    }
+};
 
 class NativeTestTile : public Tile
 {
@@ -129,6 +151,20 @@ private Q_SLOTS:
     void transientMembershipMutations();
     void transientChildDestruction_data();
     void transientChildDestruction();
+    void transientControllerGeometry();
+    void transientControllerInvalidGeometry_data();
+    void transientControllerInvalidGeometry();
+    void transientControllerRevocation_data();
+    void transientControllerRevocation();
+    void transientControllerShutdown();
+    void transientControllerConstructionContext_data();
+    void transientControllerConstructionContext();
+    void transientControllerLeafThenRootDeletion();
+    void transientControllerCreationReentry();
+    void transientControllerUnpublishedRootCleanup();
+    void transientControllerIgnoresRetiredNotification();
+    void transientControllerRemovedDesktop_data();
+    void transientControllerRemovedDesktop();
 
 private:
     void createSimpleLayout();
@@ -382,6 +418,329 @@ void TilesTest::transientChildDestruction()
         QCOMPARE(root->childCount(), 0);
         QVERIFY(!childrenChanged.isEmpty());
     }
+}
+
+void TilesTest::transientControllerGeometry()
+{
+    using Result = TransientTileController::Result;
+    TransientTileController controller;
+    auto desktop = m_rootTile->desktop();
+    const RectF original(0.1, 0.1, 0.4, 0.4);
+    const auto manualChildren = m_rootTile->childTiles();
+    QSignalSpy manualChanged(m_rootTile, &CustomTile::layoutModified);
+    QCOMPARE(controller.createTree(m_tileManager, desktop, original), Result::Accepted);
+    const quint64 generation = controller.generation();
+    QVERIFY(generation != 0);
+    auto root = controller.rootTile();
+    auto tile = controller.tile();
+    QVERIFY(root && tile);
+    QVERIFY(root->isTransient() && tile->isTransient());
+    QCOMPARE(root->parent(), &controller);
+    QCOMPARE(tile->parentTile(), root);
+    QCOMPARE(root->childTiles(), QList<Tile *>{tile});
+    QCOMPARE(tile->relativeGeometry(), original);
+    QVERIFY(root->windows().isEmpty() && tile->windows().isEmpty());
+    QCOMPARE(controller.createTree(m_tileManager, desktop, original), Result::Busy);
+    const RectF next(0.2, 0.1, 0.5, 0.6);
+    QSignalSpy relative(tile, &Tile::relativeGeometryChanged);
+    QSignalSpy absolute(tile, &Tile::absoluteGeometryChanged);
+    QSignalSpy geometry(tile, &Tile::windowGeometryChanged);
+    QCOMPARE(controller.setGeometry(generation + 1, next), Result::StaleGeneration);
+    QCOMPARE(controller.setGeometry(generation, next), Result::Accepted);
+    QCOMPARE(tile->relativeGeometry(), next);
+    QCOMPARE(relative.count(), 1);
+    QCOMPARE(absolute.count(), 1);
+    QCOMPARE(geometry.count(), 1);
+    QVERIFY(tile->setProperty("relativeGeometry", QVariant::fromValue(original)));
+    QCOMPARE(tile->relativeGeometry(), next);
+    QCOMPARE(m_rootTile->childTiles(), manualChildren);
+    QCOMPARE(manualChanged.count(), 0);
+    QCOMPARE(controller.clearTree(generation), Result::Accepted);
+    QVERIFY(!controller.rootTile() && !controller.tile());
+    QCOMPARE(controller.generation(), quint64(0));
+    QCOMPARE(controller.createTree(m_tileManager, desktop, original), Result::Accepted);
+    QVERIFY(controller.generation() > generation);
+    QCOMPARE(controller.setGeometry(generation, next), Result::StaleGeneration);
+}
+
+void TilesTest::transientControllerInvalidGeometry_data()
+{
+    QTest::addColumn<RectF>("geometry");
+    QTest::newRow("zero") << RectF(0, 0, 0, 1);
+    QTest::newRow("negative-size") << RectF(0, 0, 1, -1);
+    QTest::newRow("negative-origin") << RectF(-0.1, 0, 0.5, 1);
+    QTest::newRow("outside") << RectF(0.8, 0, 0.5, 1);
+    QTest::newRow("nan") << RectF(std::numeric_limits<qreal>::quiet_NaN(), 0, 0.5, 1);
+    QTest::newRow("infinity") << RectF(0, 0, 0.5, std::numeric_limits<qreal>::infinity());
+}
+
+void TilesTest::transientControllerInvalidGeometry()
+{
+    QFETCH(RectF, geometry);
+    using Result = TransientTileController::Result;
+    TransientTileController controller;
+    QSignalSpy changed(&controller, &TransientTileController::treeChanged);
+    QCOMPARE(controller.createTree(m_tileManager, m_rootTile->desktop(), geometry), Result::InvalidGeometry);
+    QVERIFY(controller.children().isEmpty());
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(controller.createTree(nullptr, m_rootTile->desktop(), RectF(0, 0, 1, 1)), Result::InvalidContext);
+    QCOMPARE(controller.createTree(m_tileManager, nullptr, RectF(0, 0, 1, 1)), Result::InvalidContext);
+    QCOMPARE(controller.createTree(m_tileManager, m_rootTile->desktop(), RectF(0, 0, 1, 1)), Result::Accepted);
+    QCOMPARE(controller.setGeometry(controller.generation(), geometry), Result::InvalidGeometry);
+    QCOMPARE(controller.tile()->relativeGeometry(), RectF(0, 0, 1, 1));
+}
+
+void TilesTest::transientControllerRevocation_data()
+{
+    QTest::addColumn<int>("cause");
+    QTest::addColumn<int>("notification");
+    const QStringList causes{QStringLiteral("clear"), QStringLiteral("delete-leaf"), QStringLiteral("delete-root"),
+                             QStringLiteral("delete-controller"), QStringLiteral("delete-manager"), QStringLiteral("delete-desktop")};
+    const QStringList notifications{QStringLiteral("relative"), QStringLiteral("absolute"), QStringLiteral("window")};
+    for (int cause = 0; cause < causes.size(); ++cause) {
+        for (int notification = 0; notification < notifications.size(); ++notification) {
+            QTest::newRow(qPrintable(notifications[notification] + QLatin1Char('-') + causes[cause])) << cause << notification;
+        }
+    }
+}
+
+void TilesTest::transientControllerRevocation()
+{
+    QFETCH(int, cause);
+    QFETCH(int, notification);
+    using Result = TransientTileController::Result;
+    auto manager = std::make_unique<TileManager>(m_output);
+    auto controller = std::make_unique<TransientTileController>();
+    auto desktop = VirtualDesktopManager::self()->desktops().constLast();
+    QCOMPARE(controller->createTree(manager.get(), desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    auto tile = controller->tile();
+    QPointer<Tile> oldRoot = controller->rootTile();
+    const auto generation = controller->generation();
+    QSignalSpy absolute(tile, &Tile::absoluteGeometryChanged);
+    QSignalSpy geometry(tile, &Tile::windowGeometryChanged);
+    auto nested = Result::Accepted;
+    auto nestedUpdate = Result::Accepted;
+    const auto signal = notification == 0 ? &Tile::relativeGeometryChanged
+        : notification == 1               ? &Tile::absoluteGeometryChanged
+                                          : &Tile::windowGeometryChanged;
+    connect(tile, signal, this, [&]() {
+        nestedUpdate = controller->setGeometry(generation, RectF(0, 0, 0.5, 1));
+        switch (cause) {
+        case 0:
+            controller->clearTree(generation);
+            nested = controller->createTree(manager.get(), desktop, RectF(0, 0, 1, 1));
+            break;
+        case 1:
+            delete tile;
+            break;
+        case 2:
+            delete controller->rootTile();
+            break;
+        case 3:
+            controller.reset();
+            break;
+        case 4:
+            manager.reset();
+            break;
+        case 5:
+            VirtualDesktopManager::self()->removeVirtualDesktop(desktop);
+            break;
+        }
+    });
+    QCOMPARE(controller->setGeometry(generation, RectF(0.1, 0.1, 0.5, 0.5)), Result::Superseded);
+    QCOMPARE(nestedUpdate, Result::Busy);
+    QCOMPARE(absolute.count(), notification >= 1 ? 1 : 0);
+    QCOMPARE(geometry.count(), notification >= 2 ? 1 : 0);
+    if (cause == 0) {
+        QCOMPARE(nested, Result::Busy);
+    }
+    if (controller) {
+        QCOMPARE(controller->generation(), quint64(0));
+        QVERIFY(!controller->rootTile() && !controller->tile());
+    }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(!oldRoot);
+}
+
+void TilesTest::transientControllerShutdown()
+{
+    using Result = TransientTileController::Result;
+    auto controller = std::make_unique<TransientTileController>();
+    const RectF geometry(0, 0, 0.5, 1);
+    auto desktop = m_rootTile->desktop();
+    QCOMPARE(controller->createTree(m_tileManager, desktop, geometry), Result::Accepted);
+    auto pointer = controller.get();
+    const auto generation = controller->generation();
+    auto createResult = Result::Accepted;
+    auto updateResult = Result::Accepted;
+    connect(controller->rootTile(), &QObject::destroyed, this, [&]() {
+        createResult = pointer->createTree(m_tileManager, desktop, geometry);
+        updateResult = pointer->setGeometry(generation, geometry);
+    });
+    controller.reset();
+    QCOMPARE(createResult, Result::Busy);
+    QCOMPARE(updateResult, Result::Busy);
+}
+
+void TilesTest::transientControllerConstructionContext_data()
+{
+    QTest::addColumn<int>("cause");
+    QTest::addColumn<bool>("rootParent");
+    QTest::newRow("leaf-manager") << 0 << false;
+    QTest::newRow("leaf-controller") << 1 << false;
+    QTest::newRow("leaf-desktop") << 2 << false;
+    QTest::newRow("root-manager") << 0 << true;
+    QTest::newRow("root-controller") << 1 << true;
+    QTest::newRow("root-desktop") << 2 << true;
+}
+
+void TilesTest::transientControllerConstructionContext()
+{
+    QFETCH(int, cause);
+    QFETCH(bool, rootParent);
+    using Result = TransientTileController::Result;
+    auto manager = std::make_unique<TileManager>(m_output);
+    auto controller = std::make_unique<TransientTileController>();
+    auto desktop = VirtualDesktopManager::self()->desktops().constLast();
+    bool destroyed = false;
+    ChildEventFilter filter;
+    filter.childAdded = [&](QObject *object, QObject *) {
+        auto tile = qobject_cast<Tile *>(object);
+        if ((rootParent ? object == controller.get() : tile && tile->isTransient()) && !destroyed) {
+            destroyed = true;
+            if (cause == 0) {
+                manager.reset();
+            } else if (cause == 1) {
+                controller.reset();
+            } else {
+                VirtualDesktopManager::self()->removeVirtualDesktop(desktop);
+            }
+        }
+    };
+    qApp->installEventFilter(&filter);
+    const auto result = controller->createTree(manager.get(), desktop, RectF(0, 0, 0.5, 1));
+    qApp->removeEventFilter(&filter);
+    QVERIFY(destroyed);
+    QCOMPARE(result, Result::Superseded);
+    if (controller) {
+        QVERIFY(!controller->rootTile() && !controller->tile());
+        QVERIFY(controller->children().isEmpty());
+    }
+}
+
+void TilesTest::transientControllerLeafThenRootDeletion()
+{
+    using Result = TransientTileController::Result;
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(m_tileManager, m_rootTile->desktop(), RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QPointer<Tile> root = controller.rootTile();
+    bool deletedRoot = false;
+    connect(&controller, &TransientTileController::treeChanged, this, [&]() {
+        if (root) {
+            deletedRoot = true;
+            delete root.data();
+        }
+    });
+    delete controller.tile();
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    QVERIFY(deletedRoot);
+    QVERIFY(!root);
+    QVERIFY(!controller.rootTile() && !controller.tile());
+}
+
+void TilesTest::transientControllerCreationReentry()
+{
+    using Result = TransientTileController::Result;
+    TransientTileController controller;
+    auto desktop = m_rootTile->desktop();
+    auto nested = Result::Accepted;
+    bool revoked = false;
+    connect(&controller, &TransientTileController::treeChanged, this, [&]() {
+        if (!revoked) {
+            revoked = true;
+            controller.clearTree(controller.generation());
+            nested = controller.createTree(m_tileManager, desktop, RectF(0, 0, 1, 1));
+        }
+    });
+    QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), Result::Superseded);
+    QCOMPARE(nested, Result::Busy);
+    QCOMPARE(controller.generation(), quint64(0));
+    QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+}
+
+void TilesTest::transientControllerUnpublishedRootCleanup()
+{
+    using Result = TransientTileController::Result;
+    auto manager = std::make_unique<TileManager>(m_output);
+    auto controller = std::make_unique<TransientTileController>();
+    bool invalidated = false;
+    ChildEventFilter filter;
+    filter.childAdded = [&](QObject *object, QObject *child) {
+        if (object == controller.get() && !invalidated) {
+            invalidated = true;
+            connect(child, &QObject::destroyed, this, [&]() {
+                controller.reset();
+            });
+            manager.reset();
+        }
+    };
+    qApp->installEventFilter(&filter);
+    const auto result = controller->createTree(manager.get(), m_rootTile->desktop(), RectF(0, 0, 0.5, 1));
+    qApp->removeEventFilter(&filter);
+    QVERIFY(invalidated);
+    QCOMPARE(result, Result::Superseded);
+    QVERIFY(!controller);
+}
+
+void TilesTest::transientControllerIgnoresRetiredNotification()
+{
+    using Result = TransientTileController::Result;
+    TransientTileController controller;
+    const RectF geometry(0, 0, 0.5, 1);
+    QCOMPARE(controller.createTree(m_tileManager, m_rootTile->desktop(), geometry), Result::Accepted);
+    const auto oldGeneration = controller.generation();
+    delete controller.tile();
+    QSignalSpy changed(&controller, &TransientTileController::treeChanged);
+    QCOMPARE(controller.createTree(m_tileManager, m_rootTile->desktop(), geometry), Result::Accepted);
+    QVERIFY(controller.generation() > oldGeneration);
+    QCOMPARE(changed.count(), 1);
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    QCOMPARE(changed.count(), 1);
+    QVERIFY(controller.rootTile() && controller.tile());
+}
+
+void TilesTest::transientControllerRemovedDesktop_data()
+{
+    QTest::addColumn<bool>("creation");
+    QTest::newRow("create") << true;
+    QTest::newRow("update") << false;
+}
+
+void TilesTest::transientControllerRemovedDesktop()
+{
+    QFETCH(bool, creation);
+    using Result = TransientTileController::Result;
+    TransientTileController existing;
+    TransientTileController empty;
+    auto desktop = m_rootTile->desktop();
+    QCOMPARE(existing.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto generation = existing.generation();
+    QSignalSpy changed(existing.tile(), &Tile::relativeGeometryChanged);
+    auto result = Result::Accepted;
+    bool attempted = false;
+    const auto connection = connect(VirtualDesktopManager::self(), &VirtualDesktopManager::currentChanged, this,
+                                    [&](VirtualDesktop *old, VirtualDesktop *, LogicalOutput *output) {
+        if (old == desktop && output == m_output) {
+            attempted = true;
+            result = creation ? empty.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1))
+                              : existing.setGeometry(generation, RectF(0.1, 0.1, 0.5, 0.5));
+        }
+    });
+    VirtualDesktopManager::self()->removeVirtualDesktop(desktop);
+    disconnect(connection);
+    QVERIFY(attempted);
+    QCOMPARE(result, Result::InvalidContext);
+    QCOMPARE(changed.count(), 0);
 }
 
 void TilesTest::createSimpleLayout()
