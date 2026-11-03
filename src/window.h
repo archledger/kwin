@@ -61,6 +61,7 @@ class SurfaceItem;
 class VirtualDesktop;
 class WindowItem;
 class TileManager;
+class TileAssignmentFence;
 class TransientTileController;
 class TransientNoRequestProof;
 class TransientPlacementWriter;
@@ -1743,8 +1744,11 @@ Q_SIGNALS:
     void decorationPolicyChanged();
 
 private:
+    friend class TileAssignmentFence;
     friend class TransientTileController;
     friend class ::TestXdgShellWindow;
+
+    TileAssignmentFence makeTileAssignmentFence();
 
     enum class TransientRequestOutcome {
         Rejected,
@@ -2298,6 +2302,32 @@ protected:
     QString m_description;
 
     QString m_activationToken;
+};
+
+// Synchronous observation only; this fence grants no mutation or admission authority.
+class KWIN_EXPORT TileAssignmentFence final
+{
+public:
+    ~TileAssignmentFence();
+    Q_DISABLE_COPY_MOVE(TileAssignmentFence)
+
+    bool isCurrentFor(const Window &window) const;
+
+private:
+    friend class Window;
+    friend class Tile;
+    explicit TileAssignmentFence(Window &window);
+
+    const QPointer<Window> m_window;
+    const QUuid m_windowId;
+    const quint64 m_placementRevision;
+    const quint64 m_requestedRevision;
+    const quint64 m_committedRevision;
+    const quint64 m_geometryGeneration;
+    const QPointer<Tile> m_requestedTile;
+    const QPointer<Tile> m_committedTile;
+    const bool m_hadRequestedTile;
+    const bool m_hadCommittedTile;
 };
 
 inline RectF Window::bufferGeometry() const
