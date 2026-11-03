@@ -1853,7 +1853,7 @@ private:
     TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request);
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
-    void cancelTransientRequest();
+    bool cancelTransientRequest();
     void commitTileInternal(Tile *tile);
 
 protected:
@@ -2227,6 +2227,7 @@ protected:
     QPointer<Tile> m_tile;
     quint64 m_requestedTileChange = 0;
     quint64 m_committedTileChange = 0;
+    quint64 m_placementContinuationRevision = 0;
 
     // electric border/quick tiling
     std::optional<ElectricBorderMode> m_electricMode = std::nullopt;
