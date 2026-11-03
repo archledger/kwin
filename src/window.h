@@ -1577,17 +1577,19 @@ private:
 
     TileAssignmentFence makeTileAssignmentFence();
 
-    enum class AssignmentCommitOutcome {
+    enum class AssignmentStepOutcome {
         Refused,
         Superseded,
         AppliedCurrent,
     };
-    struct AssignmentCommitResult
+    struct AssignmentStepResult
     {
-        AssignmentCommitOutcome outcome = AssignmentCommitOutcome::Refused;
+        AssignmentStepOutcome outcome = AssignmentStepOutcome::Refused;
         std::unique_ptr<TileAssignmentFence> checkpoint;
     };
-    [[nodiscard]] AssignmentCommitResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
+    [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
+    [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before);
+    void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
 
     enum class TransientRequestOutcome {
         Rejected,
@@ -1697,7 +1699,7 @@ private:
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     bool cancelTransientRequest();
-    void commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResult = nullptr);
+    void commitTileInternal(Tile *tile, AssignmentStepResult *guardedResult = nullptr);
 
 protected:
     Window();

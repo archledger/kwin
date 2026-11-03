@@ -363,6 +363,13 @@ private Q_SLOTS:
     void testGuardedTileCommitTransientTarget();
     void testGuardedTileCommitReentry_data();
     void testGuardedTileCommitReentry();
+    void testGuardedGeometryRestore();
+    void testGuardedGeometryRestoreRefusal_data();
+    void testGuardedGeometryRestoreRefusal();
+    void testGuardedGeometryRestoreReentry_data();
+    void testGuardedGeometryRestoreReentry();
+    void testGuardedGeometryRestoreSentinels();
+    void testGeometryRestorePreservesOwnership();
     void testTransientRegistryLookup();
     void testTransientRegistryRetiredRoot();
     void testTransientRegistryDestructorReentry_data();
@@ -6526,7 +6533,7 @@ void TestXdgShellWindow::testGuardedTileCommit()
         notifications.append(QStringLiteral("mode"));
     });
     auto result = window->commitTileForAssignment(tile.get(), before);
-    QCOMPARE(result.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
     QVERIFY(result.checkpoint);
     QVERIFY(result.checkpoint->isCurrentFor(*window));
     QVERIFY(!before.isCurrentFor(*window));
@@ -6541,7 +6548,7 @@ void TestXdgShellWindow::testGuardedTileCommit()
     QCOMPARE(notifications, QStringList({QStringLiteral("tile"), QStringLiteral("mode")}));
     notifications.clear();
     auto unchanged = window->commitTileForAssignment(tile.get(), *result.checkpoint);
-    QCOMPARE(unchanged.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QCOMPARE(unchanged.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
     QVERIFY(unchanged.checkpoint && unchanged.checkpoint->isCurrentFor(*window));
     QCOMPARE(window->m_committedTileChange, committedRevision + 1);
     QCOMPARE(window->m_placementContinuationRevision, placementRevision + 1);
@@ -6551,13 +6558,13 @@ void TestXdgShellWindow::testGuardedTileCommit()
     QCOMPARE(window->tile(), tile.get());
     auto beforeNull = window->makeTileAssignmentFence();
     auto toNull = window->commitTileForAssignment(nullptr, beforeNull);
-    QCOMPARE(toNull.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QCOMPARE(toNull.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
     QVERIFY(toNull.checkpoint && toNull.checkpoint->isCurrentFor(*window));
     QVERIFY(!window->tile());
     QCOMPARE(notifications, QStringList({QStringLiteral("tile"), QStringLiteral("mode")}));
     notifications.clear();
     auto nullNoOp = window->commitTileForAssignment(nullptr, *toNull.checkpoint);
-    QCOMPARE(nullNoOp.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QCOMPARE(nullNoOp.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
     QVERIFY(nullNoOp.checkpoint && nullNoOp.checkpoint->isCurrentFor(*window));
     QVERIFY(notifications.isEmpty());
 }
@@ -6614,7 +6621,7 @@ void TestXdgShellWindow::testGuardedTileCommitRefusal()
     QSignalSpy tileChanged(window, &Window::tileChanged);
     QSignalSpy modeChanged(window, &Window::quickTileModeChanged);
     auto result = window->commitTileForAssignment(action == 0 ? alternative.get() : rawTarget, before);
-    QCOMPARE(result.outcome, action == 0 || action == 3 ? Window::AssignmentCommitOutcome::Refused : Window::AssignmentCommitOutcome::Superseded);
+    QCOMPARE(result.outcome, action == 0 || action == 3 ? Window::AssignmentStepOutcome::Refused : Window::AssignmentStepOutcome::Superseded);
     QVERIFY(!result.checkpoint);
     QCOMPARE(window->m_placementContinuationRevision, revisions[0]);
     QCOMPARE(window->m_requestedTileChange, revisions[1]);
@@ -6675,11 +6682,11 @@ void TestXdgShellWindow::testGuardedTileCommitCapacity()
     QSignalSpy tileChanged(window, &Window::tileChanged);
     QSignalSpy modeChanged(window, &Window::quickTileModeChanged);
     auto result = window->commitTileForAssignment(tile.get(), before);
-    auto expected = Window::AssignmentCommitOutcome::AppliedCurrent;
+    auto expected = Window::AssignmentStepOutcome::AppliedCurrent;
     if (scenario == 0) {
-        expected = Window::AssignmentCommitOutcome::Refused;
+        expected = Window::AssignmentStepOutcome::Refused;
     } else if (scenario == 3) {
-        expected = Window::AssignmentCommitOutcome::Superseded;
+        expected = Window::AssignmentStepOutcome::Superseded;
     }
     QCOMPARE(result.outcome, expected);
     QCOMPARE(bool(result.checkpoint), scenario == 1 || scenario == 2);
@@ -6716,7 +6723,7 @@ void TestXdgShellWindow::testGuardedTileCommitTransientTarget()
     QVERIFY(before.isCurrentFor(*window));
     QSignalSpy committed(window, &Window::tileChanged);
     auto result = window->commitTileForAssignment(&target, before);
-    QCOMPARE(result.outcome, Window::AssignmentCommitOutcome::Refused);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::Refused);
     QVERIFY(!result.checkpoint);
     QVERIFY(before.isCurrentFor(*window));
     QCOMPARE(window->requestedTile(), &target);
@@ -6736,6 +6743,8 @@ void TestXdgShellWindow::testGuardedTileCommitReentry_data()
     QTest::newRow("mode-notification") << 6;
     QTest::newRow("new-requested") << 7;
     QTest::newRow("input-owner-only") << 8;
+    QTest::newRow("restore-change") << 9;
+    QTest::newRow("restore-same") << 10;
 }
 
 void TestXdgShellWindow::testGuardedTileCommitReentry()
@@ -6795,6 +6804,12 @@ void TestXdgShellWindow::testGuardedTileCommitReentry()
         case 8:
             before.reset();
             break;
+        case 9:
+            window->setGeometryRestore(RectF(60, 70, 220, 130));
+            break;
+        case 10:
+            window->setGeometryRestore(window->geometryRestore());
+            break;
         }
     };
     if (action == 6) {
@@ -6804,9 +6819,10 @@ void TestXdgShellWindow::testGuardedTileCommitReentry()
     }
     auto result = window->commitTileForAssignment(target.get(), *before);
     QVERIFY(invoked);
-    QCOMPARE(result.outcome, action == 8 ? Window::AssignmentCommitOutcome::AppliedCurrent : Window::AssignmentCommitOutcome::Superseded);
-    QCOMPARE(bool(result.checkpoint), action == 8);
-    QCOMPARE(modeChanged.count(), action == 6 || action == 8 ? 1 : 0);
+    const bool current = action == 8 || action == 10;
+    QCOMPARE(result.outcome, current ? Window::AssignmentStepOutcome::AppliedCurrent : Window::AssignmentStepOutcome::Superseded);
+    QCOMPARE(bool(result.checkpoint), current);
+    QCOMPARE(modeChanged.count(), action == 6 || current ? 1 : 0);
     if (action == 4 || action == 5) {
         if (action == 4) {
             QVERIFY(guard && window->isDeleted());
@@ -6822,10 +6838,303 @@ void TestXdgShellWindow::testGuardedTileCommitReentry()
         QCOMPARE(window->requestedTile(), other.get());
     } else if (action == 2) {
         QCOMPARE(window->tile(), target.get());
-    } else if (action == 8) {
-        QVERIFY(!before);
+    } else if (current) {
+        QCOMPARE(!before, action == 8);
         QVERIFY(result.checkpoint->isCurrentFor(*window));
     }
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestore()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const RectF original(10, 20, 200, 100);
+    const RectF desired(30, 40, 240, 160);
+    window->setGeometryRestore(original);
+    const auto revision = window->m_placementContinuationRevision;
+    const auto requestedRevision = window->m_requestedTileChange;
+    const auto committedRevision = window->m_committedTileChange;
+    const auto geometryRevision = window->m_geometryRequestGeneration;
+    const auto requestedGeometry = window->moveResizeGeometry();
+    const auto frameGeometry = window->frameGeometry();
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy requestedChanged(window, &Window::requestedGeometryChanged);
+    QSignalSpy tileChanged(window, &Window::tileChanged);
+    auto before = window->makeTileAssignmentFence();
+    auto result = window->setGeometryRestoreForAssignment(desired, before);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+    QVERIFY(!before.isCurrentFor(*window));
+    QCOMPARE(window->geometryRestore(), desired);
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(window->m_requestedTileChange, requestedRevision);
+    QCOMPARE(window->m_committedTileChange, committedRevision);
+    QCOMPARE(window->m_geometryRequestGeneration, geometryRevision);
+    QCOMPARE(window->moveResizeGeometry(), requestedGeometry);
+    QCOMPARE(window->frameGeometry(), frameGeometry);
+    QCOMPARE(restoreChanged.count(), 1);
+    QVERIFY(requestedChanged.isEmpty() && tileChanged.isEmpty());
+    auto unchanged = window->setGeometryRestoreForAssignment(desired, *result.checkpoint);
+    QCOMPARE(unchanged.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(unchanged.checkpoint && unchanged.checkpoint->isCurrentFor(*window));
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(restoreChanged.count(), 1);
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestoreRefusal_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("stale") << 0;
+    QTest::newRow("wrong-window") << 1;
+    QTest::newRow("closed") << 2;
+    QTest::newRow("last-change-refused") << 3;
+    QTest::newRow("penultimate-change") << 4;
+    QTest::newRow("last-noop") << 5;
+    QTest::newRow("exhausted-input") << 6;
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestoreRefusal()
+{
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    std::unique_ptr<KWayland::Client::Surface> otherSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> otherShell(Test::createXdgToplevelSurface(otherSurface.get()));
+    auto other = Test::renderAndWaitForShown(otherSurface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(other);
+    const RectF original(10, 20, 200, 100);
+    const RectF desired = scenario == 5 || scenario == 6 ? original : RectF(30, 40, 240, 160);
+    window->setGeometryRestore(original);
+    if (scenario >= 3) {
+        quint64 headroom = 1;
+        if (scenario == 4) {
+            headroom = 2;
+        } else if (scenario == 6) {
+            headroom = 0;
+        }
+        window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - headroom;
+    }
+    auto owner = scenario == 1 ? other : window;
+    std::unique_ptr<TileAssignmentFence> before(new TileAssignmentFence(owner->makeTileAssignmentFence()));
+    QPointer<Window> guard(window);
+    if (scenario == 0) {
+        window->cancelTransientRequest();
+    } else if (scenario == 2) {
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QVERIFY(guard);
+    }
+    const auto revision = window->m_placementContinuationRevision;
+    const auto geometry = window->moveResizeGeometry();
+    QSignalSpy changed(window, &Window::maximizeGeometryRestoreChanged);
+    auto result = window->setGeometryRestoreForAssignment(desired, *before);
+    auto expected = Window::AssignmentStepOutcome::Superseded;
+    if (scenario == 3) {
+        expected = Window::AssignmentStepOutcome::Refused;
+    } else if (scenario == 4 || scenario == 5) {
+        expected = Window::AssignmentStepOutcome::AppliedCurrent;
+    }
+    QCOMPARE(result.outcome, expected);
+    QCOMPARE(bool(result.checkpoint), scenario == 4 || scenario == 5);
+    if (result.checkpoint) {
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+    }
+    QCOMPARE(window->geometryRestore(), scenario == 4 ? desired : original);
+    QCOMPARE(window->m_placementContinuationRevision, revision + (scenario == 4 ? 1 : 0));
+    QCOMPARE(changed.count(), scenario == 4 ? 1 : 0);
+    QCOMPARE(window->moveResizeGeometry(), geometry);
+    if (scenario == 2) {
+        before.reset();
+        QTRY_VERIFY(!guard);
+    }
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestoreReentry_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("replacement") << 0;
+    QTest::newRow("roundtrip") << 1;
+    QTest::newRow("same-value") << 2;
+    QTest::newRow("equal-geometry") << 3;
+    QTest::newRow("cancel") << 4;
+    QTest::newRow("commit") << 5;
+    QTest::newRow("close") << 6;
+    QTest::newRow("input-owner-close") << 7;
+    QTest::newRow("input-owner-only") << 8;
+    QTest::newRow("caller-value-change") << 9;
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestoreReentry()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto tile = std::make_unique<Tile>(workspace()->tileManager(window->moveResizeOutput()));
+    tile->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    const RectF requested(30, 40, 240, 160);
+    const RectF replacement(70, 80, 260, 180);
+    RectF callerValue = requested;
+    std::unique_ptr<TileAssignmentFence> before(new TileAssignmentFence(window->makeTileAssignmentFence()));
+    QPointer<Window> guard(window);
+    QSignalSpy changed(window, &Window::maximizeGeometryRestoreChanged);
+    QObject context;
+    bool called = false;
+    connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        switch (action) {
+        case 0:
+            window->setGeometryRestore(replacement);
+            break;
+        case 1:
+            window->setGeometryRestore(replacement);
+            window->setGeometryRestore(requested);
+            break;
+        case 2:
+            window->setGeometryRestore(requested);
+            break;
+        case 3:
+            window->moveResize(window->moveResizeGeometry());
+            break;
+        case 4:
+            window->setTileCompatibility(nullptr);
+            break;
+        case 5:
+            window->commitTile(tile.get());
+            break;
+        case 7:
+            before.reset();
+            [[fallthrough]];
+        case 6:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            QVERIFY(guard);
+            break;
+        case 8:
+            before.reset();
+            break;
+        case 9:
+            callerValue = replacement;
+            break;
+        }
+    });
+    auto result = window->setGeometryRestoreForAssignment(callerValue, *before);
+    QVERIFY(called);
+    const bool current = action == 2 || action == 8 || action == 9;
+    QCOMPARE(result.outcome, current ? Window::AssignmentStepOutcome::AppliedCurrent : Window::AssignmentStepOutcome::Superseded);
+    QCOMPARE(bool(result.checkpoint), current);
+    if (action == 6 || action == 7) {
+        if (action == 6) {
+            QVERIFY(guard && window->isDeleted());
+            before.reset();
+        }
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    QVERIFY(guard);
+    QCOMPARE(window->geometryRestore(), action == 0 ? replacement : requested);
+    if (result.checkpoint) {
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+    }
+    if (action == 9) {
+        QCOMPARE(callerValue, replacement);
+    }
+    int notifications = 1;
+    if (action == 0) {
+        notifications = 2;
+    } else if (action == 1) {
+        notifications = 3;
+    }
+    QCOMPARE(changed.count(), notifications);
+}
+
+void TestXdgShellWindow::testGuardedGeometryRestoreSentinels()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const auto geometry = window->moveResizeGeometry();
+    const auto frame = window->frameGeometry();
+    for (const RectF &desired : {RectF(), RectF(1, 2, -3, 4), RectF(5, 6, 0, 0)}) {
+        const bool changed = window->geometryRestore() != desired;
+        const auto revision = window->m_placementContinuationRevision;
+        auto before = window->makeTileAssignmentFence();
+        QSignalSpy notification(window, &Window::maximizeGeometryRestoreChanged);
+        auto result = window->setGeometryRestoreForAssignment(desired, before);
+        QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+        QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+        QCOMPARE(window->geometryRestore(), desired);
+        QCOMPARE(window->m_placementContinuationRevision, revision + (changed ? 1 : 0));
+        QCOMPARE(notification.count(), changed ? 1 : 0);
+        QCOMPARE(window->moveResizeGeometry(), geometry);
+        QCOMPARE(window->frameGeometry(), frame);
+    }
+}
+
+void TestXdgShellWindow::testGeometryRestorePreservesOwnership()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.restore-field"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.restore-field");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    const auto geometry = window->moveResizeGeometry();
+    auto leaf = controller.tile();
+    QSignalSpy requested(window, &Window::requestedGeometryChanged);
+    QSignalSpy removed(leaf, &Tile::windowRemoved);
+    const RectF stored(40, 50, 210, 120);
+    window->setGeometryRestore(stored);
+    const auto revision = window->m_placementContinuationRevision;
+    window->setGeometryRestore(stored);
+    QCOMPARE(window->m_placementContinuationRevision, revision);
+    {
+        auto before = window->makeTileAssignmentFence();
+        auto result = window->setGeometryRestoreForAssignment(RectF(60, 70, 220, 130), before);
+        QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+        QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+    }
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+    QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+    QCOMPARE(window->requestedTile(), leaf);
+    QCOMPARE(window->moveResizeGeometry(), geometry);
+    QVERIFY(writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(key), original);
+    QVERIFY(requested.isEmpty() && removed.isEmpty());
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
 }
 
 void TestXdgShellWindow::testTransientRegistryLookup()
