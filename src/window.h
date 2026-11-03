@@ -1747,6 +1747,7 @@ private:
     friend class TileAssignmentFence;
     friend class WaylandWindow;
     friend class XdgSurfaceWindow;
+    friend class XdgToplevelWindow;
     friend class TransientTileController;
     friend class ::TestXdgShellWindow;
 
@@ -1758,17 +1759,64 @@ private:
         Superseded,
         AppliedCurrent,
     };
+    // Owned provenance of one native call. The alternatives are exclusive: the exact adoption
+    // request being executed, borrowed for the call, or the ownership generation of an owner acting
+    // on its own placement. Either can lapse without any Window counter changing, so every child
+    // step validates it next to its checkpoint; public callbacks never inherit it.
+    struct OwnedProvenance
+    {
+        enum class Kind {
+            None,
+            Request,
+            Ownership,
+        };
+        // A declared constructor rather than member initializers: those would be a complete-class
+        // context of Window and unusable in the default arguments below.
+        OwnedProvenance()
+            : kind(Kind::None)
+            , request(nullptr)
+            , ownership(0)
+        {
+        }
+        static OwnedProvenance forRequest(TransientTileRequest *request)
+        {
+            OwnedProvenance owned;
+            owned.kind = Kind::Request;
+            owned.request = request;
+            return owned;
+        }
+        // The constraint carries the owner operation's own validity (for example that the frozen
+        // target is still feasible under the client's size limits), which neither the fence nor
+        // the ownership record can observe; every child step evaluates it next to them.
+        static OwnedProvenance forOwnership(quint64 generation, std::function<bool()> constraint = {})
+        {
+            OwnedProvenance owned;
+            owned.kind = Kind::Ownership;
+            owned.ownership = generation;
+            owned.constraint = std::move(constraint);
+            return owned;
+        }
+
+        Kind kind;
+        TransientTileRequest *request;
+        quint64 ownership;
+        std::function<bool()> constraint;
+    };
     struct AssignmentStepResult
     {
         AssignmentStepOutcome outcome = AssignmentStepOutcome::Refused;
         std::unique_ptr<TileAssignmentFence> checkpoint;
-        // Borrowed for the duration of one owned native call: its external authority can lapse without
-        // any Window counter changing, so every child step validates it next to the checkpoint.
-        const TransientTileRequest *ownedRequest = nullptr;
+        OwnedProvenance owned;
     };
+    bool ownedProvenanceIsCurrent(const OwnedProvenance &owned) const;
     bool assignmentResultIsCurrent(const AssignmentStepResult &result) const;
+    // An owner may act on its own placement only while this holds: live Owned record for exactly
+    // this generation, nothing executing or releasing, writer/provider/reservation valid, live tile
+    // with this window as member in a current context, and the association unchanged. Admission
+    // feasibility is deliberately not reused: an owner may legitimately be maximized.
+    bool transientOwnershipIsCurrent(quint64 generation) const;
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
-    [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, const TransientTileRequest *owned = nullptr);
+    [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
     struct AssignmentGeometrySync
     {
@@ -1779,9 +1827,9 @@ private:
         std::shared_ptr<ColorDescription> color;
         bool hadOutput = false;
         bool synchronize = false;
-        // Joins the result carrier once the requested rectangle is written: the request's own
+        // Joins the result carrier once the requested rectangle is written: a borrowed request's own
         // predicate cannot hold between generation allocation and that callback-free write.
-        const TransientTileRequest *owned = nullptr;
+        OwnedProvenance owned;
     };
     [[nodiscard]] AssignmentStepResult setMoveResizeGeometryForAssignment(RectF desired, const TileAssignmentFence &before);
     bool assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const;
@@ -2051,7 +2099,10 @@ private:
     // form takes the exact active native request and derives its target and mode from it.
     [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForAssignment(TransientTileRequest &request, const TileAssignmentFence &before);
-    AssignmentGeometryRequest requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, TransientTileRequest *owned);
+    // An owner acting on its own placement passes its ownership generation; the rectangle is the
+    // caller's complete frame target and is dispatched as given.
+    [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForOwnership(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, quint64 generation, std::function<bool()> constraint = {});
+    AssignmentGeometryRequest requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, OwnedProvenance owned);
 
 protected:
     /*!
