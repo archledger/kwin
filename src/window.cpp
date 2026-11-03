@@ -4082,6 +4082,49 @@ void Window::forgetTile(Tile *tile)
     Q_EMIT requestedTileChanged();
 }
 
+TileAssignmentFence Window::makeTileAssignmentFence()
+{
+    return TileAssignmentFence(*this);
+}
+
+TileAssignmentFence::TileAssignmentFence(Window &window)
+    : m_window(&window)
+    , m_windowId(window.internalId())
+    , m_placementRevision(window.m_placementContinuationRevision)
+    , m_requestedRevision(window.m_requestedTileChange)
+    , m_committedRevision(window.m_committedTileChange)
+    , m_geometryGeneration(window.m_geometryRequestGeneration)
+    , m_requestedTile(window.m_requestedTile)
+    , m_committedTile(window.m_tile)
+    , m_hadRequestedTile(!window.m_requestedTile.isNull())
+    , m_hadCommittedTile(!window.m_tile.isNull())
+{
+    window.ref();
+}
+
+TileAssignmentFence::~TileAssignmentFence()
+{
+    if (m_window) {
+        m_window->unref();
+    }
+}
+
+bool TileAssignmentFence::isCurrentFor(const Window &window) const
+{
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    return m_window.data() == &window && !window.isDeleted() && window.internalId() == m_windowId
+        && m_placementRevision != exhausted && m_requestedRevision != exhausted
+        && m_committedRevision != exhausted && m_geometryGeneration != exhausted
+        && window.m_placementContinuationRevision == m_placementRevision
+        && window.m_requestedTileChange == m_requestedRevision
+        && window.m_committedTileChange == m_committedRevision
+        && window.m_geometryRequestGeneration == m_geometryGeneration
+        && (!m_hadRequestedTile || !m_requestedTile.isNull())
+        && (!m_hadCommittedTile || !m_committedTile.isNull())
+        && window.m_requestedTile.data() == m_requestedTile.data()
+        && window.m_tile.data() == m_committedTile.data();
+}
+
 void Window::setTileCompatibility(Tile *tile)
 {
     qCWarning(KWIN_CORE) << "Writing to the property window.tile is deprecated: use tile.manage() instead";
