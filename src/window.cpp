@@ -3448,18 +3448,30 @@ quint64 Window::prepareAssignmentGeometrySync(const RectF &desired, AssignmentGe
 
 Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before)
 {
+    return requestMoveResizeGuarded(desired, mode, before, nullptr);
+}
+
+Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(TransientTileRequest &request, const TileAssignmentFence &before)
+{
+    // The adoption target is a complete frame rectangle; it never inherits pending manual resize work.
+    return requestMoveResizeGuarded(request.m_target, MoveResizeMode::MoveResize, before, &request);
+}
+
+Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, TransientTileRequest *owned)
+{
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
     AssignmentGeometryRequest request;
-    if (!before.isCurrentFor(*this)) {
+    if (!before.isCurrentFor(*this) || (owned && !transientRequestIsCurrent(*owned))) {
         request.result.outcome = AssignmentStepOutcome::Superseded;
         return request;
     }
-    // Refusals here have no effects. Transient ownership routes its own requests, and a backend
-    // without a guarded dispatcher could not report what it did.
-    if (m_transientOwnership || m_activeTransientRequest || !supportsAssignmentGeometryRequest()) {
+    // Refusals here have no effects. Only the exact active native request, whose identity the
+    // predicate above already checked, passes the ownership boundary; ordinary callers never
+    // inherit that exemption. A backend without a guarded dispatcher could not report what it did.
+    if ((!owned && (m_transientOwnership || m_activeTransientRequest)) || !supportsAssignmentGeometryRequest()) {
         return request;
     }
     AssignmentGeometrySync sync;
@@ -3474,7 +3486,7 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(RectF d
         return request;
     }
     // A Move inside an unsubmitted resize inherits that resize's requested size, as in performMoveResize().
-    if (mode == MoveResizeMode::Move && m_geometryResizePending) {
+    if (!owned && mode == MoveResizeMode::Move && m_geometryResizePending) {
         mode = MoveResizeMode::MoveResize;
     }
     const auto generation = ++m_geometryRequestGeneration;
@@ -3486,14 +3498,25 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(RectF d
             m_geometryResizePending = false;
         }
     });
+    if (owned) {
+        // Progress is published before the first synchronized write and stays Requested whatever
+        // happens afterwards; teardown callbacks must see it before any automatic geometry.
+        owned->m_geometryGeneration = generation;
+        owned->m_progress = TransientRequestProgress::Requested;
+        if (m_transientOwnership && m_transientOwnership->generation == owned->m_ownerGeneration
+            && m_transientOwnership->nativeSequence == owned->m_sequence) {
+            m_transientOwnership->progress = TransientRequestProgress::Requested;
+        }
+    }
     // The allocation invalidated every earlier fence, so this request's own checkpoint starts here.
     sync.result.outcome = AssignmentStepOutcome::Superseded;
+    sync.owned = owned;
     sync.result.checkpoint.reset(new TileAssignmentFence(*this));
     setMoveResizeGeometryInternal(desired, &sync);
     request.result = std::move(sync.result);
     const auto current = [&]() {
-        return request.result.checkpoint && request.result.checkpoint->isCurrentFor(*this)
-            && geometryRequestIsCurrent(generation) && transientGeometryRequestIsCurrent(generation);
+        return assignmentResultIsCurrent(request.result) && geometryRequestIsCurrent(generation)
+            && transientGeometryRequestIsCurrent(generation);
     };
     const auto supersede = [&]() {
         // After the first mutation nothing is rolled back and nothing is refused: the request ends
@@ -3528,9 +3551,15 @@ void Window::dispatchAssignmentGeometryRequest(const RectF &, MoveResizeMode, As
     // Only a backend that opted in through supportsAssignmentGeometryRequest() is dispatched to.
 }
 
+bool Window::assignmentResultIsCurrent(const AssignmentStepResult &result) const
+{
+    return result.checkpoint && result.checkpoint->isCurrentFor(*this)
+        && (!result.ownedRequest || transientRequestIsCurrent(*result.ownedRequest));
+}
+
 bool Window::assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const
 {
-    if (sync.result.checkpoint && sync.result.checkpoint->isCurrentFor(*this) && (!sync.hadOutput || sync.output)) {
+    if (assignmentResultIsCurrent(sync.result) && (!sync.hadOutput || sync.output)) {
         return true;
     }
     sync.result.outcome = AssignmentStepOutcome::Superseded;
@@ -3549,6 +3578,11 @@ void Window::setMoveResizeGeometryInternal(const RectF &rect, AssignmentGeometry
         if (sync) {
             sync->result.checkpoint.reset(new TileAssignmentFence(*this));
         }
+    }
+    if (sync) {
+        // No callback ran since the entry check; from here every synchronized write validates the
+        // owned request next to the checkpoint.
+        sync->result.ownedRequest = sync->owned;
     }
     setMoveResizeOutputInternal(sync ? sync->output.data() : workspace()->outputAt(rect.center()), sync);
 }
@@ -3686,13 +3720,10 @@ void Window::geometryResizeSubmitted(quint64 generation)
     }
 }
 
-void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, TransientTileRequest *request)
+void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
 {
-    if (!request) {
-        cancelTransientRequest();
-    } else if (m_activeTransientRequest != request || !transientRequestIsCurrent(*request)) {
-        return;
-    }
+    // Public geometry intent: a native request in flight is cancelled, never inherited.
+    cancelTransientRequest();
     if (isDeleted() || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
         return;
     }
@@ -3712,15 +3743,6 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, Transient
             m_geometryResizePending = false;
         }
     });
-    if (request) {
-        request->m_geometryGeneration = generation;
-        request->m_progress = TransientRequestProgress::Requested;
-        if (m_transientOwnership && m_transientOwnership->generation == request->m_ownerGeneration
-            && m_transientOwnership->nativeSequence == request->m_sequence) {
-            // Teardown callbacks must see this before any automatic geometry can be observed.
-            m_transientOwnership->progress = TransientRequestProgress::Requested;
-        }
-    }
     setMoveResizeGeometry(rect);
     if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
         return;
@@ -4715,7 +4737,10 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         || (m_transientOwnership && !prepared)
         || (!prepared && (request->m_ownerGeneration <= m_lastTransientOwnershipGeneration || m_transientRequestSequence == std::numeric_limits<quint64>::max()))
         || (prepared && (request->m_sequence != m_transientRequestSequence || m_transientOwnership->phase != TransientOwnershipPhase::Owned))
-        || m_geometryRequestGeneration == std::numeric_limits<quint64>::max()) {
+        // The owned geometry step reserves one request generation below the exhausted value, and
+        // the association needs its install and a possible removal; refuse both here, before any effect.
+        || m_geometryRequestGeneration >= std::numeric_limits<quint64>::max() - 1
+        || m_requestedTileChange >= std::numeric_limits<quint64>::max() - 1) {
         return receipt(TransientRequestOutcome::Rejected);
     }
     ref();
@@ -4727,8 +4752,10 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         m_lastTransientOwnershipGeneration = request->m_ownerGeneration;
         request->m_sequence = ++m_transientRequestSequence;
     }
+    // A backend without a guarded dispatcher is refused here rather than after the restore and
+    // association writes, which the owned geometry step must never leave behind as a refusal.
     if (!transientRequestTargetIsCurrent(*request) || !request->authorityIsCurrent()
-        || !canStartTransientTileRequest(request->m_target)
+        || !canStartTransientTileRequest(request->m_target) || !supportsAssignmentGeometryRequest()
         || m_geometryRequestGeneration != request->m_initialGeometryGeneration
         || !exactFrameGeometry(frameGeometry(), request->m_floating)
         || !exactFrameGeometry(moveResizeGeometry(), request->m_floating)) {
@@ -4754,24 +4781,37 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
             m_activeTransientRequest = nullptr;
         }
     });
-    setGeometryRestore(request->m_floating);
-    if (!transientRequestIsCurrent(*request) || !canStartTransientTileRequest(request->m_target)) {
+    // From here on every step borrows this request: a lapse of its external authority, like any
+    // Window change, ends the attempt where it stands. Nothing is rolled back or refreshed.
+    const auto restore = setGeometryRestoreForAssignment(request->m_floating, makeTileAssignmentFence(), request.get());
+    if (restore.outcome == AssignmentStepOutcome::Refused) {
+        // The restore writer refuses only for counter headroom, before any effect.
+        return receipt(TransientRequestOutcome::Rejected);
+    }
+    if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !canStartTransientTileRequest(request->m_target)) {
         return receipt(TransientRequestOutcome::Superseded);
     }
+    // The association is installed inline: no callback separates these writes from the checkpoint
+    // taken right after them, the fence already observes the association revision, and preflight
+    // reserved the headroom for this install and its possible removal.
     m_requestedTile = request->m_tile;
     m_requestedTransientTileGeneration = request->m_ownerGeneration;
     m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
     request->m_associationInstalled = true;
-    performMoveResize(request->m_target, MoveResizeMode::MoveResize, request.get());
-    if (!transientRequestIsCurrent(*request)) {
+    const TileAssignmentFence installed(*this);
+    const auto geometry = requestMoveResizeForAssignment(*request, installed);
+    // The geometry result's checkpoint and borrowed request validate the rest of this attempt:
+    // a notification handler that changes the restore field or any other fenced state, with the
+    // request's authority intact, supersedes it as well.
+    if (geometry.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(geometry.result)) {
         return receipt(TransientRequestOutcome::Superseded);
     }
     doSetQuickTileMode();
-    if (!transientRequestIsCurrent(*request)) {
+    if (!assignmentResultIsCurrent(geometry.result)) {
         return receipt(TransientRequestOutcome::Superseded);
     }
     Q_EMIT requestedTileChanged();
-    if (!transientRequestIsCurrent(*request)) {
+    if (!assignmentResultIsCurrent(geometry.result)) {
         return receipt(TransientRequestOutcome::Superseded);
     }
     applied = true;
@@ -5262,14 +5302,14 @@ void Window::setGeometryRestore(const RectF &rect)
     setGeometryRestoreInternal(rect);
 }
 
-Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before)
+Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, const TransientTileRequest *owned)
 {
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
     AssignmentStepResult result;
-    if (!before.isCurrentFor(*this)) {
+    if (!before.isCurrentFor(*this) || (owned && !transientRequestIsCurrent(*owned))) {
         result.outcome = AssignmentStepOutcome::Superseded;
         return result;
     }
@@ -5277,6 +5317,7 @@ Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desir
         return result;
     }
     result.outcome = AssignmentStepOutcome::Superseded;
+    result.ownedRequest = owned;
     setGeometryRestoreInternal(desired, &result);
     return result;
 }
@@ -5286,7 +5327,11 @@ void Window::setGeometryRestoreInternal(const RectF &desired, AssignmentStepResu
     if (m_maximizeGeometryRestore == desired) {
         if (guardedResult) {
             guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
-            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+            if (assignmentResultIsCurrent(*guardedResult)) {
+                guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+            } else {
+                guardedResult->checkpoint.reset();
+            }
         }
         return;
     }
@@ -5298,7 +5343,7 @@ void Window::setGeometryRestoreInternal(const RectF &desired, AssignmentStepResu
     }
     Q_EMIT maximizeGeometryRestoreChanged();
     if (guardedResult) {
-        if (guardedResult->checkpoint->isCurrentFor(*this)) {
+        if (assignmentResultIsCurrent(*guardedResult)) {
             guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
         } else {
             guardedResult->checkpoint.reset();

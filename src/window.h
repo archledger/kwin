@@ -1578,6 +1578,7 @@ private:
     friend class ::TestXdgShellWindow;
 
     TileAssignmentFence makeTileAssignmentFence();
+    class TransientTileRequest;
 
     enum class AssignmentStepOutcome {
         Refused,
@@ -1588,9 +1589,13 @@ private:
     {
         AssignmentStepOutcome outcome = AssignmentStepOutcome::Refused;
         std::unique_ptr<TileAssignmentFence> checkpoint;
+        // Borrowed for the duration of one owned native call: its external authority can lapse without
+        // any Window counter changing, so every child step validates it next to the checkpoint.
+        const TransientTileRequest *ownedRequest = nullptr;
     };
+    bool assignmentResultIsCurrent(const AssignmentStepResult &result) const;
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
-    [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before);
+    [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, const TransientTileRequest *owned = nullptr);
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
     struct AssignmentGeometrySync
     {
@@ -1601,6 +1606,9 @@ private:
         std::shared_ptr<ColorDescription> color;
         bool hadOutput = false;
         bool synchronize = false;
+        // Joins the result carrier once the requested rectangle is written: the request's own
+        // predicate cannot hold between generation allocation and that callback-free write.
+        const TransientTileRequest *owned = nullptr;
     };
     [[nodiscard]] AssignmentStepResult setMoveResizeGeometryForAssignment(RectF desired, const TileAssignmentFence &before);
     bool assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const;
@@ -1852,7 +1860,7 @@ protected:
         MoveResize = Move | Resize,
     };
     virtual void moveResizeInternal(const RectF &rect, MoveResizeMode mode) = 0;
-    void performMoveResize(const RectF &rect, MoveResizeMode mode, TransientTileRequest *request = nullptr);
+    void performMoveResize(const RectF &rect, MoveResizeMode mode);
     bool geometryRequestIsCurrent(quint64 generation) const;
     void geometryResizeSubmitted(quint64 generation);
     bool transientGeometryRequestIsCurrent(quint64 generation) const;
@@ -1866,8 +1874,11 @@ protected:
     virtual void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request);
 
 private:
-    // Declared after MoveResizeMode; it belongs with the private guarded entries above.
+    // Declared after MoveResizeMode; they belong with the private guarded entries above. The owned
+    // form takes the exact active native request and derives its target and mode from it.
     [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before);
+    [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForAssignment(TransientTileRequest &request, const TileAssignmentFence &before);
+    AssignmentGeometryRequest requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, TransientTileRequest *owned);
 
 protected:
     /**

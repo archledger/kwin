@@ -252,7 +252,7 @@ void WaylandWindow::updateGeometryInternal(const RectF &rect, AssignmentStepResu
     const RectF clientGeometry = frameRectToClientRect(rect);
     const RectF bufferGeometry = frameRectToBufferRect(rect);
     auto nextOutput = workspace()->outputAt(rect.center());
-    if (guardedResult && (!guardedResult->checkpoint->isCurrentFor(*this) || entryGeneration != m_geometryUpdateGeneration || (oldOutput && !entryOutput) || m_output != entryOutput.data())) {
+    if (guardedResult && (!assignmentResultIsCurrent(*guardedResult) || entryGeneration != m_geometryUpdateGeneration || (oldOutput && !entryOutput) || m_output != entryOutput.data())) {
         guardedResult->checkpoint.reset();
         return;
     }
@@ -322,7 +322,7 @@ void WaylandWindow::updateGeometryInternal(const RectF &rect, AssignmentStepResu
             return false;
         }
         return generation == m_geometryUpdateGeneration
-            && (!guardedResult || (guardedResult->checkpoint->isCurrentFor(*this) && (!hadExpectedOutput || expectedOutput) && m_output == expectedOutput.data()));
+            && (!guardedResult || (assignmentResultIsCurrent(*guardedResult) && (!hadExpectedOutput || expectedOutput) && m_output == expectedOutput.data()));
     };
     const auto finish = qScopeGuard([&]() {
         if (guardedResult) {
