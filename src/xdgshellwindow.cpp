@@ -44,6 +44,7 @@
 #include <QScopeGuard>
 
 #include <cmath>
+#include <limits>
 
 namespace KWin
 {
@@ -163,9 +164,28 @@ void XdgSurfaceWindow::handleRoleCommit()
 
 void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
 {
+    dispatchMoveResize(rect, mode, nullptr);
+}
+
+void XdgSurfaceWindow::dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request)
+{
+    dispatchMoveResize(rect, mode, &request);
+}
+
+void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded)
+{
     const auto generation = geometryRequestGeneration();
+    const auto current = [&]() {
+        if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
+            return false;
+        }
+        return !guarded || (guarded->result.checkpoint && guarded->result.checkpoint->isCurrentFor(*this));
+    };
     Q_EMIT frameGeometryAboutToChange();
-    if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
+    if (!current()) {
+        if (guarded) {
+            guarded->result.checkpoint.reset();
+        }
         return;
     }
 
@@ -180,9 +200,24 @@ void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode
         geometryResizeSubmitted(generation);
         if (roundedRequestedClientSize == roundedClientSize) {
             const RectF snappedRect = RectF(rect.topLeft(), nextClientSizeToFrameSize(snapToPixels(roundedClientSize, nextTargetScale())));
-            updateGeometry(m_configureGravity.apply(snappedRect, rect));
+            const RectF target = m_configureGravity.apply(snappedRect, rect);
+            if (guarded) {
+                publishForAssignment(target, *guarded);
+            } else {
+                updateGeometry(target);
+            }
         } else {
             scheduleConfigure();
+            if (guarded) {
+                // Staged for the coalesced configure, neither sent nor completed. Staging runs no
+                // callbacks, so the checkpoint taken before it is validated, not replaced.
+                guarded->dispatch = AssignmentRequestDispatch::Queued;
+                if (current()) {
+                    guarded->result.outcome = AssignmentStepOutcome::AppliedCurrent;
+                } else {
+                    guarded->result.checkpoint.reset();
+                }
+            }
         }
     } else {
         // If the window is moved, cancel any queued window position updates.
@@ -190,8 +225,26 @@ void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode
             configureEvent->bounds.moveTopLeft(rect.topLeft());
             configureEvent->gravity = Gravity::BottomRight;
         }
-        updateGeometry(RectF(rect.topLeft(), size()));
+        const RectF target(rect.topLeft(), size());
+        if (guarded) {
+            publishForAssignment(target, *guarded);
+        } else {
+            updateGeometry(target);
+        }
     }
+}
+
+void XdgSurfaceWindow::publishForAssignment(const RectF &rect, AssignmentGeometryRequest &request)
+{
+    // Fences do not observe the publication generation, so a nested drain during earlier callbacks
+    // can have consumed the headroom reserved at preflight. Detect that here rather than letting
+    // the publication helper refuse after this request has already mutated state.
+    if (m_geometryUpdateGeneration >= std::numeric_limits<quint64>::max() - 1) {
+        request.result.checkpoint.reset();
+        return;
+    }
+    request.dispatch = AssignmentRequestDispatch::Published;
+    updateGeometryInternal(rect, &request.result);
 }
 
 RectF XdgSurfaceWindow::frameRectToBufferRect(const RectF &rect) const
@@ -722,6 +775,12 @@ void XdgToplevelWindow::handleRoleCommit()
         }
         commitTileFromConfigure(tile, transientGeneration);
     }
+}
+
+bool XdgToplevelWindow::supportsAssignmentGeometryRequest() const
+{
+    // Popups keep their own placement rules; only toplevels take guarded geometry requests.
+    return true;
 }
 
 bool XdgToplevelWindow::canStartTransientTileRequest(const RectF &target) const
