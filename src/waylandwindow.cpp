@@ -214,7 +214,29 @@ RectF WaylandWindow::frameRectToBufferRect(const RectF &rect) const
 
 void WaylandWindow::updateGeometry(const RectF &rect)
 {
-    if (isDeleted() || m_geometryUpdateGeneration == std::numeric_limits<quint64>::max()) {
+    updateGeometryInternal(rect);
+}
+
+Window::AssignmentStepResult WaylandWindow::updateGeometryForAssignment(RectF rect, const TileAssignmentFence &before)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    result.outcome = AssignmentStepOutcome::Superseded;
+    if (!before.isCurrentFor(*this)) {
+        return result;
+    }
+    // Preparation may call a virtual conversion; never borrow the caller's fence afterward.
+    result.checkpoint.reset(new TileAssignmentFence(*this));
+    updateGeometryInternal(rect, &result);
+    return result;
+}
+
+void WaylandWindow::updateGeometryInternal(const RectF &rect, AssignmentStepResult *guardedResult)
+{
+    if (!guardedResult && (isDeleted() || m_geometryUpdateGeneration == std::numeric_limits<quint64>::max())) {
         return;
     }
     ref();
@@ -225,8 +247,15 @@ void WaylandWindow::updateGeometry(const RectF &rect)
     const RectF oldFrameGeometry = m_frameGeometry;
     const RectF oldBufferGeometry = m_bufferGeometry;
     LogicalOutput *oldOutput = m_output;
+    const QPointer<LogicalOutput> entryOutput(oldOutput);
+    const auto entryGeneration = m_geometryUpdateGeneration;
     const RectF clientGeometry = frameRectToClientRect(rect);
     const RectF bufferGeometry = frameRectToBufferRect(rect);
+    auto nextOutput = workspace()->outputAt(rect.center());
+    if (guardedResult && (!guardedResult->checkpoint->isCurrentFor(*this) || entryGeneration != m_geometryUpdateGeneration || (oldOutput && !entryOutput) || m_output != entryOutput.data())) {
+        guardedResult->checkpoint.reset();
+        return;
+    }
 
     WaylandGeometryTypes changedGeometries;
 
@@ -240,12 +269,24 @@ void WaylandWindow::updateGeometry(const RectF &rect)
         changedGeometries |= WaylandGeometryBuffer;
     }
 
-    if (!changedGeometries) {
+    auto &pending = m_pendingGeometryNotifications;
+    const bool outputReplaced = oldOutput != nextOutput;
+    const bool changed = changedGeometries || (guardedResult && outputReplaced);
+    const bool hasPending = pending.buffer || pending.client || pending.frame || pending.outputPending;
+    if (!changed && (!guardedResult || !hasPending)) {
+        if (guardedResult) {
+            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+        }
+        return;
+    }
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (guardedResult && (m_geometryUpdateGeneration >= exhausted - 1 || (changed && m_placementContinuationRevision >= exhausted - 1))) {
+        guardedResult->outcome = AssignmentStepOutcome::Refused;
+        guardedResult->checkpoint.reset();
         return;
     }
 
     const auto generation = ++m_geometryUpdateGeneration;
-    auto &pending = m_pendingGeometryNotifications;
     if ((changedGeometries & WaylandGeometryBuffer) && !pending.buffer) {
         pending.buffer = oldBufferGeometry;
     }
@@ -255,25 +296,46 @@ void WaylandWindow::updateGeometry(const RectF &rect)
     if ((changedGeometries & WaylandGeometryFrame) && !pending.frame) {
         pending.frame = oldFrameGeometry;
     }
-    auto nextOutput = workspace()->outputAt(rect.center());
-    if (oldOutput != nextOutput && !pending.outputPending) {
+    if (outputReplaced && !pending.outputPending) {
         pending.outputPending = true;
         pending.outputWasNull = !oldOutput;
         pending.output = oldOutput;
     }
-    m_clientGeometry = clientGeometry;
-    m_frameGeometry = rect;
-    m_bufferGeometry = bufferGeometry;
-    m_output = nextOutput;
-    updateWindowRules(Rules::Position | Rules::Size);
+    if (changed) {
+        m_clientGeometry = clientGeometry;
+        m_frameGeometry = rect;
+        m_bufferGeometry = bufferGeometry;
+        m_output = nextOutput;
+        if (m_placementContinuationRevision != exhausted) {
+            ++m_placementContinuationRevision;
+        }
+    }
+    const QPointer<LogicalOutput> expectedOutput(m_output);
+    const bool hadExpectedOutput = m_output;
+    if (guardedResult) {
+        guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
+    }
 
     const auto current = [&]() {
         if (isDeleted()) {
             pending = {};
             return false;
         }
-        return generation == m_geometryUpdateGeneration;
+        return generation == m_geometryUpdateGeneration
+            && (!guardedResult || (guardedResult->checkpoint->isCurrentFor(*this) && (!hadExpectedOutput || expectedOutput) && m_output == expectedOutput.data()));
     };
+    const auto finish = qScopeGuard([&]() {
+        if (guardedResult) {
+            if (current()) {
+                guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+            } else {
+                guardedResult->checkpoint.reset();
+            }
+        }
+    });
+    if (changed) {
+        updateWindowRules(Rules::Position | Rules::Size);
+    }
     if (!current()) {
         return;
     }
