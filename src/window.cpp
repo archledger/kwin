@@ -3980,15 +3980,15 @@ void Window::commitTileFromConfigure(Tile *tile, quint64 transientGeneration)
     commitTileInternal(tile);
 }
 
-Window::AssignmentCommitResult Window::commitTileForAssignment(Tile *target, const TileAssignmentFence &before)
+Window::AssignmentStepResult Window::commitTileForAssignment(Tile *target, const TileAssignmentFence &before)
 {
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
-    AssignmentCommitResult result;
+    AssignmentStepResult result;
     if (!before.isCurrentFor(*this)) {
-        result.outcome = AssignmentCommitOutcome::Superseded;
+        result.outcome = AssignmentStepOutcome::Superseded;
         return result;
     }
     if (target != m_requestedTile.data() || (target && target->isTransient())) {
@@ -3998,12 +3998,12 @@ Window::AssignmentCommitResult Window::commitTileForAssignment(Tile *target, con
     if (m_tile != target && (m_committedTileChange >= lastUsable || m_placementContinuationRevision >= lastUsable)) {
         return result;
     }
-    result.outcome = AssignmentCommitOutcome::Superseded;
+    result.outcome = AssignmentStepOutcome::Superseded;
     commitTileInternal(target, &result);
     return result;
 }
 
-void Window::commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResult)
+void Window::commitTileInternal(Tile *tile, AssignmentStepResult *guardedResult)
 {
     if (isDeleted()) {
         return;
@@ -4011,7 +4011,7 @@ void Window::commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResul
     if (m_tile == tile) {
         if (guardedResult) {
             guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
-            guardedResult->outcome = AssignmentCommitOutcome::AppliedCurrent;
+            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
         }
         return;
     }
@@ -4051,7 +4051,7 @@ void Window::commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResul
     }
     if (guardedResult) {
         if (current()) {
-            guardedResult->outcome = AssignmentCommitOutcome::AppliedCurrent;
+            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
         } else {
             guardedResult->checkpoint.reset();
         }
@@ -4997,9 +4997,50 @@ RectF Window::geometryRestore() const
  */
 void Window::setGeometryRestore(const RectF &rect)
 {
-    if (m_maximizeGeometryRestore != rect) {
-        m_maximizeGeometryRestore = rect;
-        Q_EMIT maximizeGeometryRestoreChanged();
+    setGeometryRestoreInternal(rect);
+}
+
+Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    if (m_maximizeGeometryRestore != desired && m_placementContinuationRevision >= std::numeric_limits<quint64>::max() - 1) {
+        return result;
+    }
+    result.outcome = AssignmentStepOutcome::Superseded;
+    setGeometryRestoreInternal(desired, &result);
+    return result;
+}
+
+void Window::setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult)
+{
+    if (m_maximizeGeometryRestore == desired) {
+        if (guardedResult) {
+            guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
+            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+        }
+        return;
+    }
+    m_maximizeGeometryRestore = desired;
+    // Restore-state callbacks must invalidate older native continuation snapshots too.
+    m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+    if (guardedResult) {
+        guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
+    }
+    Q_EMIT maximizeGeometryRestoreChanged();
+    if (guardedResult) {
+        if (guardedResult->checkpoint->isCurrentFor(*this)) {
+            guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
+        } else {
+            guardedResult->checkpoint.reset();
+        }
     }
 }
 
