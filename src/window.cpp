@@ -4095,8 +4095,9 @@ void Window::setTileCompatibility(Tile *tile)
     }
 
     Tile *previousTile = m_requestedTile;
-    if (tile) {
-        tile->manage(this);
+    if (tile && !tile->manage(this)) {
+        // A refused destination must not release the previous assignment.
+        return;
     }
 
     if (previousTile) {
