@@ -347,6 +347,14 @@ private Q_SLOTS:
     void testPublicTransientReleaseRefusal();
     void testCompatibilityCancellation_data();
     void testCompatibilityCancellation();
+    void testTileAssignmentFenceNeutral();
+    void testTileAssignmentFenceInvalidation_data();
+    void testTileAssignmentFenceInvalidation();
+    void testTileAssignmentFenceAssociations_data();
+    void testTileAssignmentFenceAssociations();
+    void testTileAssignmentFenceClose();
+    void testTileAssignmentFenceCounters_data();
+    void testTileAssignmentFenceCounters();
     void testTransientRegistryLookup();
     void testTransientRegistryRetiredRoot();
     void testTransientRegistryDestructorReentry_data();
@@ -6251,6 +6259,236 @@ void TestXdgShellWindow::testCompatibilityCancellation()
     window->setSkipCloseAnimation(true);
     window->destroyWindow();
     QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceNeutral()
+{
+    static_assert(!std::is_copy_constructible_v<TileAssignmentFence>);
+    static_assert(!std::is_move_constructible_v<TileAssignmentFence>);
+    static_assert(!std::is_copy_assignable_v<TileAssignmentFence>);
+    static_assert(!std::is_move_assignable_v<TileAssignmentFence>);
+    static_assert(!std::is_constructible_v<TileAssignmentFence, Window &>);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    std::unique_ptr<KWayland::Client::Surface> otherSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> otherShell(Test::createXdgToplevelSurface(otherSurface.get()));
+    auto other = Test::renderAndWaitForShown(otherSurface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(other);
+    const std::array fields = {&Window::m_placementContinuationRevision, &Window::m_requestedTileChange,
+                               &Window::m_committedTileChange, &Window::m_geometryRequestGeneration};
+    // Colliding versions make wrong-Window refusal independent of the counter comparisons.
+    for (auto field : fields) {
+        const auto revision = std::max(window->*field, other->*field);
+        window->*field = revision;
+        other->*field = revision;
+    }
+    const auto revisions = std::array{window->m_placementContinuationRevision, window->m_requestedTileChange,
+                                      window->m_committedTileChange, window->m_geometryRequestGeneration};
+    const auto geometry = window->moveResizeGeometry();
+    const int references = window->m_refCount;
+    QSignalSpy requested(window, &Window::requestedTileChanged);
+    QSignalSpy committed(window, &Window::tileChanged);
+    QSignalSpy geometryChanged(window, &Window::requestedGeometryChanged);
+    {
+        auto fence = window->makeTileAssignmentFence();
+        QCOMPARE(window->m_refCount, references + 1);
+        QVERIFY(fence.isCurrentFor(*window));
+        QVERIFY(!fence.isCurrentFor(*other));
+        QVERIFY(fence.isCurrentFor(*window));
+        {
+            auto second = window->makeTileAssignmentFence();
+            QCOMPARE(window->m_refCount, references + 2);
+            QVERIFY(second.isCurrentFor(*window));
+            QVERIFY(fence.isCurrentFor(*window));
+        }
+        QCOMPARE(window->m_refCount, references + 1);
+        QCOMPARE(window->m_placementContinuationRevision, revisions[0]);
+        QCOMPARE(window->m_requestedTileChange, revisions[1]);
+        QCOMPARE(window->m_committedTileChange, revisions[2]);
+        QCOMPARE(window->m_geometryRequestGeneration, revisions[3]);
+        QCOMPARE(window->moveResizeGeometry(), geometry);
+        QVERIFY(!window->requestedTile() && !window->tile());
+        QVERIFY(requested.isEmpty() && committed.isEmpty() && geometryChanged.isEmpty());
+    }
+    QCOMPARE(window->m_refCount, references);
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceInvalidation_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("equal-null") << 0;
+    QTest::newRow("equal-geometry") << 1;
+    QTest::newRow("requested-roundtrip") << 2;
+    QTest::newRow("committed-roundtrip") << 3;
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceInvalidation()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto tile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+    QVERIFY(tile);
+    auto fence = window->makeTileAssignmentFence();
+    QVERIFY(fence.isCurrentFor(*window));
+    switch (action) {
+    case 0:
+        window->setTileCompatibility(nullptr);
+        break;
+    case 1:
+        window->moveResize(window->moveResizeGeometry());
+        break;
+    case 2:
+        window->requestTile(tile);
+        window->requestTile(nullptr);
+        break;
+    case 3:
+        window->commitTile(tile);
+        window->commitTile(nullptr);
+        break;
+    }
+    QVERIFY(!fence.isCurrentFor(*window));
+    QVERIFY(!fence.isCurrentFor(*window));
+    QVERIFY(!window->requestedTile() && !window->tile());
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceAssociations_data()
+{
+    QTest::addColumn<bool>("requested");
+    QTest::addColumn<bool>("committed");
+    QTest::newRow("requested-only") << true << false;
+    QTest::newRow("committed-only") << false << true;
+    QTest::newRow("both") << true << true;
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceAssociations()
+{
+    QFETCH(bool, requested);
+    QFETCH(bool, committed);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto tile = std::make_unique<Tile>(workspace()->tileManager(window->moveResizeOutput()));
+    tile->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    if (requested) {
+        window->requestTile(tile.get());
+    }
+    if (committed) {
+        window->commitTile(tile.get());
+    }
+    // No membership means destruction only clears QPointers, without ordinary unmanage calls.
+    QVERIFY(tile->windows().isEmpty());
+    const auto revisions = std::array{window->m_placementContinuationRevision, window->m_requestedTileChange,
+                                      window->m_committedTileChange, window->m_geometryRequestGeneration};
+    QSignalSpy requestedChanged(window, &Window::requestedTileChanged);
+    QSignalSpy committedChanged(window, &Window::tileChanged);
+    auto fence = window->makeTileAssignmentFence();
+    QVERIFY(fence.isCurrentFor(*window));
+    tile.reset();
+    QVERIFY(!window->requestedTile() && !window->tile());
+    QCOMPARE(window->m_placementContinuationRevision, revisions[0]);
+    QCOMPARE(window->m_requestedTileChange, revisions[1]);
+    QCOMPARE(window->m_committedTileChange, revisions[2]);
+    QCOMPARE(window->m_geometryRequestGeneration, revisions[3]);
+    QVERIFY(requestedChanged.isEmpty() && committedChanged.isEmpty());
+    QVERIFY(!fence.isCurrentFor(*window));
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceClose()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QPointer<Window> guard(window);
+    QSignalSpy destroyed(window, &QObject::destroyed);
+    {
+        auto fence = window->makeTileAssignmentFence();
+        QVERIFY(fence.isCurrentFor(*window));
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QVERIFY(guard);
+        QVERIFY(window->isDeleted());
+        QVERIFY(!fence.isCurrentFor(*window));
+        // Matching snapshots still cannot make a logically closed Window current.
+        auto closedFence = window->makeTileAssignmentFence();
+        QVERIFY(!closedFence.isCurrentFor(*window));
+        QCOMPARE(destroyed.count(), 0);
+    }
+    QTRY_VERIFY(!guard);
+    QCOMPARE(destroyed.count(), 1);
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceCounters_data()
+{
+    QTest::addColumn<int>("field");
+    QTest::addColumn<int>("boundary");
+    const std::array names = {QByteArray("placement"), QByteArray("requested"), QByteArray("committed"), QByteArray("geometry")};
+    for (int field = 0; field < int(names.size()); ++field) {
+        QTest::newRow((names[field] + "-change").constData()) << field << 0;
+        QTest::newRow((names[field] + "-last-value").constData()) << field << 1;
+        QTest::newRow((names[field] + "-exhausted").constData()) << field << 2;
+    }
+}
+
+void TestXdgShellWindow::testTileAssignmentFenceCounters()
+{
+    QFETCH(int, field);
+    QFETCH(int, boundary);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    const std::array fields = {&Window::m_placementContinuationRevision, &Window::m_requestedTileChange,
+                               &Window::m_committedTileChange, &Window::m_geometryRequestGeneration};
+    auto &revision = window->*fields[field];
+    const auto maximum = std::numeric_limits<quint64>::max();
+    if (boundary) {
+        revision = maximum - (boundary == 1 ? 1 : 0);
+    }
+    const auto before = std::array{window->m_placementContinuationRevision, window->m_requestedTileChange,
+                                   window->m_committedTileChange, window->m_geometryRequestGeneration};
+    auto fence = window->makeTileAssignmentFence();
+    QCOMPARE(fence.isCurrentFor(*window), boundary != 2);
+    if (boundary != 2) {
+        // Isolate each comparison so another changed counter cannot mask its absence.
+        ++revision;
+        for (int other = 0; other < int(fields.size()); ++other) {
+            if (other != field) {
+                QCOMPARE(window->*fields[other], before[other]);
+            }
+        }
+    }
+    QVERIFY(!fence.isCurrentFor(*window));
+    if (boundary) {
+        auto tile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+        QVERIFY(tile);
+        switch (field) {
+        case 0:
+            window->cancelTransientRequest();
+            window->cancelTransientRequest();
+            break;
+        case 1:
+            window->requestTile(tile);
+            window->requestTile(nullptr);
+            break;
+        case 2:
+            window->commitTile(tile);
+            window->commitTile(nullptr);
+            break;
+        case 3:
+            window->moveResize(RectF(30, 40, 260, 130));
+            window->moveResize(RectF(40, 50, 270, 140));
+            break;
+        }
+        QCOMPARE(revision, maximum);
+    }
+    QVERIFY(!fence.isCurrentFor(*window));
 }
 
 void TestXdgShellWindow::testTransientRegistryLookup()
