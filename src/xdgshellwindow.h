@@ -151,6 +151,7 @@ public:
 class XdgToplevelWindow final : public XdgSurfaceWindow
 {
     Q_OBJECT
+    friend class ::TestXdgShellWindow;
 
     enum class PingReason {
         CloseWindow,
@@ -278,6 +279,17 @@ private:
     QMap<quint32, PingReason> m_pings;
     MaximizeMode m_maximizeMode = MaximizeRestore;
     MaximizeMode m_requestedMaximizeMode = MaximizeRestore;
+    // Advanced by every requested-mode write so a later boundary can tell a round trip from no change.
+    quint64 m_requestedMaximizeRevision = 0;
+    struct OwnedMaximize
+    {
+        quint64 generation;
+        RectF managed;
+    };
+    std::optional<OwnedMaximize> ownedMaximizePlan(MaximizeMode mode, MaximizeMode oldMode, const RectF &restore) const;
+    bool ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const;
+    void maximizeOwned(const OwnedMaximize &plan, MaximizeMode mode, MaximizeMode oldMode, const RectF &oldGeometry, const RectF &clientArea);
+    void writeRequestedMaximizeMode(MaximizeMode mode);
     QSizeF m_minimumSize = QSizeF(0, 0);
     QSizeF m_maximumSize = QSizeF(0, 0);
     DecorationPolicy m_decorationPolicy = DecorationPolicy::PreferredByClient;

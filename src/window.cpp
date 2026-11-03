@@ -3448,30 +3448,36 @@ quint64 Window::prepareAssignmentGeometrySync(const RectF &desired, AssignmentGe
 
 Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before)
 {
-    return requestMoveResizeGuarded(desired, mode, before, nullptr);
+    return requestMoveResizeGuarded(desired, mode, before, OwnedProvenance());
 }
 
 Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(TransientTileRequest &request, const TileAssignmentFence &before)
 {
     // The adoption target is a complete frame rectangle; it never inherits pending manual resize work.
-    return requestMoveResizeGuarded(request.m_target, MoveResizeMode::MoveResize, before, &request);
+    return requestMoveResizeGuarded(request.m_target, MoveResizeMode::MoveResize, before, OwnedProvenance::forRequest(&request));
 }
 
-Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, TransientTileRequest *owned)
+Window::AssignmentGeometryRequest Window::requestMoveResizeForOwnership(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, quint64 generation, std::function<bool()> constraint)
+{
+    return requestMoveResizeGuarded(desired, mode, before, OwnedProvenance::forOwnership(generation, std::move(constraint)));
+}
+
+Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before, OwnedProvenance owned)
 {
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
     AssignmentGeometryRequest request;
-    if (!before.isCurrentFor(*this) || (owned && !transientRequestIsCurrent(*owned))) {
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
         request.result.outcome = AssignmentStepOutcome::Superseded;
         return request;
     }
-    // Refusals here have no effects. Only the exact active native request, whose identity the
-    // predicate above already checked, passes the ownership boundary; ordinary callers never
-    // inherit that exemption. A backend without a guarded dispatcher could not report what it did.
-    if ((!owned && (m_transientOwnership || m_activeTransientRequest)) || !supportsAssignmentGeometryRequest()) {
+    // Refusals here have no effects. Only owned provenance, whose identity the predicate above
+    // already checked, passes the ownership boundary; ordinary callers never inherit that
+    // exemption. A backend without a guarded dispatcher could not report what it did.
+    const bool ordinary = owned.kind == OwnedProvenance::Kind::None;
+    if ((ordinary && (m_transientOwnership || m_activeTransientRequest)) || !supportsAssignmentGeometryRequest()) {
         return request;
     }
     AssignmentGeometrySync sync;
@@ -3486,7 +3492,7 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
         return request;
     }
     // A Move inside an unsubmitted resize inherits that resize's requested size, as in performMoveResize().
-    if (!owned && mode == MoveResizeMode::Move && m_geometryResizePending) {
+    if (ordinary && mode == MoveResizeMode::Move && m_geometryResizePending) {
         mode = MoveResizeMode::MoveResize;
     }
     const auto generation = ++m_geometryRequestGeneration;
@@ -3498,13 +3504,14 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
             m_geometryResizePending = false;
         }
     });
-    if (owned) {
+    if (owned.kind == OwnedProvenance::Kind::Request) {
         // Progress is published before the first synchronized write and stays Requested whatever
         // happens afterwards; teardown callbacks must see it before any automatic geometry.
-        owned->m_geometryGeneration = generation;
-        owned->m_progress = TransientRequestProgress::Requested;
-        if (m_transientOwnership && m_transientOwnership->generation == owned->m_ownerGeneration
-            && m_transientOwnership->nativeSequence == owned->m_sequence) {
+        auto *const adoption = owned.request;
+        adoption->m_geometryGeneration = generation;
+        adoption->m_progress = TransientRequestProgress::Requested;
+        if (m_transientOwnership && m_transientOwnership->generation == adoption->m_ownerGeneration
+            && m_transientOwnership->nativeSequence == adoption->m_sequence) {
             m_transientOwnership->progress = TransientRequestProgress::Requested;
         }
     }
@@ -3551,10 +3558,51 @@ void Window::dispatchAssignmentGeometryRequest(const RectF &, MoveResizeMode, As
     // Only a backend that opted in through supportsAssignmentGeometryRequest() is dispatched to.
 }
 
+bool Window::ownedProvenanceIsCurrent(const OwnedProvenance &owned) const
+{
+    switch (owned.kind) {
+    case OwnedProvenance::Kind::None:
+        return true;
+    case OwnedProvenance::Kind::Request:
+        return owned.request && transientRequestIsCurrent(*owned.request);
+    case OwnedProvenance::Kind::Ownership:
+        return transientOwnershipIsCurrent(owned.ownership) && (!owned.constraint || owned.constraint());
+    }
+    return false;
+}
+
 bool Window::assignmentResultIsCurrent(const AssignmentStepResult &result) const
 {
-    return result.checkpoint && result.checkpoint->isCurrentFor(*this)
-        && (!result.ownedRequest || transientRequestIsCurrent(*result.ownedRequest));
+    return result.checkpoint && result.checkpoint->isCurrentFor(*this) && ownedProvenanceIsCurrent(result.owned);
+}
+
+bool Window::transientOwnershipIsCurrent(quint64 generation) const
+{
+    if (isDeleted() || !generation || !m_transientOwnership || m_transientOwnership->generation != generation
+        || m_transientOwnership->phase != TransientOwnershipPhase::Owned || m_transientOwnership->executing
+        || m_transientOwnership->releasing || m_activeTransientRequest) {
+        return false;
+    }
+    const auto &ownership = *m_transientOwnership;
+    if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+        || !ownership.writer->ownsReservation(internalId(), QString::number(generation))) {
+        return false;
+    }
+    Tile *const tile = ownership.tile.data();
+    if (!tile || !tile->isTransient() || !ownership.manager || !ownership.output || !ownership.desktop
+        || tile->manager() != ownership.manager || ownership.manager->tearingDown()
+        || ownership.manager->output() != ownership.output || tile->desktop() != ownership.desktop
+        || !workspace()->outputs().contains(ownership.output)
+        || !VirtualDesktopManager::self()->desktops().contains(ownership.desktop)
+        || !tile->windows().contains(const_cast<Window *>(this))) {
+        return false;
+    }
+    // The window's own current context, not only the recorded objects: a handler can move it to
+    // another desktop without touching any fence or releasing the ownership.
+    if (desktops().size() != 1 || desktops().constFirst() != ownership.desktop || moveResizeOutput() != ownership.output) {
+        return false;
+    }
+    return m_requestedTile == tile && m_requestedTransientTileGeneration == generation && (!m_tile || m_tile == tile);
 }
 
 bool Window::assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const
@@ -3581,8 +3629,8 @@ void Window::setMoveResizeGeometryInternal(const RectF &rect, AssignmentGeometry
     }
     if (sync) {
         // No callback ran since the entry check; from here every synchronized write validates the
-        // owned request next to the checkpoint.
-        sync->result.ownedRequest = sync->owned;
+        // owned provenance next to the checkpoint.
+        sync->result.owned = sync->owned;
     }
     setMoveResizeOutputInternal(sync ? sync->output.data() : workspace()->outputAt(rect.center()), sync);
 }
@@ -4783,7 +4831,7 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     });
     // From here on every step borrows this request: a lapse of its external authority, like any
     // Window change, ends the attempt where it stands. Nothing is rolled back or refreshed.
-    const auto restore = setGeometryRestoreForAssignment(request->m_floating, makeTileAssignmentFence(), request.get());
+    const auto restore = setGeometryRestoreForAssignment(request->m_floating, makeTileAssignmentFence(), OwnedProvenance::forRequest(request.get()));
     if (restore.outcome == AssignmentStepOutcome::Refused) {
         // The restore writer refuses only for counter headroom, before any effect.
         return receipt(TransientRequestOutcome::Rejected);
@@ -5302,14 +5350,14 @@ void Window::setGeometryRestore(const RectF &rect)
     setGeometryRestoreInternal(rect);
 }
 
-Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, const TransientTileRequest *owned)
+Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned)
 {
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
     AssignmentStepResult result;
-    if (!before.isCurrentFor(*this) || (owned && !transientRequestIsCurrent(*owned))) {
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
         result.outcome = AssignmentStepOutcome::Superseded;
         return result;
     }
@@ -5317,7 +5365,7 @@ Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desir
         return result;
     }
     result.outcome = AssignmentStepOutcome::Superseded;
-    result.ownedRequest = owned;
+    result.owned = owned;
     setGeometryRestoreInternal(desired, &result);
     return result;
 }
