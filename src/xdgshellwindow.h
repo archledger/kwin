@@ -74,6 +74,7 @@ public:
 
 protected:
     void moveResizeInternal(const RectF &rect, MoveResizeMode mode) override;
+    void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request) override;
 
     virtual XdgSurfaceConfigure *sendRoleConfigure() = 0;
     virtual void handleRoleCommit();
@@ -81,7 +82,7 @@ protected:
     virtual void handleRoleDestroyed();
 
     XdgSurfaceConfigure *lastAcknowledgedConfigure() const;
-    bool hasPendingNativeGeometry() const;
+    KWIN_EXPORT bool hasPendingNativeGeometry() const;
     void scheduleConfigure();
     void sendConfigure();
 
@@ -91,6 +92,10 @@ protected:
     Gravity m_nextGravity = Gravity::None;
 
 private:
+    friend class ::TestXdgShellWindow;
+
+    void dispatchMoveResize(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded);
+    void publishForAssignment(const RectF &rect, AssignmentGeometryRequest &request);
     void handleConfigureAcknowledged(quint32 serial);
     void handleCommit();
     void handleNextWindowGeometry();
@@ -211,6 +216,7 @@ protected:
     void doSetPreferredColorDescription() override;
     bool canStartTransientTileRequest(const RectF &target) const override;
     bool isTransientTileTargetFeasible(const RectF &target) const override;
+    bool supportsAssignmentGeometryRequest() const override;
 
 private:
     void handleWindowTitleChanged();

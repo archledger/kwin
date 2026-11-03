@@ -1610,6 +1610,20 @@ private:
     void setNextTargetScaleInternal(qreal scale, AssignmentGeometrySync *sync = nullptr);
     void setPreferredBufferTransformInternal(OutputTransform transform, AssignmentGeometrySync *sync = nullptr);
     void setPreferredColorDescriptionInternal(const std::shared_ptr<ColorDescription> &description, AssignmentGeometrySync *sync = nullptr);
+    quint64 prepareAssignmentGeometrySync(const RectF &desired, AssignmentGeometrySync &sync) const;
+
+    enum class AssignmentRequestDispatch {
+        None,
+        Published,
+        Queued,
+    };
+    struct AssignmentGeometryRequest
+    {
+        AssignmentStepResult result;
+        AssignmentRequestDispatch dispatch = AssignmentRequestDispatch::None;
+        // The geometry-request generation this attempt allocated; zero while nothing was allocated.
+        quint64 requestGeneration = 0;
+    };
 
     enum class TransientRequestOutcome {
         Rejected,
@@ -1846,7 +1860,16 @@ protected:
     void commitTileFromConfigure(Tile *tile, quint64 transientGeneration);
     virtual bool canStartTransientTileRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
+    // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;
+    // a dispatcher reports what it staged or published through the stack-bound request.
+    virtual bool supportsAssignmentGeometryRequest() const;
+    virtual void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request);
 
+private:
+    // Declared after MoveResizeMode; it belongs with the private guarded entries above.
+    [[nodiscard]] AssignmentGeometryRequest requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before);
+
+protected:
     /**
      * @returns whether the Window is currently in move resize mode
      */

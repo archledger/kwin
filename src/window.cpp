@@ -3404,15 +3404,30 @@ Window::AssignmentStepResult Window::setMoveResizeGeometryForAssignment(RectF de
     AssignmentGeometrySync sync;
     sync.result.outcome = AssignmentStepOutcome::Superseded;
     sync.result.checkpoint.reset(new TileAssignmentFence(*this));
+    const quint64 writes = prepareAssignmentGeometrySync(desired, sync);
+    if (!assignmentGeometrySyncIsCurrent(sync)) {
+        return std::move(sync.result);
+    }
+    if (writes > std::numeric_limits<quint64>::max() - 1 - m_placementContinuationRevision) {
+        return refused;
+    }
+    setMoveResizeGeometryInternal(desired, &sync);
+    if (assignmentGeometrySyncIsCurrent(sync)) {
+        sync.result.outcome = AssignmentStepOutcome::AppliedCurrent;
+    }
+    return std::move(sync.result);
+}
+
+quint64 Window::prepareAssignmentGeometrySync(const RectF &desired, AssignmentGeometrySync &sync) const
+{
+    // Freeze the target output properties before any owned write; the writers must not re-read
+    // them after callbacks. This is a query only and advances no counter.
     sync.output = workspace()->outputAt(desired.center());
     sync.hadOutput = bool(sync.output);
     if (sync.output) {
         sync.scale = sync.output->scale();
         sync.transform = sync.output->transform();
         sync.color = sync.output->blendingColor();
-    }
-    if (!assignmentGeometrySyncIsCurrent(sync)) {
-        return std::move(sync.result);
     }
     const bool outputChanged = m_moveResizeOutput != sync.output;
     const bool scaleChanged = sync.output && m_nextTargetScale != sync.scale;
@@ -3428,14 +3443,89 @@ Window::AssignmentStepResult Window::setMoveResizeGeometryForAssignment(RectF de
     } else if (!sync.output) {
         writes += m_outputPropertiesPending;
     }
-    if (writes > std::numeric_limits<quint64>::max() - 1 - m_placementContinuationRevision) {
-        return refused;
+    return writes;
+}
+
+Window::AssignmentGeometryRequest Window::requestMoveResizeForAssignment(RectF desired, MoveResizeMode mode, const TileAssignmentFence &before)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentGeometryRequest request;
+    if (!before.isCurrentFor(*this)) {
+        request.result.outcome = AssignmentStepOutcome::Superseded;
+        return request;
     }
+    // Refusals here have no effects. Transient ownership routes its own requests, and a backend
+    // without a guarded dispatcher could not report what it did.
+    if (m_transientOwnership || m_activeTransientRequest || !supportsAssignmentGeometryRequest()) {
+        return request;
+    }
+    AssignmentGeometrySync sync;
+    const quint64 writes = prepareAssignmentGeometrySync(desired, sync);
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    // Reserve everything a synchronous request may need before the first mutation: one request
+    // generation below the value fences treat as exhausted, the exact synchronization writes plus
+    // one committed-geometry change, and one publication generation. Near exhaustion this refuses
+    // requests whose eventual queued or no-op branch would have needed less.
+    if (m_geometryRequestGeneration >= exhausted - 1 || m_geometryUpdateGeneration >= exhausted - 1
+        || writes + 1 > exhausted - 1 - m_placementContinuationRevision) {
+        return request;
+    }
+    // A Move inside an unsubmitted resize inherits that resize's requested size, as in performMoveResize().
+    if (mode == MoveResizeMode::Move && m_geometryResizePending) {
+        mode = MoveResizeMode::MoveResize;
+    }
+    const auto generation = ++m_geometryRequestGeneration;
+    request.requestGeneration = generation;
+    m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
+    const auto finish = qScopeGuard([this, generation]() {
+        // An obsolete stack frame must not clear a newer request's pending submission.
+        if (generation == m_geometryRequestGeneration) {
+            m_geometryResizePending = false;
+        }
+    });
+    // The allocation invalidated every earlier fence, so this request's own checkpoint starts here.
+    sync.result.outcome = AssignmentStepOutcome::Superseded;
+    sync.result.checkpoint.reset(new TileAssignmentFence(*this));
     setMoveResizeGeometryInternal(desired, &sync);
-    if (assignmentGeometrySyncIsCurrent(sync)) {
-        sync.result.outcome = AssignmentStepOutcome::AppliedCurrent;
+    request.result = std::move(sync.result);
+    const auto current = [&]() {
+        return request.result.checkpoint && request.result.checkpoint->isCurrentFor(*this)
+            && geometryRequestIsCurrent(generation) && transientGeometryRequestIsCurrent(generation);
+    };
+    const auto supersede = [&]() {
+        // After the first mutation nothing is rolled back and nothing is refused: the request ends
+        // without authority over the state it left behind.
+        request.result.outcome = AssignmentStepOutcome::Superseded;
+        request.result.checkpoint.reset();
+    };
+    if (!current()) {
+        supersede();
+        return request;
     }
-    return std::move(sync.result);
+    dispatchAssignmentGeometryRequest(desired, mode, request);
+    if (request.dispatch == AssignmentRequestDispatch::None || request.result.outcome != AssignmentStepOutcome::AppliedCurrent || !current()) {
+        supersede();
+        return request;
+    }
+    notifyRequestedGeometryChanged();
+    if (!current()) {
+        supersede();
+        return request;
+    }
+    return request;
+}
+
+bool Window::supportsAssignmentGeometryRequest() const
+{
+    return false;
+}
+
+void Window::dispatchAssignmentGeometryRequest(const RectF &, MoveResizeMode, AssignmentGeometryRequest &)
+{
+    // Only a backend that opted in through supportsAssignmentGeometryRequest() is dispatched to.
 }
 
 bool Window::assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const
