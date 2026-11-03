@@ -3995,6 +3995,8 @@ void Window::commitTileInternal(Tile *tile)
 
     m_tile = tile;
     m_committedTileChange = nextAssociationChange(m_committedTileChange);
+    // A native commit can supersede placement without a geometry request or cancellation.
+    m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
     const auto change = m_committedTileChange;
 
     Q_EMIT tileChanged(tile);
@@ -4084,10 +4086,21 @@ void Window::setTileCompatibility(Tile *tile)
 {
     qCWarning(KWIN_CORE) << "Writing to the property window.tile is deprecated: use tile.manage() instead";
 
-    if (tile && tile->isTransient()) {
+    if (isDeleted() || (tile && tile->isTransient())) {
         return;
     }
-    cancelTransientRequest();
+
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const QPointer<Tile> target(tile);
+    const bool hadTarget = tile;
+    const auto geometryGeneration = geometryRequestGeneration();
+    if (!cancelTransientRequest() || geometryRequestGeneration() != geometryGeneration || (hadTarget && !target)) {
+        return;
+    }
+    tile = target.data();
 
     if (m_requestedTile == tile) {
         m_requestedTransientTileGeneration = 0;
@@ -4121,14 +4134,23 @@ Window::TransientTileRequest::TransientTileRequest(Window *window, Tile *tile, q
     }
 }
 
-void Window::cancelTransientRequest()
+bool Window::cancelTransientRequest()
 {
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+    const auto revision = m_placementContinuationRevision;
     if (m_activeTransientRequest) {
         m_activeTransientRequest->m_cancelled = true;
     }
     if (m_transientOwnership) {
         revokeTransientOwnership(m_transientOwnership->generation);
     }
+    // This qualifies only the caller's continuation, not restoration completion.
+    return !isDeleted() && revision != std::numeric_limits<quint64>::max()
+        && m_placementContinuationRevision == revision;
 }
 
 Window::TransientOwnership::TransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, quint64 providerRevision,

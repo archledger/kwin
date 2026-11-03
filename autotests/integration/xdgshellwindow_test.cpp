@@ -362,6 +362,8 @@ private Q_SLOTS:
     void testPublicTransientReleaseDestruction_data();
     void testPublicTransientReleaseDestruction();
     void testPublicTransientReleaseRefusal();
+    void testCompatibilityCancellation_data();
+    void testCompatibilityCancellation();
     void testTransientRegistryLookup();
     void testTransientRegistryRetiredRoot();
     void testTransientRegistryDestructorReentry_data();
@@ -6863,6 +6865,162 @@ void TestXdgShellWindow::testPublicTransientReleaseRefusal()
     QTRY_VERIFY(!guard);
     other->setSkipCloseAnimation(true);
     other->destroyWindow();
+}
+
+void TestXdgShellWindow::testCompatibilityCancellation_data()
+{
+    QTest::addColumn<bool>("committed");
+    QTest::addColumn<int>("action");
+    for (bool committed : {false, true}) {
+        const QByteArray prefix = committed ? "committed-" : "pending-";
+        QTest::newRow((prefix + "unchanged").constData()) << committed << 0;
+        QTest::newRow((prefix + "equal-null").constData()) << committed << 1;
+        QTest::newRow((prefix + "manual").constData()) << committed << 2;
+        QTest::newRow((prefix + "equal-geometry").constData()) << committed << 3;
+        QTest::newRow((prefix + "commit-only").constData()) << committed << 4;
+        QTest::newRow((prefix + "commit-roundtrip").constData()) << committed << 5;
+        QTest::newRow((prefix + "target-destroyed").constData()) << committed << 6;
+        QTest::newRow((prefix + "window-closed").constData()) << committed << 7;
+        QTest::newRow((prefix + "helper-window-closed").constData()) << committed << 8;
+        QTest::newRow((prefix + "saturation-next").constData()) << committed << 9;
+        QTest::newRow((prefix + "saturation-current").constData()) << committed << 10;
+        QTest::newRow((prefix + "outer-null-new-manual").constData()) << committed << 11;
+    }
+}
+
+void TestXdgShellWindow::testCompatibilityCancellation()
+{
+    QFETCH(bool, committed);
+    QFETCH(int, action);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.compatibility"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.compatibility");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QCOMPARE(window->requestedTile(), controller.tile());
+    if (committed) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), controller.tile()->windowGeometry().size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->tile(), controller.tile());
+    } else {
+        QVERIFY(!window->tile());
+    }
+    auto targets = std::make_unique<TileManager>(window->moveResizeOutput());
+    QPointer<Tile> target = targets->quickTile(QuickTileFlag::Left);
+    QPointer<Tile> other = targets->quickTile(QuickTileFlag::Right);
+    QVERIFY(target && other);
+    if (action == 9 || action == 10) {
+        window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - (action == 9 ? 1 : 0);
+    }
+    QSignalSpy targetAdded(target, &Tile::windowAdded);
+    QObject context;
+    QPointer<Window> guard(window);
+    bool called = false;
+    connect(window, &Window::requestedTileChanged, &context, [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        switch (action) {
+        case 1:
+            window->setTileCompatibility(nullptr);
+            break;
+        case 2:
+        case 11:
+            QVERIFY(other->manage(window));
+            break;
+        case 3:
+            window->moveResize(window->moveResizeGeometry());
+            break;
+        case 4:
+            window->commitTile(other.data());
+            break;
+        case 5:
+            window->commitTile(other.data());
+            window->commitTile(nullptr);
+            break;
+        case 6:
+            targets.reset();
+            break;
+        case 7:
+        case 8:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        }
+    });
+    if (action == 8) {
+        QVERIFY(!window->cancelTransientRequest());
+    } else {
+        window->setTileCompatibility(action == 11 ? nullptr : target.data());
+    }
+    QVERIFY(called);
+    QCOMPARE(targetAdded.count(), action == 0 ? 1 : 0);
+    if (action == 7 || action == 8) {
+        QVERIFY(!guard);
+        QVERIFY(target->windows().isEmpty());
+        QVERIFY(!writer.isReserved(id));
+        QCOMPARE(writer.snapshot().entries.value(key), original);
+        return;
+    }
+    QVERIFY(guard);
+    if (action == 6) {
+        QVERIFY(!target && !other);
+    }
+    if (target) {
+        QCOMPARE(target->windows().contains(window), action == 0);
+    } else {
+        QCOMPARE(action, 6);
+    }
+    Tile *expectedTile = action == 0 ? target.data() : nullptr;
+    if (action == 2 || action == 11) {
+        expectedTile = other.data();
+        QVERIFY(other->windows().contains(window));
+    }
+    QCOMPARE(window->requestedTile(), expectedTile);
+    if (action == 4 || action == 5) {
+        QCOMPARE(window->tile(), action == 4 ? other.data() : nullptr);
+    }
+    if (action == 9 || action == 10) {
+        QCOMPARE(window->m_placementContinuationRevision, std::numeric_limits<quint64>::max());
+        QVERIFY(!window->cancelTransientRequest());
+        QCOMPARE(window->m_placementContinuationRevision, std::numeric_limits<quint64>::max());
+    }
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+    QVERIFY(writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(key), original);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
 }
 
 void TestXdgShellWindow::testTransientRegistryLookup()
