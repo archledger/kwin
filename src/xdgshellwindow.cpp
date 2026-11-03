@@ -1913,8 +1913,15 @@ void XdgToplevelWindow::maximize(MaximizeMode mode, const RectF &restore)
         return;
     }
 
+    // An owner keeps its placement authority through an ordinary toggle. The choice is made before
+    // the first callback; afterwards only that operation's own checks decide, never this path.
+    if (const auto plan = ownedMaximizePlan(mode, oldMode, restore)) {
+        maximizeOwned(*plan, mode, oldMode, oldGeometry, clientArea);
+        return;
+    }
+
     Q_EMIT maximizedAboutToChange(mode);
-    m_requestedMaximizeMode = mode;
+    writeRequestedMaximizeMode(mode);
 
     // call into decoration update borders
     if (m_nextDecoration && !(options->borderlessMaximizedWindows() && m_requestedMaximizeMode == MaximizeFull)) {
@@ -1999,6 +2006,153 @@ void XdgToplevelWindow::maximize(MaximizeMode mode, const RectF &restore)
     markAsPlaced();
 
     doSetMaximized();
+}
+
+void XdgToplevelWindow::writeRequestedMaximizeMode(MaximizeMode mode)
+{
+    m_requestedMaximizeMode = mode;
+    if (m_requestedMaximizeRevision != std::numeric_limits<quint64>::max()) {
+        ++m_requestedMaximizeRevision;
+    }
+}
+
+bool XdgToplevelWindow::ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const
+{
+    for (qreal value : {managed.x(), managed.y(), managed.width(), managed.height()}) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    if (managed.width() <= 0 || managed.height() <= 0) {
+        return false;
+    }
+    // A released axis returns to the managed extent exactly, so the client's size limits must
+    // allow that extent; an owner is never silently enlarged or recentred.
+    const MaximizeMode released = MaximizeMode(oldMode & ~mode);
+    if (released == MaximizeRestore) {
+        return true;
+    }
+    const QSizeF constrained = constrainFrameSize(managed.size());
+    return (!(released & MaximizeHorizontal) || constrained.width() == managed.width())
+        && (!(released & MaximizeVertical) || constrained.height() == managed.height());
+}
+
+std::optional<XdgToplevelWindow::OwnedMaximize> XdgToplevelWindow::ownedMaximizePlan(MaximizeMode mode, MaximizeMode oldMode, const RectF &restore) const
+{
+    // Only an ordinary toggle qualifies: no caller-supplied restore rectangle, no interactive or
+    // electric-border operation, and a live current ownership record whose managed rectangle the
+    // released axes can actually return to. Anything else, including a record whose tile or context
+    // is no longer usable, takes the legacy path and releases as before; the recorded adoption
+    // rectangle is never a substitute for current placement authority.
+    if (!restore.isNull() || isInteractiveMoveResize() || isElectricBorderMaximizing() || !m_transientOwnership
+        || m_requestedMaximizeRevision >= std::numeric_limits<quint64>::max() - 1) {
+        return std::nullopt;
+    }
+    const auto generation = m_transientOwnership->generation;
+    if (!transientOwnershipIsCurrent(generation)) {
+        return std::nullopt;
+    }
+    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    if (!ownedMaximizeFeasible(managed, mode, oldMode)) {
+        return std::nullopt;
+    }
+    return OwnedMaximize{generation, managed};
+}
+
+void XdgToplevelWindow::maximizeOwned(const OwnedMaximize &plan, MaximizeMode mode, MaximizeMode oldMode, const RectF &oldGeometry, const RectF &clientArea)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const auto before = makeTileAssignmentFence();
+    const auto revisionBefore = m_requestedMaximizeRevision;
+    Q_EMIT maximizedAboutToChange(mode);
+    // A handler that revoked ownership, changed fenced state, wrote the requested mode (even back
+    // to the same value) or changed the client's size limits holds the newer intent. Nothing was
+    // written, so nothing is published.
+    if (isDeleted() || !before.isCurrentFor(*this) || m_requestedMaximizeRevision != revisionBefore
+        || !transientOwnershipIsCurrent(plan.generation) || !ownedMaximizeFeasible(plan.managed, mode, oldMode)) {
+        return;
+    }
+    writeRequestedMaximizeMode(mode);
+    const auto revision = m_requestedMaximizeRevision;
+    // Publishing the requested mode to the client is this write's own obligation: it is discharged
+    // as long as the write is still current, whatever happened to the geometry, and reports no success.
+    const auto publish = qScopeGuard([this, revision]() {
+        if (!isDeleted() && m_requestedMaximizeRevision == revision) {
+            doSetMaximized();
+        }
+    });
+    const auto written = makeTileAssignmentFence();
+    const auto current = [&]() {
+        return !isDeleted() && m_requestedMaximizeRevision == revision && written.isCurrentFor(*this)
+            && transientOwnershipIsCurrent(plan.generation) && ownedMaximizeFeasible(plan.managed, mode, oldMode);
+    };
+    if (m_nextDecoration && !(options->borderlessMaximizedWindows() && mode == MaximizeFull)) {
+        // Every signal is a callback boundary of its own, and a handler may replace the decoration.
+        const QPointer<KDecoration3::DecoratedWindow> decorated(m_nextDecoration->window());
+        changeMaximizeRecursion = true;
+        const auto recursion = qScopeGuard([this]() {
+            changeMaximizeRecursion = false;
+        });
+        const auto decorationCurrent = [&]() {
+            return current() && decorated && m_nextDecoration && m_nextDecoration->window() == decorated.data();
+        };
+        if ((mode & MaximizeVertical) != (oldMode & MaximizeVertical)) {
+            Q_EMIT decorated->maximizedVerticallyChanged(mode & MaximizeVertical);
+            if (!decorationCurrent()) {
+                return;
+            }
+        }
+        if ((mode & MaximizeHorizontal) != (oldMode & MaximizeHorizontal)) {
+            Q_EMIT decorated->maximizedHorizontallyChanged(mode & MaximizeHorizontal);
+            if (!decorationCurrent()) {
+                return;
+            }
+        }
+        if ((mode == MaximizeFull) != (oldMode == MaximizeFull)) {
+            Q_EMIT decorated->maximizedChanged(mode == MaximizeFull);
+            if (!decorationCurrent()) {
+                return;
+            }
+        }
+    }
+    if (options->borderlessMaximizedWindows()) {
+        setNoBorder(mode == MaximizeFull);
+        if (!current()) {
+            return;
+        }
+    }
+    // The restore field keeps floating A and the association stays. Maximized axes span the area;
+    // released axes return to the managed rectangle frozen before the first callback.
+    RectF geometry = oldGeometry;
+    if (mode & MaximizeHorizontal) {
+        geometry.setLeft(clientArea.left());
+        geometry.setRight(clientArea.right());
+    } else if (oldMode & MaximizeHorizontal) {
+        geometry.setLeft(plan.managed.left());
+        geometry.setRight(plan.managed.right());
+    }
+    if (mode & MaximizeVertical) {
+        geometry.setTop(clientArea.top());
+        geometry.setBottom(clientArea.bottom());
+    } else if (oldMode & MaximizeVertical) {
+        geometry.setTop(plan.managed.top());
+        geometry.setBottom(plan.managed.bottom());
+    }
+    // The client's size limits are visible to neither the fence nor the ownership record, so the
+    // request carries this operation's feasibility as its own constraint for every child boundary.
+    const auto request = requestMoveResizeForOwnership(geometry, MoveResizeMode::MoveResize, written, plan.generation, [this, &plan, mode, oldMode]() {
+        return ownedMaximizeFeasible(plan.managed, mode, oldMode);
+    });
+    // The request allocated a newer generation, so its own result, not the earlier fence, says
+    // whether this operation is still the current one.
+    if (request.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(request.result)
+        || m_requestedMaximizeRevision != revision) {
+        return;
+    }
+    markAsPlaced();
 }
 
 XdgPopupWindow::XdgPopupWindow(XdgPopupInterface *shellSurface)

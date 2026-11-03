@@ -344,6 +344,14 @@ private Q_SLOTS:
     void testOwnedRequestAuthority();
     void testOwnedRequestExhaustion_data();
     void testOwnedRequestExhaustion();
+    void testOwnedMaximize_data();
+    void testOwnedMaximize();
+    void testOwnedMaximizeLegacy_data();
+    void testOwnedMaximizeLegacy();
+    void testOwnedMaximizeSupersession_data();
+    void testOwnedMaximizeSupersession();
+    void testOwnedMaximizeDecorated_data();
+    void testOwnedMaximizeDecorated();
     void testTransientNoRequestProofReplay();
     void testNoRequestFinalization_data();
     void testNoRequestFinalization();
@@ -6424,6 +6432,619 @@ void TestXdgShellWindow::testOwnedRequestExhaustion()
     QCOMPARE(window->m_requestedTileChange, counter == 1 ? exhausted - 1 : associationRevision + (rejected ? 0 : 2));
     QCOMPARE(window->m_placementContinuationRevision, counter == 2 || counter == 4 ? exhausted - 1 : placementRevision + (rejected ? 0 : 1));
     QCOMPARE(window->m_geometryUpdateGeneration, counter == 3 ? exhausted - 1 : publicationGeneration);
+}
+
+void TestXdgShellWindow::testOwnedMaximize_data()
+{
+    QTest::addColumn<int>("mode");
+    QTest::addColumn<bool>("committed");
+    QTest::newRow("full-committed") << int(MaximizeFull) << true;
+    QTest::newRow("full-requested") << int(MaximizeFull) << false;
+    QTest::newRow("horizontal-committed") << int(MaximizeHorizontal) << true;
+    QTest::newRow("vertical-committed") << int(MaximizeVertical) << true;
+}
+
+void TestXdgShellWindow::testOwnedMaximize()
+{
+    // An ordinary maximize toggle under live ownership keeps ownership, the association and the
+    // saved floating frame, and returns to the managed rectangle; an explicit untile still releases.
+    QFETCH(int, mode);
+    QFETCH(bool, committed);
+    const auto maximizeMode = MaximizeMode(mode);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.maximize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.maximize");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QVERIFY(window->m_transientOwnership);
+    const auto generation = window->m_transientOwnership->generation;
+    const QRectF managed = leaf->windowGeometry();
+    if (committed) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->tile(), leaf);
+    }
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
+    QRectF expected = managed;
+    if (maximizeMode & MaximizeHorizontal) {
+        expected.setLeft(area.left());
+        expected.setRight(area.right());
+    }
+    if (maximizeMode & MaximizeVertical) {
+        expected.setTop(area.top());
+        expected.setBottom(area.bottom());
+    }
+    const auto owned = [&]() {
+        return window->m_transientOwnership && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned
+            && writer.ownsReservation(id, QString::number(generation)) && window->requestedTile() == leaf && leaf->windows().contains(window)
+            && QRectF(window->geometryRestore()) == original && writer.snapshot().entries.value(key) == original;
+    };
+    configure.clear();
+    window->maximize(maximizeMode);
+    QVERIFY(owned());
+    QCOMPARE(window->requestedMaximizeMode(), maximizeMode);
+    QCOMPARE(QRectF(window->moveResizeGeometry()), expected);
+    QCOMPARE(restoreChanged.count(), 0);
+    QCOMPARE(requestedTileChanged.count(), 0);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::green);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), expected);
+    QCOMPARE(window->maximizeMode(), maximizeMode);
+    if (maximizeMode == MaximizeFull) {
+        QVERIFY(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Maximized);
+    }
+    // The acknowledgement commits a kept association without unmaximizing.
+    QVERIFY(owned());
+    QCOMPARE(window->tile(), leaf);
+    QVERIFY(window->m_transientOwnership->committed);
+    configure.clear();
+    window->maximize(MaximizeRestore);
+    QVERIFY(owned());
+    QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+    QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(leaf->windowGeometry()));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::yellow);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), QRectF(leaf->windowGeometry()));
+    QCOMPARE(window->maximizeMode(), MaximizeRestore);
+    QVERIFY(!(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Maximized));
+    QVERIFY(owned());
+    QCOMPARE(window->tile(), leaf);
+    QCOMPARE(restoreChanged.count(), 0);
+    QCOMPARE(requestedTileChanged.count(), 0);
+    // The explicit untile-or-restore action still releases through the existing routing.
+    workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+    QVERIFY(!window->requestedTile());
+    QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
+    QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
+    QCOMPARE(QRectF(window->geometryRestore()), original);
+}
+
+void TestXdgShellWindow::testOwnedMaximizeLegacy_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("restore-parameter") << 0;
+    QTest::newRow("electric-border") << 1;
+    QTest::newRow("executing-record") << 2;
+    QTest::newRow("no-ownership") << 3;
+    QTest::newRow("changed-minimum") << 4;
+}
+
+void TestXdgShellWindow::testOwnedMaximizeLegacy()
+{
+    // Initial ineligibility selects the legacy path before any owned mutation; it releases as before.
+    QFETCH(int, scenario);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.maximize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF original = window->frameGeometry();
+    const RectF supplied(10, 10, 100, 50);
+    if (scenario == 3) {
+        window->maximize(MaximizeFull);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(QRectF(window->geometryRestore()), original);
+        return;
+    }
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.maximize");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    QObject context;
+    bool intervened = false;
+    if (scenario == 2) {
+        // The record is executing its adoption request: a maximize from that boundary is legacy.
+        connect(window, &Window::requestedGeometryChanged, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                QVERIFY(window->m_transientOwnership && window->m_transientOwnership->executing);
+                window->maximize(MaximizeFull);
+            }
+        });
+    }
+    auto state = writer.snapshot();
+    configure.clear();
+    const auto admission = controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision);
+    if (scenario == 2) {
+        QVERIFY(intervened);
+        QCOMPARE(admission, Result::Superseded);
+    } else {
+        QCOMPARE(admission, Result::Accepted);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+        if (scenario == 4) {
+            // Owned maximize first; then the client raises its minimum width above the managed
+            // width, so the released axis can no longer return to the managed rectangle.
+            const QRectF managed = leaf->windowGeometry();
+            QVERIFY(!configure.isEmpty() || configure.wait());
+            shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+            Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+            QVERIFY(Test::waylandSync());
+            QCOMPARE(window->tile(), leaf);
+            configure.clear();
+            window->maximize(MaximizeFull);
+            QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+            QCOMPARE(window->requestedTile(), leaf);
+            QVERIFY(!configure.isEmpty() || configure.wait());
+            shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+            Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::green);
+            QVERIFY(Test::waylandSync());
+            QCOMPARE(window->maximizeMode(), MaximizeFull);
+            shell->set_min_size(int(managed.width()) + 100, 0);
+            surface->commit(KWayland::Client::Surface::CommitFlag::None);
+            QVERIFY(Test::waylandSync());
+            QVERIFY(window->minSize().width() > managed.width());
+            window->maximize(MaximizeRestore);
+        } else {
+            if (scenario == 1) {
+                // An electric-border maximize in progress: the mode must be set before the outline shows.
+                window->setElectricBorderMode(ElectricBorderMode(MaximizeFull));
+                window->setElectricBorderMaximizing(true);
+                QVERIFY(window->isElectricBorderMaximizing());
+            }
+            window->maximize(MaximizeFull, scenario == 0 ? supplied : RectF());
+            if (scenario == 1) {
+                window->setElectricBorderMaximizing(false);
+                window->setElectricBorderMode(std::nullopt);
+            }
+        }
+    }
+    QCOMPARE(window->requestedMaximizeMode(), scenario == 4 ? MaximizeRestore : MaximizeFull);
+    QVERIFY(!window->requestedTile());
+    QVERIFY(!leaf->windows().contains(window));
+    QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
+    if (scenario == 0) {
+        QCOMPARE(QRectF(window->geometryRestore()), QRectF(supplied));
+    } else {
+        QCOMPARE(QRectF(window->geometryRestore()), original);
+    }
+}
+
+void TestXdgShellWindow::testOwnedMaximizeSupersession_data()
+{
+    QTest::addColumn<int>("boundary");
+    QTest::newRow("revoke-at-about-to-change") << 0;
+    QTest::newRow("restore-at-about-to-change") << 1;
+    QTest::newRow("round-trip-at-about-to-change") << 2;
+    QTest::newRow("revoke-at-requested-geometry") << 3;
+    QTest::newRow("round-trip-at-requested-geometry") << 4;
+    QTest::newRow("close-at-about-to-change") << 5;
+    QTest::newRow("close-at-requested-geometry") << 6;
+    QTest::newRow("reservation-lost-at-scale-synchronization") << 7;
+    QTest::newRow("desktop-change-at-about-to-change") << 8;
+    QTest::newRow("round-trip-without-geometry-at-about-to-change") << 9;
+    QTest::newRow("minimum-raised-at-about-to-change") << 10;
+    QTest::newRow("minimum-raised-at-frame-about-to-change") << 11;
+}
+
+void TestXdgShellWindow::testOwnedMaximizeSupersession()
+{
+    // After the owned path is entered, a handler's newer intent ends it where it stands: no legacy
+    // geometry, no exit from the tile, no restore write; only a current mode write is published.
+    QFETCH(int, boundary);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.maximize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.maximize");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QVERIFY(window->m_transientOwnership);
+    const auto generation = window->m_transientOwnership->generation;
+    const QRectF managed = leaf->windowGeometry();
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->tile(), leaf);
+    if (boundary == 7) {
+        // Settle the configure the scale change schedules so the owned request synchronizes it.
+        configure.clear();
+        window->setNextTargetScale(3.0);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->nextTargetScale(), 3.0);
+    }
+    const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
+    const RectF replaced(30, 30, 200, 100);
+    QPointer<Window> guard(window);
+    VirtualDesktop *other = nullptr;
+    if (boundary == 8) {
+        VirtualDesktopManager::self()->setCount(2);
+        other = VirtualDesktopManager::self()->desktops().at(1);
+    }
+    const auto desktopsReset = qScopeGuard([boundary]() {
+        if (boundary == 8) {
+            VirtualDesktopManager::self()->setCount(1);
+        }
+    });
+    // Row 9: nested owned geometry requests refuse before mutation for publication headroom, so the
+    // nested mode writes change no fenced state and only the requested-mode revision sees them.
+    const auto publicationGeneration = window->m_geometryUpdateGeneration;
+    if (boundary == 9) {
+        window->m_geometryUpdateGeneration = std::numeric_limits<quint64>::max() - 1;
+    }
+    const auto publicationReset = qScopeGuard([&]() {
+        if (guard) {
+            window->m_geometryUpdateGeneration = publicationGeneration;
+        }
+    });
+    if (boundary >= 10) {
+        // Rows 10 and 11 start owned and maximized; the outer call is the unmaximize.
+        configure.clear();
+        window->maximize(MaximizeFull);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(window->requestedTile(), leaf);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        QCOMPARE(QRectF(window->frameGeometry()), area);
+    }
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QObject context;
+    bool intervened = false;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (boundary) {
+        case 0:
+        case 3:
+            leaf->forget(window);
+            break;
+        case 10:
+        case 11:
+            // The client's minimum width rises above the managed width as a property-only change
+            // (a real commit would also notify the requested geometry): neither the fence nor the
+            // ownership record observes it, only the operation's own feasibility.
+            static_cast<XdgToplevelWindow *>(window)->m_minimumSize = QSizeF(managed.width() + 100, 0);
+            QVERIFY(window->minSize().width() > managed.width());
+            break;
+        case 1:
+            window->setGeometryRestore(replaced);
+            break;
+        case 2:
+        case 9:
+            window->maximize(MaximizeFull);
+            window->maximize(MaximizeRestore);
+            break;
+        case 4:
+            window->maximize(MaximizeRestore);
+            break;
+        case 5:
+        case 6:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        case 7:
+            // Validity lapses in the writer alone; no Window counter changes.
+            QVERIFY(writer.forgetWindow(id));
+            break;
+        case 8:
+            // The window leaves the recorded desktop; no fence and no release notices.
+            window->setDesktops({other});
+            break;
+        }
+    };
+    if (boundary <= 2 || boundary == 5 || boundary == 8 || boundary == 9 || boundary == 10) {
+        connect(window, &Window::maximizedAboutToChange, &context, intervene);
+    } else if (boundary == 7) {
+        connect(window, &Window::nextTargetScaleChanged, &context, intervene);
+    } else if (boundary == 11) {
+        connect(window, &Window::frameGeometryAboutToChange, &context, intervene);
+    } else {
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    }
+    configure.clear();
+    toplevelConfigure.clear();
+    window->maximize(boundary >= 10 ? MaximizeRestore : MaximizeFull);
+    QVERIFY(intervened);
+    if (boundary == 5 || boundary == 6) {
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    QVERIFY(guard);
+    const bool owned = window->m_transientOwnership && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned
+        && writer.ownsReservation(id, QString::number(generation)) && window->requestedTile() == leaf && leaf->windows().contains(window);
+    QCOMPARE(owned, boundary != 0 && boundary != 3 && boundary != 7);
+    QCOMPARE(QRectF(window->geometryRestore()), boundary == 1 ? QRectF(replaced) : original);
+    QCOMPARE(writer.snapshot().entries.value(key), original);
+    switch (boundary) {
+    case 0:
+    case 1:
+    case 8:
+    case 9:
+        // The handler's intent precedes the mode write: the outer operation writes no mode and
+        // requests no geometry. Row 9's nested round trip leaves Restore requested; only the
+        // revision could tell it from an untouched mode.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), managed);
+        break;
+    case 2:
+    case 4:
+        // The nested round trip holds the newer intent; the outer operation publishes nothing.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 2);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(leaf->windowGeometry()));
+        break;
+    case 3:
+        // The mode was written before the revocation: it is published, the geometry stays requested,
+        // nothing falls through to the legacy path.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), area);
+        break;
+    case 7:
+        // The lapse is visible only through the ownership provenance: synchronization stops with its
+        // obligation pending, the dispatcher is never reached, the mode is still published.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), area);
+        QVERIFY(window->m_outputPropertiesPending);
+        // Since 6.8 the published state's configure carries moveResizeGeometry() as its bounds, asserted above; no separate position staging.
+        break;
+    case 10:
+        // Infeasible before the mode write: the unmaximize writes nothing, requests nothing, keeps
+        // ownership and stays maximized; no legacy fallthrough.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), area);
+        break;
+    case 11:
+        // Infeasible at the dispatcher boundary: the request's own constraint stops the dispatch
+        // before it stages anything; the written mode is still published, ownership is kept.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), managed);
+        // Since 6.8 the published state's configure carries moveResizeGeometry() as its bounds, asserted above; no separate position staging.
+        break;
+    }
+    if (boundary == 8) {
+        // The record is structurally present but no longer valid authority; the handler's desktop stands.
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        QCOMPARE(window->desktops(), QList<VirtualDesktop *>{other});
+    }
+    QCOMPARE(restoreChanged.count(), boundary == 1 ? 1 : 0);
+    // Whatever was published reflects the final requested mode, never an older one.
+    if (configure.isEmpty()) {
+        configure.wait(200);
+    }
+    if (!toplevelConfigure.isEmpty()) {
+        const auto states = toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>();
+        QCOMPARE(bool(states & Test::XdgToplevel::State::Maximized), window->requestedMaximizeMode() == MaximizeFull);
+    } else {
+        QCOMPARE(window->requestedMaximizeMode(), boundary == 10 ? MaximizeFull : MaximizeRestore);
+    }
+    if (boundary == 2 || boundary == 4) {
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::yellow);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(leaf->windowGeometry()));
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QVERIFY(window->m_transientOwnership && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned);
+    }
+}
+
+void TestXdgShellWindow::testOwnedMaximizeDecorated_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("control") << 0;
+    QTest::newRow("revoke-at-first-signal") << 1;
+}
+
+void TestXdgShellWindow::testOwnedMaximizeDecorated()
+{
+    // A server-decorated owner: each decoration signal is a callback boundary of its own.
+    QFETCH(int, scenario);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    shell->set_app_id(QStringLiteral("org.example.maximize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(configure.count() >= 2 || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.maximize");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    QVERIFY(window->m_transientOwnership);
+    const auto generation = window->m_transientOwnership->generation;
+    const QRectF managed = leaf->windowGeometry();
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->frameSizeToClientSize(managed.size()).toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->tile(), leaf);
+    QCOMPARE(QRectF(window->frameGeometry()), managed);
+    auto decorated = window->nextDecoration()->window();
+    QVERIFY(decorated);
+    QSignalSpy vertical(decorated, &KDecoration3::DecoratedWindow::maximizedVerticallyChanged);
+    QSignalSpy horizontal(decorated, &KDecoration3::DecoratedWindow::maximizedHorizontallyChanged);
+    QSignalSpy full(decorated, &KDecoration3::DecoratedWindow::maximizedChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QObject context;
+    bool intervened = false;
+    if (scenario == 1) {
+        connect(decorated, &KDecoration3::DecoratedWindow::maximizedVerticallyChanged, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                leaf->forget(window);
+            }
+        });
+    }
+    const auto owned = [&]() {
+        return window->m_transientOwnership && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned
+            && writer.ownsReservation(id, QString::number(generation)) && window->requestedTile() == leaf && leaf->windows().contains(window)
+            && QRectF(window->geometryRestore()) == original && writer.snapshot().entries.value(key) == original;
+    };
+    const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
+    configure.clear();
+    toplevelConfigure.clear();
+    window->maximize(MaximizeFull);
+    QCOMPARE(vertical.count(), 1);
+    QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+    QCOMPARE(QRectF(window->geometryRestore()), original);
+    if (scenario == 1) {
+        // The first handler's revocation stops the remaining signals and the geometry; the mode
+        // write, already made, is still published.
+        QVERIFY(intervened);
+        QCOMPARE(horizontal.count(), 0);
+        QCOMPARE(full.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QVERIFY(!owned());
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(QRectF(window->moveResizeGeometry()), managed);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        QVERIFY(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Maximized);
+        return;
+    }
+    QCOMPARE(horizontal.count(), 1);
+    QCOMPARE(full.count(), 1);
+    QVERIFY(owned());
+    QCOMPARE(QRectF(window->moveResizeGeometry()), area);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->frameSizeToClientSize(window->moveResizeGeometry().size()).toSize(), Qt::green);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), area);
+    QCOMPARE(window->maximizeMode(), MaximizeFull);
+    QVERIFY(owned());
+    QCOMPARE(window->tile(), leaf);
+    configure.clear();
+    window->maximize(MaximizeRestore);
+    QVERIFY(owned());
+    QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(leaf->windowGeometry()));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->frameSizeToClientSize(window->moveResizeGeometry().size()).toSize(), Qt::yellow);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), QRectF(leaf->windowGeometry()));
+    QCOMPARE(window->maximizeMode(), MaximizeRestore);
+    QVERIFY(owned());
 }
 
 void TestXdgShellWindow::testTransientRequestPendingStates_data()
