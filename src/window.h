@@ -1363,6 +1363,20 @@ public:
     void setQuickTileMode(QuickTileMode mode, const QPointF &tileAtPoint);
     QuickTileMode quickTileMode() const;
     QuickTileMode requestedQuickTileMode() const;
+    /**
+     * The generation of the live transient placement ownership this window currently holds (an
+     * Owned record that is not being released), or zero. Routing only: it identifies the ownership
+     * across a callback-producing call and says nothing about the record's validity.
+     */
+    quint64 ownedTransientPlacementGeneration() const;
+    /**
+     * The explicit untile-or-restore action on an owned window. A backend with an owned
+     * fullscreen path leaves a requested fullscreen state, acknowledged or still pending, as the
+     * owner first and releases the ownership only if that exit completed as the current intent;
+     * the base implementation releases directly. Returns whether the ownership was released.
+     * Windows without a live ownership do nothing and return false.
+     */
+    virtual bool releaseOwnedPlacement();
 
     void handleCustomQuickTileShortcut(QuickTileMode mode);
 
@@ -1818,6 +1832,12 @@ private:
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
+    // The fullscreen restore field is versioned like the maximize one: its callbacks invalidate
+    // older continuation snapshots, so an owner's write can tell a handler's replacement (or a
+    // change away and back) from its own value.
+    [[nodiscard]] AssignmentStepResult setFullscreenGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
+    void setFullscreenGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
+    void writeRestoreFieldInternal(RectF &field, const RectF &desired, void (Window::*changed)(), AssignmentStepResult *guardedResult);
     struct AssignmentGeometrySync
     {
         AssignmentStepResult result;

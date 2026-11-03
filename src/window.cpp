@@ -4204,6 +4204,28 @@ QuickTileMode Window::quickTileMode() const
     }
 }
 
+quint64 Window::ownedTransientPlacementGeneration() const
+{
+    if (isDeleted() || !m_transientOwnership || m_transientOwnership->phase != TransientOwnershipPhase::Owned
+        || m_transientOwnership->releasing) {
+        return 0;
+    }
+    return m_transientOwnership->generation;
+}
+
+bool Window::releaseOwnedPlacement()
+{
+    if (!ownedTransientPlacementGeneration()) {
+        return false;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
+    return !isDeleted() && !ownedTransientPlacementGeneration();
+}
+
 QuickTileMode Window::requestedQuickTileMode() const
 {
     if (m_requestedTile) {
@@ -5170,10 +5192,7 @@ RectF Window::fullscreenGeometryRestore() const
 
 void Window::setFullscreenGeometryRestore(const RectF &geom)
 {
-    if (m_fullscreenGeometryRestore != geom) {
-        m_fullscreenGeometryRestore = geom;
-        Q_EMIT fullscreenGeometryRestoreChanged();
-    }
+    setFullscreenGeometryRestoreInternal(geom);
 }
 
 /**
@@ -5305,7 +5324,37 @@ Window::AssignmentStepResult Window::setGeometryRestoreForAssignment(RectF desir
 
 void Window::setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult)
 {
-    if (m_maximizeGeometryRestore == desired) {
+    writeRestoreFieldInternal(m_maximizeGeometryRestore, desired, &Window::maximizeGeometryRestoreChanged, guardedResult);
+}
+
+Window::AssignmentStepResult Window::setFullscreenGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    if (m_fullscreenGeometryRestore != desired && m_placementContinuationRevision >= std::numeric_limits<quint64>::max() - 1) {
+        return result;
+    }
+    result.outcome = AssignmentStepOutcome::Superseded;
+    result.owned = owned;
+    setFullscreenGeometryRestoreInternal(desired, &result);
+    return result;
+}
+
+void Window::setFullscreenGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult)
+{
+    writeRestoreFieldInternal(m_fullscreenGeometryRestore, desired, &Window::fullscreenGeometryRestoreChanged, guardedResult);
+}
+
+void Window::writeRestoreFieldInternal(RectF &field, const RectF &desired, void (Window::*changed)(), AssignmentStepResult *guardedResult)
+{
+    if (field == desired) {
         if (guardedResult) {
             guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
             if (assignmentResultIsCurrent(*guardedResult)) {
@@ -5316,13 +5365,15 @@ void Window::setGeometryRestoreInternal(const RectF &desired, AssignmentStepResu
         }
         return;
     }
-    m_maximizeGeometryRestore = desired;
-    // Restore-state callbacks must invalidate older native continuation snapshots too.
+    field = desired;
+    // Restore-state callbacks must invalidate older native continuation snapshots too. The
+    // checkpoint is taken after the write and before the notification; it is never refreshed.
     m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
     if (guardedResult) {
         guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
     }
-    Q_EMIT maximizeGeometryRestoreChanged();
+    // Emits the field's change signal through the member pointer.
+    std::invoke(changed, this);
     if (guardedResult) {
         if (assignmentResultIsCurrent(*guardedResult)) {
             guardedResult->outcome = AssignmentStepOutcome::AppliedCurrent;
