@@ -177,6 +177,7 @@ public:
     void takeFocus() override;
     bool wantsInput() const override;
     void setFullScreen(bool set) override;
+    bool releaseOwnedPlacement() override;
     void closeWindow() override;
     void maximize(MaximizeMode mode, const RectF &restore = RectF()) override;
 
@@ -248,6 +249,7 @@ private:
     Gravity preferredConfigureGravity() const;
     Gravity preferredSpontaneousGravity() const;
     DecorationMode preferredDecorationMode() const;
+    DecorationMode preferredDecorationMode(bool requestedFullScreen) const;
     void configureDecoration();
     void configureXdgDecoration(DecorationMode decorationMode);
     void configureServerDecoration(DecorationMode decorationMode);
@@ -281,6 +283,41 @@ private:
     bool ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const;
     void maximizeOwned(const OwnedMaximize &plan, MaximizeMode mode, MaximizeMode oldMode, const RectF &oldGeometry, const RectF &clientArea);
     void writeRequestedMaximizeMode(MaximizeMode mode);
+    // Advanced by every requested-fullscreen write, the state the client is told; the intent
+    // revision is advanced by those writes and by every requested-output write as well, since the
+    // owned geometry depends on both while the publication depends on the state alone.
+    quint64 m_requestedFullScreenRevision = 0;
+    quint64 m_fullScreenIntentRevision = 0;
+    struct OwnedFullScreen
+    {
+        quint64 generation;
+        RectF managed;
+        // The rectangle an owned exit returns to: maximize-area extents on the maximized axes, the
+        // managed extents elsewhere; exactly the managed rectangle when nothing is maximized.
+        RectF target;
+        MaximizeMode maximizeMode;
+        quint64 maximizeRevision;
+        QPointer<LogicalOutput> requestedOutput;
+        bool hadRequestedOutput;
+        QSizeF minimumHint;
+        QSizeF maximumHint;
+    };
+    std::optional<OwnedFullScreen> ownedFullScreenPlan(bool set) const;
+    RectF ownedFullScreenExitGeometry(const RectF &managed, MaximizeMode maximizeMode) const;
+    bool ownedFullScreenExitFeasible(const RectF &managed, MaximizeMode maximizeMode) const;
+    // Legacy: the legacy path ran (selected before the first callback, or an exit it took over
+    // after the shared prefix). Stopped: the owned operation ended at a boundary; nothing but the
+    // state write stands. Applied: the owned geometry was requested and current at the end.
+    enum class OwnedFullScreenOutcome {
+        Legacy,
+        Stopped,
+        Applied,
+    };
+    OwnedFullScreenOutcome applyFullScreen(bool set);
+    OwnedFullScreenOutcome setFullScreenOwned(const OwnedFullScreen &plan, bool set);
+    void finishFullScreenLegacy(bool set);
+    void writeRequestedFullScreen(bool set);
+    void writeFullScreenRequestedOutput(LogicalOutput *output);
     QSizeF m_minimumSize = QSizeF(0, 0);
     QSizeF m_maximumSize = QSizeF(0, 0);
     DecorationPolicy m_decorationPolicy = DecorationPolicy::ClientPreference;
