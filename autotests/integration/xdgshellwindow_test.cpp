@@ -372,6 +372,14 @@ private Q_SLOTS:
     void testTileAssignmentFenceClose();
     void testTileAssignmentFenceCounters_data();
     void testTileAssignmentFenceCounters();
+    void testGuardedTileCommit();
+    void testGuardedTileCommitRefusal_data();
+    void testGuardedTileCommitRefusal();
+    void testGuardedTileCommitCapacity_data();
+    void testGuardedTileCommitCapacity();
+    void testGuardedTileCommitTransientTarget();
+    void testGuardedTileCommitReentry_data();
+    void testGuardedTileCommitReentry();
     void testTransientRegistryLookup();
     void testTransientRegistryRetiredRoot();
     void testTransientRegistryDestructorReentry_data();
@@ -7259,6 +7267,335 @@ void TestXdgShellWindow::testTileAssignmentFenceCounters()
         QCOMPARE(revision, maximum);
     }
     QVERIFY(!fence.isCurrentFor(*window));
+}
+
+void TestXdgShellWindow::testGuardedTileCommit()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto tile = std::make_unique<Tile>(workspace()->tileManager(window->moveResizeOutput()));
+    tile->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    tile->setQuickTileMode(QuickTileFlag::Custom);
+    window->requestTile(tile.get());
+    QVERIFY(!window->tile());
+    const auto requestedRevision = window->m_requestedTileChange;
+    const auto committedRevision = window->m_committedTileChange;
+    const auto placementRevision = window->m_placementContinuationRevision;
+    const auto geometryRevision = window->m_geometryRequestGeneration;
+    const auto requestedGeometry = window->moveResizeGeometry();
+    const auto frameGeometry = window->frameGeometry();
+    auto before = window->makeTileAssignmentFence();
+    QStringList notifications;
+    QObject context;
+    connect(window, &Window::tileChanged, &context, [&]() {
+        notifications.append(QStringLiteral("tile"));
+    });
+    connect(window, &Window::quickTileModeChanged, &context, [&]() {
+        notifications.append(QStringLiteral("mode"));
+    });
+    auto result = window->commitTileForAssignment(tile.get(), before);
+    QCOMPARE(result.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QVERIFY(result.checkpoint);
+    QVERIFY(result.checkpoint->isCurrentFor(*window));
+    QVERIFY(!before.isCurrentFor(*window));
+    QCOMPARE(window->tile(), tile.get());
+    QCOMPARE(window->requestedTile(), tile.get());
+    QCOMPARE(window->m_requestedTileChange, requestedRevision);
+    QCOMPARE(window->m_committedTileChange, committedRevision + 1);
+    QCOMPARE(window->m_placementContinuationRevision, placementRevision + 1);
+    QCOMPARE(window->m_geometryRequestGeneration, geometryRevision);
+    QCOMPARE(window->moveResizeGeometry(), requestedGeometry);
+    QCOMPARE(window->frameGeometry(), frameGeometry);
+    QCOMPARE(notifications, QStringList({QStringLiteral("tile"), QStringLiteral("mode")}));
+    notifications.clear();
+    auto unchanged = window->commitTileForAssignment(tile.get(), *result.checkpoint);
+    QCOMPARE(unchanged.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QVERIFY(unchanged.checkpoint && unchanged.checkpoint->isCurrentFor(*window));
+    QCOMPARE(window->m_committedTileChange, committedRevision + 1);
+    QCOMPARE(window->m_placementContinuationRevision, placementRevision + 1);
+    QVERIFY(notifications.isEmpty());
+    window->forgetTile(tile.get());
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->tile(), tile.get());
+    auto beforeNull = window->makeTileAssignmentFence();
+    auto toNull = window->commitTileForAssignment(nullptr, beforeNull);
+    QCOMPARE(toNull.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QVERIFY(toNull.checkpoint && toNull.checkpoint->isCurrentFor(*window));
+    QVERIFY(!window->tile());
+    QCOMPARE(notifications, QStringList({QStringLiteral("tile"), QStringLiteral("mode")}));
+    notifications.clear();
+    auto nullNoOp = window->commitTileForAssignment(nullptr, *toNull.checkpoint);
+    QCOMPARE(nullNoOp.outcome, Window::AssignmentCommitOutcome::AppliedCurrent);
+    QVERIFY(nullNoOp.checkpoint && nullNoOp.checkpoint->isCurrentFor(*window));
+    QVERIFY(notifications.isEmpty());
+}
+
+void TestXdgShellWindow::testGuardedTileCommitRefusal_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("mismatched-target") << 0;
+    QTest::newRow("stale-fence") << 1;
+    QTest::newRow("wrong-window") << 2;
+    QTest::newRow("raw-destroyed-target") << 3;
+    QTest::newRow("captured-destroyed-target") << 4;
+    QTest::newRow("closed-window") << 5;
+}
+
+void TestXdgShellWindow::testGuardedTileCommitRefusal()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    std::unique_ptr<KWayland::Client::Surface> otherSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> otherShell(Test::createXdgToplevelSurface(otherSurface.get()));
+    auto other = Test::renderAndWaitForShown(otherSurface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(other);
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto target = std::make_unique<Tile>(manager);
+    auto alternative = std::make_unique<Tile>(manager);
+    target->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    alternative->setRelativeGeometry(RectF(0.5, 0, 0.5, 1));
+    alternative->setQuickTileMode(QuickTileFlag::Custom);
+    window->requestTile(target.get());
+    Tile *rawTarget = target.get();
+    if (action == 3) {
+        target.reset();
+    }
+    auto before = (action == 2 ? other : window)->makeTileAssignmentFence();
+    if (action == 1) {
+        window->setTileCompatibility(nullptr);
+    } else if (action == 4) {
+        target.reset();
+    } else if (action == 5) {
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QVERIFY(window->isDeleted());
+    }
+    const auto revisions = std::array{window->m_placementContinuationRevision, window->m_requestedTileChange,
+                                      window->m_committedTileChange, window->m_geometryRequestGeneration};
+    const auto requested = window->requestedTile();
+    const auto committed = window->tile();
+    const auto geometry = window->moveResizeGeometry();
+    QSignalSpy requestedChanged(window, &Window::requestedTileChanged);
+    QSignalSpy tileChanged(window, &Window::tileChanged);
+    QSignalSpy modeChanged(window, &Window::quickTileModeChanged);
+    auto result = window->commitTileForAssignment(action == 0 ? alternative.get() : rawTarget, before);
+    QCOMPARE(result.outcome, action == 0 || action == 3 ? Window::AssignmentCommitOutcome::Refused : Window::AssignmentCommitOutcome::Superseded);
+    QVERIFY(!result.checkpoint);
+    QCOMPARE(window->m_placementContinuationRevision, revisions[0]);
+    QCOMPARE(window->m_requestedTileChange, revisions[1]);
+    QCOMPARE(window->m_committedTileChange, revisions[2]);
+    QCOMPARE(window->m_geometryRequestGeneration, revisions[3]);
+    QCOMPARE(window->requestedTile(), requested);
+    QCOMPARE(window->tile(), committed);
+    QCOMPARE(window->moveResizeGeometry(), geometry);
+    QVERIFY(requestedChanged.isEmpty() && tileChanged.isEmpty() && modeChanged.isEmpty());
+    if (action == 0) {
+        // Ordinary commits deliberately keep their legacy, less restrictive contract.
+        window->commitTile(alternative.get());
+        QCOMPARE(window->tile(), alternative.get());
+        QCOMPARE(window->requestedTile(), target.get());
+    }
+}
+
+void TestXdgShellWindow::testGuardedTileCommitCapacity_data()
+{
+    QTest::addColumn<bool>("placement");
+    QTest::addColumn<int>("scenario");
+    for (bool placement : {false, true}) {
+        const QByteArray prefix = placement ? "placement-" : "committed-";
+        QTest::newRow((prefix + "last-change-refused").constData()) << placement << 0;
+        QTest::newRow((prefix + "penultimate-change").constData()) << placement << 1;
+        QTest::newRow((prefix + "last-noop").constData()) << placement << 2;
+        QTest::newRow((prefix + "exhausted-input").constData()) << placement << 3;
+    }
+}
+
+void TestXdgShellWindow::testGuardedTileCommitCapacity()
+{
+    QFETCH(bool, placement);
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto tile = std::make_unique<Tile>(workspace()->tileManager(window->moveResizeOutput()));
+    tile->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    tile->setQuickTileMode(QuickTileFlag::Custom);
+    window->requestTile(tile.get());
+    if (scenario >= 2) {
+        window->commitTile(tile.get());
+    }
+    auto &limited = placement ? window->m_placementContinuationRevision : window->m_committedTileChange;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    quint64 headroom = 1;
+    if (scenario == 1) {
+        headroom = 2;
+    } else if (scenario == 3) {
+        headroom = 0;
+    }
+    limited = maximum - headroom;
+    const auto oldCommitted = window->m_committedTileChange;
+    const auto oldPlacement = window->m_placementContinuationRevision;
+    auto before = window->makeTileAssignmentFence();
+    QSignalSpy tileChanged(window, &Window::tileChanged);
+    QSignalSpy modeChanged(window, &Window::quickTileModeChanged);
+    auto result = window->commitTileForAssignment(tile.get(), before);
+    auto expected = Window::AssignmentCommitOutcome::AppliedCurrent;
+    if (scenario == 0) {
+        expected = Window::AssignmentCommitOutcome::Refused;
+    } else if (scenario == 3) {
+        expected = Window::AssignmentCommitOutcome::Superseded;
+    }
+    QCOMPARE(result.outcome, expected);
+    QCOMPARE(bool(result.checkpoint), scenario == 1 || scenario == 2);
+    if (result.checkpoint) {
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+    }
+    QCOMPARE(window->m_committedTileChange, oldCommitted + (scenario == 1 ? 1 : 0));
+    QCOMPARE(window->m_placementContinuationRevision, oldPlacement + (scenario == 1 ? 1 : 0));
+    QCOMPARE(tileChanged.count(), scenario == 1 ? 1 : 0);
+    QCOMPARE(modeChanged.count(), scenario == 1 ? 1 : 0);
+    QCOMPARE(window->requestedTile(), tile.get());
+    QCOMPARE(window->tile(), scenario == 0 ? nullptr : tile.get());
+}
+
+void TestXdgShellWindow::testGuardedTileCommitTransientTarget()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile target(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    const auto request = window->requestTransientTile(std::make_unique<RequestForTest>(window, &target, authority));
+    QCOMPARE(request.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(window->requestedTile(), &target);
+    auto before = window->makeTileAssignmentFence();
+    QVERIFY(before.isCurrentFor(*window));
+    QSignalSpy committed(window, &Window::tileChanged);
+    auto result = window->commitTileForAssignment(&target, before);
+    QCOMPARE(result.outcome, Window::AssignmentCommitOutcome::Refused);
+    QVERIFY(!result.checkpoint);
+    QVERIFY(before.isCurrentFor(*window));
+    QCOMPARE(window->requestedTile(), &target);
+    QVERIFY(!window->tile());
+    QVERIFY(committed.isEmpty());
+}
+
+void TestXdgShellWindow::testGuardedTileCommitReentry_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("equal-requested") << 0;
+    QTest::newRow("equal-geometry") << 1;
+    QTest::newRow("committed-roundtrip") << 2;
+    QTest::newRow("target-destroyed") << 3;
+    QTest::newRow("window-closed") << 4;
+    QTest::newRow("input-owner-close") << 5;
+    QTest::newRow("mode-notification") << 6;
+    QTest::newRow("new-requested") << 7;
+    QTest::newRow("input-owner-only") << 8;
+}
+
+void TestXdgShellWindow::testGuardedTileCommitReentry()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto target = std::make_unique<Tile>(manager);
+    auto other = std::make_unique<Tile>(manager);
+    target->setRelativeGeometry(RectF(0, 0, 0.5, 1));
+    other->setRelativeGeometry(RectF(0.5, 0, 0.5, 1));
+    target->setQuickTileMode(QuickTileFlag::Custom);
+    other->setQuickTileMode(QuickTileFlag::Custom);
+    window->requestTile(target.get());
+    // Direct prvalue initialization preserves the fence's nonmovable type.
+    std::unique_ptr<TileAssignmentFence> before(new TileAssignmentFence(window->makeTileAssignmentFence()));
+    QPointer<Window> guard(window);
+    QSignalSpy modeChanged(window, &Window::quickTileModeChanged);
+    bool invoked = false;
+    QObject context;
+    const auto callback = [&]() {
+        if (invoked) {
+            return;
+        }
+        invoked = true;
+        switch (action) {
+        case 0:
+            window->setTileCompatibility(target.get());
+            break;
+        case 1:
+            window->moveResize(window->moveResizeGeometry());
+            break;
+        case 2:
+            window->commitTile(other.get());
+            window->commitTile(target.get());
+            break;
+        case 3:
+            target.reset();
+            break;
+        case 5:
+            before.reset();
+            [[fallthrough]];
+        case 4:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            QVERIFY(guard);
+            break;
+        case 6:
+            window->setTileCompatibility(nullptr);
+            break;
+        case 7:
+            window->requestTile(other.get());
+            break;
+        case 8:
+            before.reset();
+            break;
+        }
+    };
+    if (action == 6) {
+        connect(window, &Window::quickTileModeChanged, &context, callback);
+    } else {
+        connect(window, &Window::tileChanged, &context, callback);
+    }
+    auto result = window->commitTileForAssignment(target.get(), *before);
+    QVERIFY(invoked);
+    QCOMPARE(result.outcome, action == 8 ? Window::AssignmentCommitOutcome::AppliedCurrent : Window::AssignmentCommitOutcome::Superseded);
+    QCOMPARE(bool(result.checkpoint), action == 8);
+    QCOMPARE(modeChanged.count(), action == 6 || action == 8 ? 1 : 0);
+    if (action == 4 || action == 5) {
+        if (action == 4) {
+            QVERIFY(guard && window->isDeleted());
+            before.reset();
+        }
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    QVERIFY(guard);
+    if (action == 3) {
+        QVERIFY(!window->requestedTile() && !window->tile());
+    } else if (action == 7) {
+        QCOMPARE(window->requestedTile(), other.get());
+    } else if (action == 2) {
+        QCOMPARE(window->tile(), target.get());
+    } else if (action == 8) {
+        QVERIFY(!before);
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+    }
 }
 
 void TestXdgShellWindow::testTransientRegistryLookup()
