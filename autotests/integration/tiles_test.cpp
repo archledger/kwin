@@ -11,6 +11,7 @@
 #include "core/output.h"
 #include "pointer_input.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transientplacementwriter.h"
 #include "tiles/transienttilecontroller.h"
 #include "utils/gravity.h"
 #include "wayland_server.h"
@@ -155,6 +156,10 @@ private Q_SLOTS:
     void compatibilityPreviousTileDestruction();
     void transientMembershipMutations_data();
     void transientMembershipMutations();
+    void membershipRevision_data();
+    void membershipRevision();
+    void membershipDuringTransientAdmission_data();
+    void membershipDuringTransientAdmission();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -556,6 +561,314 @@ void TilesTest::transientMembershipMutations()
     QVERIFY(retained);
     QCOMPARE(removed.count(), 0);
     QCOMPARE(windowsChanged.count(), 0);
+}
+
+void TilesTest::membershipRevision_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("manage-inactive-desktop-member") << 0;
+    QTest::newRow("manage-existing-member") << 1;
+    QTest::newRow("unmanage-member") << 2;
+    QTest::newRow("unmanage-non-member") << 3;
+    QTest::newRow("forget-non-member") << 4;
+    QTest::newRow("manage-refused-transient") << 5;
+    QTest::newRow("manage-refused-off-desktop") << 6;
+    QTest::newRow("evacuation-miss-single-stamp") << 7;
+    QTest::newRow("evacuation-moves-membership") << 8;
+    QTest::newRow("saturates") << 9;
+    QTest::newRow("exhausted-fence") << 10;
+    QTest::newRow("unmanage-null") << 11;
+    QTest::newRow("forget-null") << 12;
+}
+
+void TilesTest::membershipRevision()
+{
+    // Every actual membership change and every otherwise-valid public membership no-op advances the
+    // window's membership revision before any notification, so a fence taken earlier is no longer
+    // current; refusals and internal evacuation misses record nothing.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(window);
+    const auto maximum = std::numeric_limits<quint64>::max();
+    auto inactiveDesktop = VirtualDesktopManager::self()->desktops().constLast();
+    QVERIFY(inactiveDesktop != VirtualDesktopManager::self()->currentDesktop(m_output));
+    Tile *inactive = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Left);
+    QVERIFY(inactive && !inactive->isActive());
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second && first->isActive());
+    if (scenario == 0) {
+        window->setOnAllDesktops(true);
+    }
+    if (scenario == 1 || scenario == 2 || scenario == 8) {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+    }
+    if (scenario == 9) {
+        window->m_tileMembershipChange = maximum - 1;
+    } else if (scenario == 10) {
+        window->m_tileMembershipChange = maximum;
+    }
+    const auto membership = window->m_tileMembershipChange;
+    const auto requested = window->m_requestedTileChange;
+    const auto committed = window->m_committedTileChange;
+    const auto placement = window->m_placementContinuationRevision;
+    const auto geometry = window->m_geometryRequestGeneration;
+    QSignalSpy addedFirst(first, &Tile::windowAdded);
+    QSignalSpy removedFirst(first, &Tile::windowRemoved);
+    QSignalSpy changedFirst(first, &Tile::windowsChanged);
+    auto fence = window->makeTileAssignmentFence();
+    QCOMPARE(fence.isCurrentFor(*window), scenario != 10);
+    // The stamp precedes the notification: inside the membership callbacks the fence is already stale.
+    bool staleInsideCallbacks = false;
+    QObject context;
+    if (scenario == 7 || scenario == 8) {
+        staleInsideCallbacks = true;
+        connect(second, &Tile::windowAdded, &context, [&]() {
+            staleInsideCallbacks = staleInsideCallbacks && !fence.isCurrentFor(*window);
+        });
+        connect(first, &Tile::windowRemoved, &context, [&]() {
+            staleInsideCallbacks = staleInsideCallbacks && !fence.isCurrentFor(*window);
+        });
+    }
+    bool accepted = false;
+    switch (scenario) {
+    case 0:
+        // A membership on another desktop is added without any request: only the revision sees it.
+        accepted = inactive->manage(window);
+        QVERIFY(accepted);
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        break;
+    case 1:
+        accepted = first->manage(window);
+        QVERIFY(accepted);
+        QCOMPARE(addedFirst.count(), 0);
+        QCOMPARE(changedFirst.count(), 0);
+        break;
+    case 2:
+        accepted = first->unmanage(window);
+        QVERIFY(accepted);
+        QCOMPARE(removedFirst.count(), 1);
+        QVERIFY(!window->requestedTile());
+        break;
+    case 3:
+        accepted = first->unmanage(window);
+        QVERIFY(!accepted);
+        QCOMPARE(removedFirst.count(), 0);
+        QCOMPARE(changedFirst.count(), 0);
+        break;
+    case 4:
+        first->forget(window);
+        QCOMPARE(removedFirst.count(), 0);
+        QCOMPARE(changedFirst.count(), 0);
+        break;
+    case 5: {
+        TransientTestTile transient(m_tileManager);
+        accepted = transient.manage(window);
+        QVERIFY(!accepted);
+        break;
+    }
+    case 6:
+        QVERIFY(!window->isOnDesktop(inactiveDesktop));
+        accepted = inactive->manage(window);
+        QVERIFY(!accepted);
+        QVERIFY(!inactive->windows().contains(window));
+        break;
+    case 7:
+        // The evacuation visits every tile of the desktop and finds nothing: one stamp, the add's.
+        accepted = second->manage(window);
+        QVERIFY(accepted);
+        QCOMPARE(window->requestedTile(), second);
+        break;
+    case 8:
+        // The evacuation removes the membership from the first tile, then the second adds it.
+        accepted = second->manage(window);
+        QVERIFY(accepted);
+        QCOMPARE(removedFirst.count(), 1);
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(second->windows().contains(window));
+        break;
+    case 9:
+    case 10:
+        accepted = first->unmanage(window);
+        QVERIFY(!accepted);
+        break;
+    case 11:
+        // A null argument (reachable from scripting) stays a plain miss: nothing recorded, nothing notified.
+        accepted = first->unmanage(nullptr);
+        QVERIFY(!accepted);
+        QCOMPARE(removedFirst.count(), 0);
+        QCOMPARE(changedFirst.count(), 0);
+        break;
+    case 12:
+        first->forget(nullptr);
+        QCOMPARE(removedFirst.count(), 0);
+        QCOMPARE(changedFirst.count(), 0);
+        break;
+    }
+    quint64 expected = membership;
+    switch (scenario) {
+    case 0:
+    case 1:
+    case 3:
+    case 4:
+    case 7:
+        expected = membership + 1;
+        break;
+    case 2:
+        expected = membership + 1;
+        break;
+    case 8:
+        expected = membership + 2;
+        break;
+    case 9:
+    case 10:
+        expected = maximum;
+        break;
+    }
+    QCOMPARE(window->m_tileMembershipChange, expected);
+    QCOMPARE(fence.isCurrentFor(*window), scenario == 5 || scenario == 6 || scenario >= 11);
+    if (scenario == 7 || scenario == 8) {
+        // The ordering was observed inside the notifications themselves.
+        QVERIFY(staleInsideCallbacks);
+    }
+    if (scenario == 0 || scenario == 1 || scenario == 3 || scenario == 4 || scenario == 5 || scenario == 6 || scenario >= 11) {
+        // The membership revision alone changed (or nothing did): the other counters are untouched.
+        QCOMPARE(window->m_requestedTileChange, requested);
+        QCOMPARE(window->m_committedTileChange, committed);
+        QCOMPARE(window->m_placementContinuationRevision, placement);
+        QCOMPARE(window->m_geometryRequestGeneration, geometry);
+    }
+    if (scenario == 9 || scenario == 10) {
+        // Exhaustion fails closed: no later fence of this window is current again.
+        auto later = window->makeTileAssignmentFence();
+        QVERIFY(!later.isCurrentFor(*window));
+    }
+    if (scenario == 0) {
+        QVERIFY(inactive->unmanage(window));
+    }
+}
+
+void TilesTest::membershipDuringTransientAdmission_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("control") << 0;
+    QTest::newRow("unmanage-no-op-at-window-added") << 1;
+    QTest::newRow("forget-no-op-at-windows-changed") << 2;
+    QTest::newRow("foreign-manage-at-window-added") << 3;
+    QTest::newRow("exhausted-membership") << 4;
+}
+
+void TilesTest::membershipDuringTransientAdmission()
+{
+    // The transient membership is published before the admission takes any fence: a membership
+    // change or an otherwise-valid public no-op made by a publication callback is newer intent the
+    // admission must not absorb.
+    QFETCH(int, scenario);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    shellSurface->set_app_id(QStringLiteral("org.example.membership"));
+    QSignalSpy configure(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(window);
+    // Settle the configure the activation scheduled: admission refuses pending native geometry.
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shellSurface->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.membership");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+    QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    Tile *first = m_rootTile->childTile(0);
+    QVERIFY(leaf && first);
+    // Admission readiness, the production check itself, before any intervention is installed.
+    QVERIFY(window->canStartTransientTileRequest(leaf->windowGeometry()));
+    const auto maximum = std::numeric_limits<quint64>::max();
+    if (scenario == 4) {
+        // The transient add saturates the revision: every later fence of this window is exhausted.
+        window->m_tileMembershipChange = maximum - 1;
+    }
+    QSignalSpy leafAdded(leaf, &Tile::windowAdded);
+    QSignalSpy leafRemoved(leaf, &Tile::windowRemoved);
+    QSignalSpy leafChanged(leaf, &Tile::windowsChanged);
+    QObject context;
+    bool intervened = false;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (scenario) {
+        case 1:
+            QVERIFY(!first->unmanage(window));
+            break;
+        case 2:
+            first->forget(window);
+            break;
+        case 3:
+            QVERIFY(first->manage(window));
+            break;
+        }
+    };
+    if (scenario == 1 || scenario == 3) {
+        connect(leaf, &Tile::windowAdded, &context, intervene);
+    } else if (scenario == 2) {
+        connect(leaf, &Tile::windowsChanged, &context, intervene);
+    }
+    const auto state = writer.snapshot();
+    const auto membership = window->m_tileMembershipChange;
+    const auto admission = controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision);
+    QCOMPARE(intervened, scenario >= 1 && scenario <= 3);
+    QCOMPARE(leafAdded.count(), 1);
+    if (scenario == 0) {
+        QCOMPARE(admission, Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        QCOMPARE(window->requestedTile(), leaf);
+        QVERIFY(leaf->windows().contains(window));
+        // The transient membership itself was recorded once and published once.
+        QCOMPARE(window->m_tileMembershipChange, membership + 1);
+        QCOMPARE(leafChanged.count(), 1);
+        QCOMPARE(leafRemoved.count(), 0);
+        return;
+    }
+    QCOMPARE(admission, Result::Superseded);
+    QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+    QVERIFY(!leaf->windows().contains(window));
+    // The release publishes its removal once; a superseded admission publishes nothing further
+    // after the boundary that superseded it (row 2 intervenes at the Owned-phase windowsChanged
+    // itself, row 4 is superseded only by its exhausted fences after a complete publication).
+    QCOMPARE(leafRemoved.count(), 1);
+    QCOMPARE(leafChanged.count(), scenario == 2 || scenario == 4 ? 2 : 1);
+    if (scenario == 4) {
+        QCOMPARE(window->m_tileMembershipChange, maximum);
+        QVERIFY(!window->requestedTile());
+        return;
+    }
+    // The transient add, the handler's stamp and the release's transient removal.
+    QCOMPARE(window->m_tileMembershipChange, membership + 3);
+    if (scenario == 3) {
+        // The handler's management stands.
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(first->windows().contains(window));
+    } else {
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!first->windows().contains(window));
+    }
 }
 
 void TilesTest::transientChildDestruction_data()
