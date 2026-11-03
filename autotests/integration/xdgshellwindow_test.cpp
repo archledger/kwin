@@ -340,6 +340,10 @@ private Q_SLOTS:
     void testTransientRequestDecorated();
     void testTransientRequestRequestedRevocation_data();
     void testTransientRequestRequestedRevocation();
+    void testOwnedRequestAuthority_data();
+    void testOwnedRequestAuthority();
+    void testOwnedRequestExhaustion_data();
+    void testOwnedRequestExhaustion();
     void testTransientNoRequestProofReplay();
     void testNoRequestFinalization_data();
     void testNoRequestFinalization();
@@ -6177,6 +6181,249 @@ void TestXdgShellWindow::testTransientRequestNewTileWins()
     QCOMPARE(receipt.progress, Window::TransientRequestProgress::Requested);
     QCOMPARE(window->requestedTile(), quick);
     QCOMPARE(window->moveResizeGeometry(), quick->windowGeometry());
+}
+
+void TestXdgShellWindow::testOwnedRequestAuthority_data()
+{
+    QTest::addColumn<int>("boundary");
+    QTest::newRow("control") << 0;
+    QTest::newRow("restore-notification") << 1;
+    QTest::newRow("scale-synchronization") << 2;
+    QTest::newRow("frame-about-to-change") << 3;
+    QTest::newRow("buffer-publication") << 4;
+    QTest::newRow("requested-tile-notification") << 5;
+    QTest::newRow("requested-tile-restore-change") << 6;
+    QTest::newRow("equal-target-scale-synchronization") << 7;
+}
+
+void TestXdgShellWindow::testOwnedRequestAuthority()
+{
+    // The request's external authority can lapse without any Window counter changing. Every owned
+    // child step must notice that next to the fence and stop where it stands, without rollback.
+    QFETCH(int, boundary);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = static_cast<XdgToplevelWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    if (boundary == 2 || boundary == 7) {
+        // Settle the configure the scale change schedules; admission refuses pending native geometry.
+        configure.clear();
+        window->setNextTargetScale(3.0);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), QSize(200, 100), Qt::red);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->nextTargetScale(), 3.0);
+    }
+    const RectF original = window->frameGeometry();
+    QCOMPARE(window->moveResizeGeometry(), original);
+    RequestTestTile tile(window);
+    if (boundary == 4) {
+        // A same-size move publishes immediately instead of staging a configure.
+        tile.setTargetForTest(RectF(640, 512, 200, 100));
+    } else if (boundary == 7) {
+        // An equal target writes no rectangle; the carrier must still join the synchronization.
+        tile.setTargetForTest(original);
+    }
+    const RectF target = tile.windowGeometry();
+    if (boundary == 7) {
+        QCOMPARE(target, original);
+    } else {
+        QVERIFY(target != original);
+    }
+    QCOMPARE(target.size() == original.size(), boundary == 4 || boundary == 7);
+    QVERIFY(static_cast<Window *>(window)->canStartTransientTileRequest(target));
+    window->setGeometryRestore(RectF(20, 20, 200, 100));
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QObject context;
+    const RectF replaced(30, 30, 200, 100);
+    bool intervened = false;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        if (boundary == 6) {
+            // Fenced state changes with the authority intact; the request predicate alone misses it.
+            window->setGeometryRestore(replaced);
+        } else {
+            authority->valid = false;
+        }
+    };
+    switch (boundary) {
+    case 1:
+        connect(window, &Window::maximizeGeometryRestoreChanged, &context, intervene);
+        break;
+    case 2:
+    case 7:
+        connect(window, &Window::nextTargetScaleChanged, &context, intervene);
+        break;
+    case 3:
+        connect(window, &Window::frameGeometryAboutToChange, &context, intervene);
+        break;
+    case 4:
+        connect(window, &Window::bufferGeometryChanged, &context, intervene);
+        break;
+    case 5:
+    case 6:
+        connect(window, &Window::requestedTileChanged, &context, intervene);
+        break;
+    }
+    QSignalSpy bufferChanged(window, &Window::bufferGeometryChanged);
+    QSignalSpy clientChanged(window, &Window::clientGeometryChanged);
+    QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+    QSignalSpy requestedChanged(window, &Window::requestedTileChanged);
+    const auto revision = window->m_requestedTileChange;
+    const auto generation = window->m_geometryRequestGeneration;
+    configure.clear();
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    QCOMPARE(intervened, boundary != 0);
+    QCOMPARE(authority->valid, boundary == 0 || boundary == 6);
+    QCOMPARE(receipt.outcome, boundary == 0 ? Window::TransientRequestOutcome::Applied : Window::TransientRequestOutcome::Superseded);
+    // Progress is published at allocation and stays Requested whatever happens afterwards.
+    QCOMPARE(receipt.progress, boundary == 1 ? Window::TransientRequestProgress::NoRequest : Window::TransientRequestProgress::Requested);
+    QVERIFY(receipt.nativeSequence);
+    QCOMPARE(bool(receipt.noRequestProof), boundary == 1);
+    QVERIFY(!window->m_activeTransientRequest);
+    // Saved A survives every outcome once written and a handler's newer value is kept; only this
+    // attempt's association is removed.
+    QCOMPARE(window->geometryRestore(), boundary == 6 ? replaced : original);
+    QCOMPARE(window->requestedTile(), boundary == 0 ? &tile : nullptr);
+    // No install before the restore notification; install only on success; install and removal otherwise.
+    quint64 associationChanges = 2;
+    if (boundary == 0) {
+        associationChanges = 1;
+    } else if (boundary == 1) {
+        associationChanges = 0;
+    }
+    QCOMPARE(window->m_requestedTileChange, revision + associationChanges);
+    // Removal announces once more; an intervention at the notification itself sees both announcements.
+    QCOMPARE(quint64(requestedChanged.count()), boundary == 5 || boundary == 6 ? 2 : qMin<quint64>(associationChanges, 1));
+    QCOMPARE(window->m_geometryRequestGeneration, generation + (boundary == 1 ? 0 : 1));
+    QVERIFY(!window->m_geometryResizePending);
+    QCOMPARE(window->moveResizeGeometry(), boundary == 1 ? original : target);
+    QCOMPARE(window->frameGeometry(), boundary == 4 ? target : original);
+    // Output properties: the lapse inside synchronization leaves the obligation for a later request.
+    QCOMPARE(window->m_outputPropertiesPending, boundary == 2 || boundary == 7);
+    QCOMPARE(window->nextTargetScale(), window->moveResizeOutput()->scale());
+    // Every boundary past the association write publishes the quick-tile state, which schedules a configure; row 1
+    // stops before any write. Since 6.8 every configure carries moveResizeGeometry() as its bounds, so the dispatcher's
+    // own staging (rows 0, 5 and 6) is not separately observable; the configure delivers the rectangle requested so far.
+    QCOMPARE(window->m_configureTimer->isActive(), boundary != 1);
+    // Publication stops after the notification in which the authority lapsed; the rest stays pending.
+    QCOMPARE(bufferChanged.count(), boundary == 4 ? 1 : 0);
+    QCOMPARE(clientChanged.count(), 0);
+    QCOMPARE(frameChanged.count(), 0);
+    QCOMPARE(window->m_pendingGeometryNotifications.client.has_value(), boundary == 4);
+    QCOMPARE(window->m_pendingGeometryNotifications.frame.has_value(), boundary == 4);
+    if (boundary != 0) {
+        return;
+    }
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), target.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), target);
+    QCOMPARE(window->requestedTile(), &tile);
+    // The transient commit is gated on the ownership record; a direct request establishes none.
+    QVERIFY(!window->tile());
+}
+
+void TestXdgShellWindow::testOwnedRequestExhaustion_data()
+{
+    QTest::addColumn<int>("counter");
+    QTest::newRow("request-generation") << 0;
+    QTest::newRow("association-revision") << 1;
+    QTest::newRow("placement-revision") << 2;
+    QTest::newRow("publication-generation") << 3;
+    QTest::newRow("placement-after-restore") << 4;
+}
+
+void TestXdgShellWindow::testOwnedRequestExhaustion()
+{
+    // Headroom known before any effect is refused as Rejected. A child refusal after the restore
+    // and association writes ends as Superseded with only this attempt's association removed.
+    QFETCH(int, counter);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = static_cast<XdgToplevelWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    RequestTestTile tile(window);
+    const RectF original = window->frameGeometry();
+    const RectF target = tile.windowGeometry();
+    QVERIFY(static_cast<Window *>(window)->canStartTransientTileRequest(target));
+    const RectF stale(20, 20, 200, 100);
+    window->setGeometryRestore(stale);
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    const auto requestGeneration = window->m_geometryRequestGeneration;
+    const auto associationRevision = window->m_requestedTileChange;
+    const auto placementRevision = window->m_placementContinuationRevision;
+    const auto publicationGeneration = window->m_geometryUpdateGeneration;
+    const auto restoreCounters = qScopeGuard([&]() {
+        window->m_geometryRequestGeneration = requestGeneration;
+        window->m_requestedTileChange = associationRevision;
+        window->m_placementContinuationRevision = placementRevision;
+        window->m_geometryUpdateGeneration = publicationGeneration;
+    });
+    switch (counter) {
+    case 0:
+        window->m_geometryRequestGeneration = exhausted - 1;
+        break;
+    case 1:
+        window->m_requestedTileChange = exhausted - 1;
+        break;
+    case 2:
+        window->m_placementContinuationRevision = exhausted - 1;
+        break;
+    case 3:
+        window->m_geometryUpdateGeneration = exhausted - 1;
+        break;
+    case 4:
+        window->m_placementContinuationRevision = exhausted - 2;
+        break;
+    }
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy requestedChanged(window, &Window::requestedTileChanged);
+    const auto sequence = window->m_transientRequestSequence;
+    // The request captures the request generation now, after the sentinel is in place.
+    const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
+    const bool rejected = counter <= 2;
+    QCOMPARE(receipt.outcome, rejected ? Window::TransientRequestOutcome::Rejected : Window::TransientRequestOutcome::Superseded);
+    QCOMPARE(receipt.progress, Window::TransientRequestProgress::NoRequest);
+    // Counter sentinels are refused before the sequence is consumed; the restore writer's refusal is not.
+    QCOMPARE(receipt.nativeSequence, counter <= 1 ? 0 : sequence + 1);
+    QCOMPARE(bool(receipt.noRequestProof), counter >= 2);
+    QVERIFY(!window->m_activeTransientRequest);
+    QCOMPARE(window->geometryRestore(), rejected ? stale : original);
+    QCOMPARE(restoreChanged.count(), rejected ? 0 : 1);
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(requestedChanged.count(), rejected ? 0 : 1);
+    QCOMPARE(window->moveResizeGeometry(), original);
+    QCOMPARE(window->frameGeometry(), original);
+    QVERIFY(!window->m_outputPropertiesPending);
+    QVERIFY(!window->m_geometryResizePending);
+    // A rejected request schedules no configure at all; a superseded one published its association's install and
+    // removal (the quick-tile state), whose configure carries moveResizeGeometry(), the original rectangle above.
+    QCOMPARE(window->m_configureTimer->isActive(), !rejected);
+    QCOMPARE(window->m_geometryRequestGeneration, counter == 0 ? exhausted - 1 : requestGeneration);
+    QCOMPARE(window->m_requestedTileChange, counter == 1 ? exhausted - 1 : associationRevision + (rejected ? 0 : 2));
+    QCOMPARE(window->m_placementContinuationRevision, counter == 2 || counter == 4 ? exhausted - 1 : placementRevision + (rejected ? 0 : 1));
+    QCOMPARE(window->m_geometryUpdateGeneration, counter == 3 ? exhausted - 1 : publicationGeneration);
 }
 
 void TestXdgShellWindow::testTransientRequestPendingStates_data()

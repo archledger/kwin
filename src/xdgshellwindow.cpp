@@ -179,7 +179,7 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
         if (!geometryRequestIsCurrent(generation) || !transientGeometryRequestIsCurrent(generation)) {
             return false;
         }
-        return !guarded || (guarded->result.checkpoint && guarded->result.checkpoint->isCurrentFor(*this));
+        return !guarded || assignmentResultIsCurrent(guarded->result);
     };
     Q_EMIT frameGeometryAboutToChange();
     if (!current()) {
