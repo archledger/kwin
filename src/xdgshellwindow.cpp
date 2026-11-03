@@ -1284,7 +1284,7 @@ void XdgToplevelWindow::handleUnmaximizeRequested()
 
 void XdgToplevelWindow::handleFullscreenRequested(OutputInterface *output)
 {
-    m_fullScreenRequestedOutput = output ? output->handle() : nullptr;
+    writeFullScreenRequestedOutput(output ? output->handle() : nullptr);
     if (m_isInitialized) {
         setFullScreen(true);
         scheduleConfigure();
@@ -1295,7 +1295,7 @@ void XdgToplevelWindow::handleFullscreenRequested(OutputInterface *output)
 
 void XdgToplevelWindow::handleUnfullscreenRequested()
 {
-    m_fullScreenRequestedOutput.clear();
+    writeFullScreenRequestedOutput(nullptr);
     if (m_isInitialized) {
         setFullScreen(false);
         scheduleConfigure();
@@ -1725,9 +1725,14 @@ void XdgToplevelWindow::installAppMenu(AppMenuInterface *appMenu)
 
 DecorationMode XdgToplevelWindow::preferredDecorationMode() const
 {
+    return preferredDecorationMode(isRequestedFullScreen());
+}
+
+DecorationMode XdgToplevelWindow::preferredDecorationMode(bool requestedFullScreen) const
+{
     if (!Decoration::DecorationBridge::hasPlugin()) {
         return DecorationMode::Client;
-    } else if (isRequestedFullScreen()) {
+    } else if (requestedFullScreen) {
         return DecorationMode::None;
     }
 
@@ -1898,6 +1903,198 @@ void XdgToplevelWindow::installXdgDialogV1(XdgDialogV1Interface *dialog)
     setModal(dialog->isModal());
 }
 
+static bool isFiniteExtent(const RectF &rect)
+{
+    for (qreal value : {rect.x(), rect.y(), rect.width(), rect.height()}) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    return rect.width() > 0 && rect.height() > 0;
+}
+
+static void advanceRevision(quint64 &revision)
+{
+    if (revision != std::numeric_limits<quint64>::max()) {
+        ++revision;
+    }
+}
+
+void XdgToplevelWindow::writeRequestedFullScreen(bool set)
+{
+    m_isRequestedFullScreen = set;
+    advanceRevision(m_requestedFullScreenRevision);
+    advanceRevision(m_fullScreenIntentRevision);
+}
+
+void XdgToplevelWindow::writeFullScreenRequestedOutput(LogicalOutput *output)
+{
+    m_fullScreenRequestedOutput = output;
+    advanceRevision(m_fullScreenIntentRevision);
+}
+
+RectF XdgToplevelWindow::ownedFullScreenExitGeometry(const RectF &managed, MaximizeMode maximizeMode) const
+{
+    RectF geometry = managed;
+    if (maximizeMode != MaximizeRestore) {
+        const RectF area = workspace()->clientArea(MaximizeArea, this, moveResizeOutput());
+        if (maximizeMode & MaximizeHorizontal) {
+            geometry.setLeft(area.left());
+            geometry.setRight(area.right());
+        }
+        if (maximizeMode & MaximizeVertical) {
+            geometry.setTop(area.top());
+            geometry.setBottom(area.bottom());
+        }
+    }
+    return geometry;
+}
+
+bool XdgToplevelWindow::ownedFullScreenExitFeasible(const RectF &managed, MaximizeMode maximizeMode) const
+{
+    // Every axis that is not maximized returns to the managed extent exactly, under the decoration
+    // the exit restores: the same check an owned unmaximize makes for its released axes.
+    return ownedMaximizeFeasible(managed, maximizeMode, MaximizeFull);
+}
+
+std::optional<XdgToplevelWindow::OwnedFullScreen> XdgToplevelWindow::ownedFullScreenPlan(bool set) const
+{
+    // Only an ordinary toggle qualifies: no interactive operation, a live current ownership record,
+    // and, when entering, no client-requested output other than the one the ownership lives on (a
+    // different output leaves that context, so the legacy path moves and releases as before). An
+    // exit must be able to return to the managed extents; the decoration it restores does not
+    // exist while fullscreen, so this is exact when no server decoration will return and only a
+    // necessary condition otherwise, settled exactly once the decoration is configured.
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (isInteractiveMoveResize() || !m_transientOwnership || m_requestedFullScreenRevision >= exhausted - 1
+        || m_fullScreenIntentRevision >= exhausted - 2) {
+        return std::nullopt;
+    }
+    const auto generation = m_transientOwnership->generation;
+    if (!transientOwnershipIsCurrent(generation)) {
+        return std::nullopt;
+    }
+    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    if (!isFiniteExtent(managed)) {
+        return std::nullopt;
+    }
+    const MaximizeMode maximizeMode = m_requestedMaximizeMode;
+    if (set) {
+        if (m_fullScreenRequestedOutput && m_fullScreenRequestedOutput.data() != moveResizeOutput()) {
+            return std::nullopt;
+        }
+    } else {
+        if (!ownedFullScreenExitFeasible(managed, maximizeMode)) {
+            return std::nullopt;
+        }
+        if (preferredDecorationMode(false) == DecorationMode::Server && !m_nextDecoration) {
+            // A returning server decoration raises the enforced client minimum to 150 on each
+            // returning axis; the frame cannot be smaller than that client.
+            const qreal enforcedMinimum = 150;
+            if ((!(maximizeMode & MaximizeHorizontal) && managed.width() < enforcedMinimum)
+                || (!(maximizeMode & MaximizeVertical) && managed.height() < enforcedMinimum)) {
+                return std::nullopt;
+            }
+        }
+    }
+    return OwnedFullScreen{generation, managed, ownedFullScreenExitGeometry(managed, maximizeMode), maximizeMode, m_requestedMaximizeRevision,
+                           m_fullScreenRequestedOutput, !m_fullScreenRequestedOutput.isNull(), m_minimumSize, m_maximumSize};
+}
+
+XdgToplevelWindow::OwnedFullScreenOutcome XdgToplevelWindow::setFullScreenOwned(const OwnedFullScreen &plan, bool set)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const auto before = makeTileAssignmentFence();
+    writeRequestedFullScreen(set);
+    const auto revision = m_requestedFullScreenRevision;
+    bool legacy = false;
+    // Publishing the requested state to the client is this write's own obligation: it is discharged
+    // as long as the write is still current, whatever happened to the geometry, and reports no
+    // success. Only an exit the legacy path takes over below, before anything owned has happened,
+    // publishes through that path instead.
+    const auto publish = qScopeGuard([this, revision, &legacy]() {
+        if (!legacy && !isDeleted() && m_requestedFullScreenRevision == revision) {
+            doSetFullScreen();
+        }
+    });
+    QPointer<LogicalOutput> requestedOutput = plan.requestedOutput;
+    bool hadRequestedOutput = plan.hadRequestedOutput;
+    quint64 intentRevision = m_fullScreenIntentRevision;
+    const auto intentCurrent = [&]() {
+        return m_fullScreenIntentRevision == intentRevision && m_requestedMaximizeRevision == plan.maximizeRevision
+            && (hadRequestedOutput ? (!requestedOutput.isNull() && m_fullScreenRequestedOutput.data() == requestedOutput.data())
+                                   : m_fullScreenRequestedOutput.isNull());
+    };
+    const auto current = [&]() {
+        return !isDeleted() && before.isCurrentFor(*this) && transientOwnershipIsCurrent(plan.generation) && intentCurrent();
+    };
+    // The decoration is configured through plugin code: a callback boundary of its own. A handler
+    // that revoked ownership, changed fenced state, wrote the fullscreen or maximize intent (even
+    // back to the same value) or changed the requested output holds the newer intent: nothing but
+    // the state write happened, and only that is published.
+    configureDecoration();
+    if (!current()) {
+        return OwnedFullScreenOutcome::Stopped;
+    }
+    if (!set) {
+        // The restored decoration's borders and enforced minimum are known only now, so the exit's
+        // dispatch is validated here, after a prefix (the state write and the decoration
+        // configuration) the legacy path shares. If the managed extents cannot be returned to under
+        // that decoration while the client's own size hints are those of the plan, that is the
+        // exit's predictable effect: the legacy exit takes the operation over and releases as
+        // before. Changed hints are a handler's newer intent and end the operation here. The hint
+        // comparison is deliberately narrow: rule limits and the decoration's state are separate
+        // inputs the exact check already reflects.
+        if (!ownedFullScreenExitFeasible(plan.managed, plan.maximizeMode)) {
+            legacy = m_minimumSize == plan.minimumHint && m_maximumSize == plan.maximumHint;
+            return legacy ? OwnedFullScreenOutcome::Legacy : OwnedFullScreenOutcome::Stopped;
+        }
+        writeFullScreenRequestedOutput(nullptr);
+        requestedOutput.clear();
+        hadRequestedOutput = false;
+        intentRevision = m_fullScreenIntentRevision;
+    }
+    // Neither the fence nor the ownership record sees the fullscreen, output or maximize intent or
+    // the client's size limits, so the owned writes carry them as their own constraint for every
+    // child boundary; captured by value, the constraint outlives nothing of this frame.
+    const auto constraint = [this, managed = plan.managed, maximizeMode = plan.maximizeMode, maximizeRevision = plan.maximizeRevision,
+                             intentRevision, hadRequestedOutput, requestedOutput, set]() {
+        return m_fullScreenIntentRevision == intentRevision && m_requestedMaximizeRevision == maximizeRevision
+            && (hadRequestedOutput ? (!requestedOutput.isNull() && m_fullScreenRequestedOutput.data() == requestedOutput.data())
+                                   : m_fullScreenRequestedOutput.isNull())
+            && (set || ownedFullScreenExitFeasible(managed, maximizeMode));
+    };
+    const auto configured = makeTileAssignmentFence();
+    if (set) {
+        // Legacy consumers (the placement tracker, a legacy exit after a release) read the restore
+        // field: it holds the rectangle an owned exit returns to. The write is a callback boundary;
+        // a handler's replacement stands and ends the operation.
+        const auto restore = setFullscreenGeometryRestoreForAssignment(plan.target, configured, OwnedProvenance::forOwnership(plan.generation, constraint));
+        if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(restore)) {
+            return OwnedFullScreenOutcome::Stopped;
+        }
+        // The ownership pins the move-resize output to the recorded one, and a requested output
+        // was admitted only when it is that same output.
+        const RectF area = workspace()->clientArea(FullScreenArea, this, moveResizeOutput());
+        const auto request = requestMoveResizeForOwnership(area, MoveResizeMode::MoveResize, *restore.checkpoint, plan.generation, constraint);
+        if (request.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(request.result)) {
+            return OwnedFullScreenOutcome::Stopped;
+        }
+    } else {
+        // The restore field is left as it is, as on the legacy exit; the geometry returns to the
+        // rectangle frozen before the first callback, never to that field.
+        const auto request = requestMoveResizeForOwnership(plan.target, MoveResizeMode::MoveResize, configured, plan.generation, constraint);
+        if (request.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(request.result)) {
+            return OwnedFullScreenOutcome::Stopped;
+        }
+    }
+    markAsPlaced();
+    return OwnedFullScreenOutcome::Applied;
+}
+
 void XdgToplevelWindow::setFullScreen(bool set)
 {
     if (!isFullScreenable()) {
@@ -1909,15 +2106,71 @@ void XdgToplevelWindow::setFullScreen(bool set)
         return;
     }
 
-    m_isRequestedFullScreen = set;
-    configureDecoration();
+    applyFullScreen(set);
+}
 
+XdgToplevelWindow::OwnedFullScreenOutcome XdgToplevelWindow::applyFullScreen(bool set)
+{
+    // An owner keeps its placement authority through an ordinary toggle. Eligibility is decided
+    // before the first callback; only an exit's exact feasibility may still be open then, because
+    // the decoration it restores does not exist while fullscreen. That dispatch is validated right
+    // after the decoration is configured, a prefix both paths share; a superseded owned operation
+    // never reaches the legacy tail.
+    if (const auto plan = ownedFullScreenPlan(set)) {
+        const auto outcome = setFullScreenOwned(*plan, set);
+        if (outcome != OwnedFullScreenOutcome::Legacy) {
+            return outcome;
+        }
+    } else {
+        writeRequestedFullScreen(set);
+        configureDecoration();
+    }
+    finishFullScreenLegacy(set);
+    return OwnedFullScreenOutcome::Legacy;
+}
+
+bool XdgToplevelWindow::releaseOwnedPlacement()
+{
+    const quint64 owned = ownedTransientPlacementGeneration();
+    if (!owned) {
+        return false;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    if (m_isRequestedFullScreen) {
+        // A requested fullscreen state, acknowledged or still pending, is left as the owner first;
+        // the release follows only if that exit completed as the current intent, so a handler's
+        // newer state write, even one ending not fullscreen, is not cancelled. A legacy exit
+        // releases on its own; a rule keeping the window fullscreen leaves nothing to restore.
+        if (!isFullScreenable() || rules()->checkFullScreen(false)) {
+            return false;
+        }
+        switch (applyFullScreen(false)) {
+        case OwnedFullScreenOutcome::Legacy:
+            return !isDeleted() && !ownedTransientPlacementGeneration();
+        case OwnedFullScreenOutcome::Stopped:
+            return false;
+        case OwnedFullScreenOutcome::Applied:
+            break;
+        }
+        if (isDeleted() || ownedTransientPlacementGeneration() != owned) {
+            return false;
+        }
+    }
+    setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
+    return !isDeleted() && !ownedTransientPlacementGeneration();
+}
+
+void XdgToplevelWindow::finishFullScreenLegacy(bool set)
+{
     if (set) {
         const LogicalOutput *output = m_fullScreenRequestedOutput ? m_fullScreenRequestedOutput.data() : moveResizeOutput();
         setFullscreenGeometryRestore(moveResizeGeometry());
         moveResize(workspace()->clientArea(FullScreenArea, this, output));
     } else {
-        m_fullScreenRequestedOutput.clear();
+        writeFullScreenRequestedOutput(nullptr);
         if (fullscreenGeometryRestore().isValid()) {
             moveResize(RectF(fullscreenGeometryRestore().topLeft(),
                              constrainFrameSize(fullscreenGeometryRestore().size())));
@@ -2059,12 +2312,7 @@ void XdgToplevelWindow::writeRequestedMaximizeMode(MaximizeMode mode)
 
 bool XdgToplevelWindow::ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const
 {
-    for (qreal value : {managed.x(), managed.y(), managed.width(), managed.height()}) {
-        if (!std::isfinite(value)) {
-            return false;
-        }
-    }
-    if (managed.width() <= 0 || managed.height() <= 0) {
+    if (!isFiniteExtent(managed)) {
         return false;
     }
     // A released axis returns to the managed extent exactly, so the client's size limits must

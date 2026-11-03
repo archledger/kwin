@@ -57,6 +57,7 @@
 #include <QActionGroup>
 #include <QMenu>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <kauthorized.h>
 #include <kconfig.h>
 
@@ -1109,8 +1110,22 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation 
         requestFocus(window);
         break;
     case Options::UntileOrRestoreOp:
+        if (window->ownedTransientPlacementGeneration()) {
+            // An owned window keeps its placement authority through an ordinary fullscreen exit;
+            // this explicit action has the owning layer leave a requested fullscreen state,
+            // acknowledged or still pending, as the owner and release in one step, only while that
+            // exit is still the current intent; a handler's newer intent is not cancelled.
+            window->ref();
+            const auto lifetime = qScopeGuard([window]() {
+                window->unref();
+            });
+            window->releaseOwnedPlacement();
+            if (window->isDeleted()) {
+                return;
+            }
+        }
         // Un-fullscreen takes priority
-        if (window->isFullScreen()) {
+        else if (window->isFullScreen()) {
             window->setFullScreen(false);
         }
         // Un-tile if tiled
