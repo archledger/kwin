@@ -244,6 +244,7 @@ void Window::setOutput(LogicalOutput *output)
     if (m_output != output) {
         LogicalOutput *oldOutput = m_output;
         m_output = output;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
         Q_EMIT outputChanged(oldOutput);
     }
 }

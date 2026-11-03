@@ -1744,6 +1744,7 @@ Q_SIGNALS:
 
 private:
     friend class TileAssignmentFence;
+    friend class WaylandWindow;
     friend class TransientTileController;
     friend class ::TestXdgShellWindow;
 
@@ -2322,6 +2323,7 @@ public:
 private:
     friend class Window;
     friend class Tile;
+    friend class WaylandWindow;
     explicit TileAssignmentFence(Window &window);
 
     const QPointer<Window> m_window;
