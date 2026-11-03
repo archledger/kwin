@@ -491,6 +491,8 @@ bool Tile::manage(Window *window)
     }
 
     if (m_windows.contains(window)) {
+        // An otherwise-valid public no-op is newer same-window intent for any older operation.
+        window->noteTileMembershipChanged();
         return true;
     }
 
@@ -545,6 +547,12 @@ bool Tile::unmanage(Window *window)
         return releaseTransientWindow(window);
     }
     if (!remove(window)) {
+        // Nothing to remove: still newer same-window intent for any older operation (conservative
+        // rule); a transient target above keeps its refusal contract instead. A null argument
+        // (reachable from scripting) stays a plain miss.
+        if (window) {
+            window->noteTileMembershipChanged();
+        }
         return false;
     }
 
@@ -562,6 +570,8 @@ void Tile::forget(Window *window)
     }
     if (remove(window)) {
         window->forgetTile(this);
+    } else if (window) {
+        window->noteTileMembershipChanged();
     }
 }
 
@@ -569,6 +579,9 @@ void Tile::add(Window *window)
 {
     Q_ASSERT(!m_windows.contains(window));
     m_windows.append(window);
+    // Recorded before the notification, so a checkpoint taken by a guarded caller after the write
+    // and before the callbacks sees this change as its own and any later one as foreign.
+    window->noteTileMembershipChanged();
 
     Q_EMIT windowAdded(window);
     Q_EMIT windowsChanged();
@@ -577,8 +590,10 @@ void Tile::add(Window *window)
 bool Tile::remove(Window *window)
 {
     if (!m_windows.removeOne(window)) {
+        // An internal miss (an evacuation that found nothing) records nothing.
         return false;
     }
+    window->noteTileMembershipChanged();
 
     Q_EMIT windowRemoved(window);
     Q_EMIT windowsChanged();

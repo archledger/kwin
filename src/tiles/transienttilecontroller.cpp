@@ -126,16 +126,19 @@ private:
         m_windows.removeAll(window);
     }
 
-    bool publishAdded(Window *window, quint64 generation)
+    // The membership predicate is the admission's own currentness over the window's membership
+    // revision, checked after each callback boundary so a superseded admission publishes nothing
+    // further; the tile itself cannot read that revision.
+    bool publishAdded(Window *window, quint64 generation, const std::function<bool()> &membershipCurrent)
     {
         const QPointer<TransientTile> guard(this);
         const auto controller = m_controller;
         Q_EMIT windowAdded(window);
-        if (!guard || !controller || !controller->admissionCurrent(window, generation)) {
+        if (!guard || !controller || !controller->admissionCurrent(window, generation) || !membershipCurrent()) {
             return false;
         }
         Q_EMIT windowsChanged();
-        return guard && controller && controller->admissionCurrent(window, generation);
+        return guard && controller && controller->admissionCurrent(window, generation) && membershipCurrent();
     }
 
     void publishRemoved(Window *window, quint64 generation)
@@ -218,8 +221,9 @@ public:
         // All state changes before finish() are callback-free.
         controller->clearAdmission();
         m_window->m_transientOwnership->controller.clear();
-        if (m_tile) {
+        if (m_tile && m_tile->m_windows.contains(m_window)) {
             m_tile->removeMember(m_window);
+            m_window->noteTileMembershipChanged();
         }
         m_changes = m_window->detachTransientAssociation(m_generation);
     }
@@ -635,8 +639,19 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
         releaseWindow(window, ownership);
         return Result::Refused;
     }
+    // The transient membership is recorded before its publication; a membership change or an
+    // otherwise-valid public membership no-op made by a publication callback is newer intent that
+    // no later fence of this admission would otherwise see.
+    window->noteTileMembershipChanged();
+    // The window outlives this call (retained above); the predicate reads its membership revision
+    // through a pointer taken here so the tile needs no access of its own.
+    const quint64 *const revision = &window->m_tileMembershipChange;
+    const auto membership = *revision;
+    const auto membershipCurrent = [revision, membership]() {
+        return *revision == membership;
+    };
     m_membershipPublished = true;
-    if (!m_tile->publishAdded(window, generation)) {
+    if (!m_tile->publishAdded(window, generation, membershipCurrent)) {
         window->revokeTransientOwnership(ownership);
         return Result::Superseded;
     }
