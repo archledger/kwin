@@ -45,6 +45,7 @@ protected:
 
 private:
     friend class ::TestXdgShellWindow;
+    friend class XdgSurfaceWindow;
 
     [[nodiscard]] KWIN_EXPORT AssignmentStepResult updateGeometryForAssignment(RectF rect, const TileAssignmentFence &before);
     void updateGeometryInternal(const RectF &rect, AssignmentStepResult *guardedResult = nullptr);

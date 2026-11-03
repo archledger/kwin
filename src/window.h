@@ -1746,6 +1746,7 @@ Q_SIGNALS:
 private:
     friend class TileAssignmentFence;
     friend class WaylandWindow;
+    friend class XdgSurfaceWindow;
     friend class TransientTileController;
     friend class ::TestXdgShellWindow;
 
@@ -1764,6 +1765,24 @@ private:
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before);
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
+    struct AssignmentGeometrySync
+    {
+        AssignmentStepResult result;
+        QPointer<LogicalOutput> output;
+        qreal scale = 1;
+        OutputTransform transform = OutputTransform::Normal;
+        std::shared_ptr<ColorDescription> color;
+        bool hadOutput = false;
+        bool synchronize = false;
+    };
+    [[nodiscard]] AssignmentStepResult setMoveResizeGeometryForAssignment(RectF desired, const TileAssignmentFence &before);
+    bool assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const;
+    void setMoveResizeGeometryInternal(const RectF &rect, AssignmentGeometrySync *sync = nullptr);
+    void setMoveResizeOutputInternal(LogicalOutput *output, AssignmentGeometrySync *sync = nullptr);
+    void setOutputPropertiesPending(bool pending, AssignmentGeometrySync *sync = nullptr);
+    void setNextTargetScaleInternal(qreal scale, AssignmentGeometrySync *sync = nullptr);
+    void setPreferredBufferTransformInternal(OutputTransform transform, AssignmentGeometrySync *sync = nullptr);
+    void setPreferredColorDescriptionInternal(const std::shared_ptr<ColorDescription> &description, AssignmentGeometrySync *sync = nullptr);
 
     enum class TransientRequestOutcome {
         Rejected,
