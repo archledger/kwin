@@ -3463,8 +3463,83 @@ RectF Window::moveResizeGeometry() const
 
 void Window::setMoveResizeGeometry(const RectF &geo)
 {
-    m_moveResizeGeometry = geo;
-    setMoveResizeOutput(workspace()->outputAt(geo.center()));
+    setMoveResizeGeometryInternal(geo);
+}
+
+Window::AssignmentStepResult Window::setMoveResizeGeometryForAssignment(RectF desired, const TileAssignmentFence &before)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult refused;
+    if (!before.isCurrentFor(*this)) {
+        refused.outcome = AssignmentStepOutcome::Superseded;
+        return refused;
+    }
+    if (m_transientOwnership || m_activeTransientRequest) {
+        return refused;
+    }
+    AssignmentGeometrySync sync;
+    sync.result.outcome = AssignmentStepOutcome::Superseded;
+    sync.result.checkpoint.reset(new TileAssignmentFence(*this));
+    sync.output = workspace()->outputAt(desired.center());
+    sync.hadOutput = bool(sync.output);
+    if (sync.output) {
+        sync.scale = sync.output->scale();
+        sync.transform = sync.output->transform();
+        sync.color = sync.output->blendingColor();
+    }
+    if (!assignmentGeometrySyncIsCurrent(sync)) {
+        return std::move(sync.result);
+    }
+    const bool outputChanged = m_moveResizeOutput != sync.output;
+    const bool scaleChanged = sync.output && m_nextTargetScale != sync.scale;
+    const bool transformChanged = sync.output && m_preferredBufferTransform != sync.transform;
+    const bool colorChanged = sync.output && m_preferredColorDescription != sync.color;
+    sync.synchronize = outputChanged || m_outputPropertiesPending || scaleChanged || transformChanged || colorChanged;
+    quint64 writes = (m_moveResizeGeometry != desired) + outputChanged;
+    if (sync.output && sync.synchronize) {
+        // Starting and finishing the obligation are distinct owned state transitions.
+        writes += !m_outputPropertiesPending;
+        writes += scaleChanged + transformChanged + colorChanged;
+        ++writes;
+    } else if (!sync.output) {
+        writes += m_outputPropertiesPending;
+    }
+    if (writes > std::numeric_limits<quint64>::max() - 1 - m_placementContinuationRevision) {
+        return refused;
+    }
+    setMoveResizeGeometryInternal(desired, &sync);
+    if (assignmentGeometrySyncIsCurrent(sync)) {
+        sync.result.outcome = AssignmentStepOutcome::AppliedCurrent;
+    }
+    return std::move(sync.result);
+}
+
+bool Window::assignmentGeometrySyncIsCurrent(AssignmentGeometrySync &sync) const
+{
+    if (sync.result.checkpoint && sync.result.checkpoint->isCurrentFor(*this) && (!sync.hadOutput || sync.output)) {
+        return true;
+    }
+    sync.result.outcome = AssignmentStepOutcome::Superseded;
+    sync.result.checkpoint.reset();
+    return false;
+}
+
+void Window::setMoveResizeGeometryInternal(const RectF &rect, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
+    if (m_moveResizeGeometry != rect) {
+        m_moveResizeGeometry = rect;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
+    }
+    setMoveResizeOutputInternal(sync ? sync->output.data() : workspace()->outputAt(rect.center()), sync);
 }
 
 void Window::notifyRequestedGeometryChanged()
@@ -3484,7 +3559,29 @@ LogicalOutput *Window::moveResizeOutput() const
 
 void Window::setMoveResizeOutput(LogicalOutput *output)
 {
-    if (m_moveResizeOutput == output && !m_outputPropertiesPending) {
+    setMoveResizeOutputInternal(output);
+}
+
+void Window::setOutputPropertiesPending(bool pending, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
+    if (m_outputPropertiesPending != pending) {
+        m_outputPropertiesPending = pending;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
+    }
+}
+
+void Window::setMoveResizeOutputInternal(LogicalOutput *output, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
+    if (m_moveResizeOutput == output && !m_outputPropertiesPending && (!sync || !sync->synchronize)) {
         return;
     }
 
@@ -3495,6 +3592,10 @@ void Window::setMoveResizeOutput(LogicalOutput *output)
             disconnect(m_moveResizeOutput, &LogicalOutput::blendingColorChanged, this, &Window::updatePreferredColorDescription);
         }
         m_moveResizeOutput = output;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
         if (output) {
             connect(output, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
             connect(output, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
@@ -3502,24 +3603,27 @@ void Window::setMoveResizeOutput(LogicalOutput *output)
         }
     }
     if (!m_moveResizeOutput) {
-        m_outputPropertiesPending = false;
+        setOutputPropertiesPending(false, sync);
         return;
     }
 
     // A nested request to this output must finish synchronization if this request is superseded.
-    m_outputPropertiesPending = true;
+    setOutputPropertiesPending(true, sync);
     const auto generation = m_geometryRequestGeneration;
-    updateNextTargetScale();
-    if (!geometryRequestIsCurrent(generation)) {
+    const auto current = [&]() {
+        return sync ? assignmentGeometrySyncIsCurrent(*sync) : geometryRequestIsCurrent(generation);
+    };
+    setNextTargetScaleInternal(sync ? sync->scale : m_moveResizeOutput->scale(), sync);
+    if (!current()) {
         return;
     }
-    updatePreferredBufferTransform();
-    if (!geometryRequestIsCurrent(generation)) {
+    setPreferredBufferTransformInternal(sync ? sync->transform : m_moveResizeOutput->transform(), sync);
+    if (!current()) {
         return;
     }
-    updatePreferredColorDescription();
-    if (geometryRequestIsCurrent(generation)) {
-        m_outputPropertiesPending = false;
+    setPreferredColorDescriptionInternal(sync ? sync->color : m_moveResizeOutput->blendingColor(), sync);
+    if (current()) {
+        setOutputPropertiesPending(false, sync);
     }
 }
 
@@ -5320,10 +5424,28 @@ qreal Window::nextTargetScale() const
 
 void Window::setNextTargetScale(qreal scale)
 {
+    setNextTargetScaleInternal(scale);
+}
+
+void Window::setNextTargetScaleInternal(qreal scale, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
     if (m_nextTargetScale != scale) {
         m_nextTargetScale = scale;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
         doSetNextTargetScale();
+        if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+            return;
+        }
         Q_EMIT nextTargetScaleChanged();
+        if (sync) {
+            assignmentGeometrySyncIsCurrent(*sync);
+        }
     }
 }
 
@@ -5351,9 +5473,24 @@ OutputTransform Window::preferredBufferTransform() const
 
 void Window::setPreferredBufferTransform(OutputTransform transform)
 {
+    setPreferredBufferTransformInternal(transform);
+}
+
+void Window::setPreferredBufferTransformInternal(OutputTransform transform, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
     if (m_preferredBufferTransform != transform) {
         m_preferredBufferTransform = transform;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
         doSetPreferredBufferTransform();
+        if (sync) {
+            assignmentGeometrySyncIsCurrent(*sync);
+        }
     }
 }
 
@@ -5373,9 +5510,24 @@ const std::shared_ptr<ColorDescription> &Window::preferredColorDescription() con
 
 void Window::setPreferredColorDescription(const std::shared_ptr<ColorDescription> &description)
 {
+    setPreferredColorDescriptionInternal(description);
+}
+
+void Window::setPreferredColorDescriptionInternal(const std::shared_ptr<ColorDescription> &description, AssignmentGeometrySync *sync)
+{
+    if (sync && !assignmentGeometrySyncIsCurrent(*sync)) {
+        return;
+    }
     if (m_preferredColorDescription != description) {
         m_preferredColorDescription = description;
+        m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+        if (sync) {
+            sync->result.checkpoint.reset(new TileAssignmentFence(*this));
+        }
         doSetPreferredColorDescription();
+        if (sync) {
+            assignmentGeometrySyncIsCurrent(*sync);
+        }
     }
 }
 
