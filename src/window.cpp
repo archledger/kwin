@@ -3901,9 +3901,39 @@ void Window::commitTileFromConfigure(Tile *tile, quint64 transientGeneration)
     commitTileInternal(tile);
 }
 
-void Window::commitTileInternal(Tile *tile)
+Window::AssignmentCommitResult Window::commitTileForAssignment(Tile *target, const TileAssignmentFence &before)
 {
-    if (isDeleted() || m_tile == tile) {
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentCommitResult result;
+    if (!before.isCurrentFor(*this)) {
+        result.outcome = AssignmentCommitOutcome::Superseded;
+        return result;
+    }
+    if (target != m_requestedTile.data() || (target && target->isTransient())) {
+        return result;
+    }
+    const auto lastUsable = std::numeric_limits<quint64>::max() - 1;
+    if (m_tile != target && (m_committedTileChange >= lastUsable || m_placementContinuationRevision >= lastUsable)) {
+        return result;
+    }
+    result.outcome = AssignmentCommitOutcome::Superseded;
+    commitTileInternal(target, &result);
+    return result;
+}
+
+void Window::commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResult)
+{
+    if (isDeleted()) {
+        return;
+    }
+    if (m_tile == tile) {
+        if (guardedResult) {
+            guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
+            guardedResult->outcome = AssignmentCommitOutcome::AppliedCurrent;
+        }
         return;
     }
     ref();
@@ -3919,14 +3949,33 @@ void Window::commitTileInternal(Tile *tile)
     // A native commit can supersede placement without a geometry request or cancellation.
     m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
     const auto change = m_committedTileChange;
+    if (guardedResult) {
+        // Seal only this write, before callbacks can create newer placement intent.
+        guardedResult->checkpoint.reset(new TileAssignmentFence(*this));
+    }
 
     Q_EMIT tileChanged(tile);
 
-    if (isDeleted() || m_tile != committed || m_committedTileChange != change || change == std::numeric_limits<quint64>::max()) {
+    const auto current = [&]() {
+        return !isDeleted() && m_tile == committed && m_committedTileChange == change
+            && change != std::numeric_limits<quint64>::max()
+            && (!guardedResult || (guardedResult->checkpoint && guardedResult->checkpoint->isCurrentFor(*this)));
+    };
+    if (!current()) {
+        if (guardedResult) {
+            guardedResult->checkpoint.reset();
+        }
         return;
     }
     if (oldTileMode != quickTileMode()) {
         Q_EMIT quickTileModeChanged();
+    }
+    if (guardedResult) {
+        if (current()) {
+            guardedResult->outcome = AssignmentCommitOutcome::AppliedCurrent;
+        } else {
+            guardedResult->checkpoint.reset();
+        }
     }
 }
 
