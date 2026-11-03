@@ -25,6 +25,7 @@
 #include "wayland/display.h"
 #include "wayland/surface.h"
 #include "wayland_server.h"
+#include "waylandwindow.h"
 #include "window.h"
 #include "workspace.h"
 
@@ -267,6 +268,14 @@ private Q_SLOTS:
     void testRequestedGeometryReentrantMove();
     void testGeometrySupersession_data();
     void testGeometrySupersession();
+    void testGuardedGeometryPublication();
+    void testGuardedGeometryPublicationReentry_data();
+    void testGuardedGeometryPublicationReentry();
+    void testGuardedGeometryPublicationBoundaries_data();
+    void testGuardedGeometryPublicationBoundaries();
+    void testGuardedGeometryPublicationOutput();
+    void testGuardedGeometryPublicationOutputRemoval();
+    void testGeometryPublicationLegacy();
     void testGeometryNotificationHandoff_data();
     void testGeometryNotificationHandoff();
     void testGeometryCallbackClose_data();
@@ -3388,6 +3397,343 @@ void TestXdgShellWindow::testRequestedGeometryReentrantMove()
     QCOMPARE(window->property("requestedGeometry").value<RectF>().topLeft(), second);
     window->move(second);
     QCOMPARE(notifications, 2);
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublication()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const RectF oldFrame = window->frameGeometry();
+    const RectF oldClient = window->clientGeometry();
+    const RectF oldBuffer = window->bufferGeometry();
+    const RectF requested = window->moveResizeGeometry();
+    const RectF target(QPointF(1400, 100), oldFrame.size());
+    const auto revision = window->m_placementContinuationRevision;
+    const auto generation = window->m_geometryUpdateGeneration;
+    QStringList notifications;
+    QObject context;
+    connect(window, &Window::bufferGeometryChanged, &context, [&]() {
+        notifications << QStringLiteral("buffer");
+    });
+    connect(window, &Window::clientGeometryChanged, &context, [&]() {
+        notifications << QStringLiteral("client");
+    });
+    connect(window, &Window::frameGeometryChanged, &context, [&]() {
+        notifications << QStringLiteral("frame");
+    });
+    connect(window, &Window::outputChanged, &context, [&]() {
+        notifications << QStringLiteral("output");
+    });
+    auto before = window->makeTileAssignmentFence();
+    auto result = window->updateGeometryForAssignment(target, before);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+    QVERIFY(!before.isCurrentFor(*window));
+    QCOMPARE(window->frameGeometry(), target);
+    QCOMPARE(window->clientGeometry(), oldClient.translated(target.topLeft() - oldFrame.topLeft()));
+    QCOMPARE(window->bufferGeometry(), oldBuffer.translated(target.topLeft() - oldFrame.topLeft()));
+    QCOMPARE(window->output(), workspace()->outputs()[1]);
+    QCOMPARE(window->moveResizeGeometry(), requested);
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(window->m_geometryUpdateGeneration, generation + 1);
+    QCOMPARE(notifications, QStringList({QStringLiteral("buffer"), QStringLiteral("client"), QStringLiteral("frame"), QStringLiteral("output")}));
+    notifications.clear();
+    auto noop = window->updateGeometryForAssignment(target, *result.checkpoint);
+    QCOMPARE(noop.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(noop.checkpoint && noop.checkpoint->isCurrentFor(*window));
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(window->m_geometryUpdateGeneration, generation + 1);
+    QVERIFY(notifications.isEmpty());
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationReentry_data()
+{
+    QTest::addColumn<int>("action");
+    QTest::newRow("restore") << 0;
+    QTest::newRow("committed-tile") << 1;
+    QTest::newRow("equal-request") << 2;
+    QTest::newRow("nested-legacy") << 3;
+    QTest::newRow("nested-drain") << 4;
+    QTest::newRow("last-notification") << 5;
+    QTest::newRow("input-owner") << 6;
+    QTest::newRow("input-owner-close") << 7;
+    QTest::newRow("copied-input") << 8;
+    QTest::newRow("output-roundtrip") << 9;
+    QTest::newRow("same-output") << 10;
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationReentry()
+{
+    QFETCH(int, action);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto tile = std::make_unique<Tile>(workspace()->tileManager(window->output()));
+    const RectF target(QPointF(1400, 100), window->size());
+    const RectF replacement(QPointF(1500, 200), window->size());
+    RectF callerValue = target;
+    const auto revision = window->m_placementContinuationRevision;
+    const auto generation = window->m_geometryUpdateGeneration;
+    std::unique_ptr<TileAssignmentFence> before(new TileAssignmentFence(window->makeTileAssignmentFence()));
+    QPointer<Window> guard(window);
+    QSignalSpy buffers(window, &Window::bufferGeometryChanged);
+    QSignalSpy clients(window, &Window::clientGeometryChanged);
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    QSignalSpy outputs(window, &Window::outputChanged);
+    QObject context;
+    bool called = false;
+    bool nestedApplied = false;
+    const auto interrupt = [&]() {
+        if (called) {
+            return;
+        }
+        called = true;
+        switch (action) {
+        case 0:
+        case 5:
+            window->setGeometryRestore(RectF(30, 40, 200, 100));
+            break;
+        case 1:
+            window->commitTile(tile.get());
+            break;
+        case 2:
+            window->moveResize(window->frameGeometry());
+            break;
+        case 3:
+            window->updateGeometry(replacement);
+            break;
+        case 4: {
+            auto nestedBefore = window->makeTileAssignmentFence();
+            auto nested = window->updateGeometryForAssignment(target, nestedBefore);
+            nestedApplied = nested.outcome == Window::AssignmentStepOutcome::AppliedCurrent && nested.checkpoint && nested.checkpoint->isCurrentFor(*window);
+            break;
+        }
+        case 6:
+            before.reset();
+            break;
+        case 7:
+            before.reset();
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            QVERIFY(guard);
+            break;
+        case 8:
+            callerValue = replacement;
+            break;
+        case 9:
+            window->setOutput(workspace()->outputs()[0]);
+            window->setOutput(workspace()->outputs()[1]);
+            break;
+        case 10:
+            window->setOutput(window->output());
+            break;
+        }
+    };
+    if (action == 5) {
+        connect(window, &Window::outputChanged, &context, interrupt);
+    } else {
+        connect(window, &Window::bufferGeometryChanged, &context, interrupt);
+    }
+    auto result = window->updateGeometryForAssignment(callerValue, *before);
+    QVERIFY(called);
+    const bool current = action == 6 || action == 8 || action == 10;
+    QCOMPARE(result.outcome, current ? Window::AssignmentStepOutcome::AppliedCurrent : Window::AssignmentStepOutcome::Superseded);
+    QCOMPARE(bool(result.checkpoint), current);
+    if (action == 7) {
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    QVERIFY(guard);
+    QCOMPARE(window->frameGeometry(), action == 3 ? replacement : target);
+    const bool interruptedBeforeClient = action < 3 || action == 9;
+    QCOMPARE(clients.count(), interruptedBeforeClient ? 0 : 1);
+    QCOMPARE(frames.count(), interruptedBeforeClient ? 0 : 1);
+    int outputCount = action < 3 ? 0 : 1;
+    if (action == 9) {
+        outputCount = 2;
+    }
+    QCOMPARE(outputs.count(), outputCount);
+    const int bufferCount = action == 3 ? 2 : 1;
+    QCOMPARE(buffers.count(), bufferCount);
+    if (action == 4) {
+        QVERIFY(nestedApplied);
+        QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+        QCOMPARE(window->m_geometryUpdateGeneration, generation + 2);
+    }
+    auto drainBefore = window->makeTileAssignmentFence();
+    auto drain = window->updateGeometryForAssignment(window->frameGeometry(), drainBefore);
+    QCOMPARE(drain.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(drain.checkpoint && drain.checkpoint->isCurrentFor(*window));
+    QCOMPARE(buffers.count(), bufferCount);
+    QCOMPARE(clients.count(), 1);
+    QCOMPARE(frames.count(), 1);
+    QCOMPARE(outputs.count(), action == 9 ? 3 : 1);
+    QVERIFY(!window->m_pendingGeometryNotifications.buffer && !window->m_pendingGeometryNotifications.client
+            && !window->m_pendingGeometryNotifications.frame && !window->m_pendingGeometryNotifications.outputPending);
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationBoundaries_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("stale") << 0;
+    QTest::newRow("wrong-window") << 1;
+    QTest::newRow("placement-headroom") << 2;
+    QTest::newRow("publication-headroom") << 3;
+    QTest::newRow("last-safe-write") << 4;
+    QTest::newRow("saturated-noop") << 5;
+    QTest::newRow("invalid-input") << 6;
+    QTest::newRow("placement-noop") << 7;
+    QTest::newRow("drain-refused") << 8;
+    QTest::newRow("last-safe-drain") << 9;
+    QTest::newRow("net-zero-drain") << 10;
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationBoundaries()
+{
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    std::unique_ptr<KWayland::Client::Surface> otherSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> otherShell(Test::createXdgToplevelSurface(otherSurface.get()));
+    auto other = Test::renderAndWaitForShown(otherSurface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(other);
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (scenario == 2 || scenario == 7) {
+        window->m_placementContinuationRevision = exhausted - 1;
+    } else if (scenario == 6) {
+        window->m_placementContinuationRevision = exhausted;
+    } else if (scenario == 4) {
+        window->m_placementContinuationRevision = exhausted - 2;
+    }
+    if (scenario == 3 || scenario == 8) {
+        window->m_geometryUpdateGeneration = exhausted - 1;
+    } else if (scenario == 5) {
+        window->m_geometryUpdateGeneration = exhausted;
+    } else if (scenario == 4 || scenario == 9) {
+        window->m_geometryUpdateGeneration = exhausted - 2;
+    }
+    const auto original = window->frameGeometry();
+    const bool pending = scenario >= 8;
+    if (pending) {
+        window->m_pendingGeometryNotifications.frame = scenario == 10 ? original : original.translated(-10, 0);
+    }
+    auto before = (scenario == 1 ? other : window)->makeTileAssignmentFence();
+    if (scenario == 0) {
+        window->setGeometryRestore(RectF(10, 20, 200, 100));
+    }
+    const auto revision = window->m_placementContinuationRevision;
+    const auto generation = window->m_geometryUpdateGeneration;
+    const bool change = scenario < 5;
+    const RectF target = change ? original.translated(20, 30) : original;
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    auto result = window->updateGeometryForAssignment(target, before);
+    auto expected = Window::AssignmentStepOutcome::AppliedCurrent;
+    if (scenario == 0 || scenario == 1 || scenario == 6) {
+        expected = Window::AssignmentStepOutcome::Superseded;
+    } else if (scenario == 2 || scenario == 3 || scenario == 8) {
+        expected = Window::AssignmentStepOutcome::Refused;
+    }
+    QCOMPARE(result.outcome, expected);
+    QCOMPARE(bool(result.checkpoint), expected == Window::AssignmentStepOutcome::AppliedCurrent);
+    if (result.checkpoint) {
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+    }
+    const bool wrote = scenario == 4;
+    const bool drained = scenario == 9 || scenario == 10;
+    QCOMPARE(window->frameGeometry(), wrote ? target : original);
+    QCOMPARE(window->m_placementContinuationRevision, revision + (wrote ? 1 : 0));
+    QCOMPARE(window->m_geometryUpdateGeneration, generation + (wrote || drained ? 1 : 0));
+    QCOMPARE(frames.count(), wrote || scenario == 9 ? 1 : 0);
+    QCOMPARE(window->m_pendingGeometryNotifications.frame.has_value(), scenario == 8);
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationOutput()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    const auto geometry = window->frameGeometry();
+    const auto expected = workspace()->outputAt(geometry.center());
+    window->m_output = workspace()->outputs()[1];
+    QVERIFY(window->m_output != expected);
+    auto before = window->makeTileAssignmentFence();
+    const auto revision = window->m_placementContinuationRevision;
+    QSignalSpy outputs(window, &Window::outputChanged);
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    auto result = window->updateGeometryForAssignment(geometry, before);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+    QCOMPARE(window->output(), expected);
+    QCOMPARE(window->frameGeometry(), geometry);
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(outputs.count(), 1);
+    QVERIFY(frames.isEmpty());
+}
+
+void TestXdgShellWindow::testGuardedGeometryPublicationOutputRemoval()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    QPointer<LogicalOutput> destination = workspace()->outputs()[1];
+    const RectF target(QPointF(1400, 100), window->size());
+    auto before = window->makeTileAssignmentFence();
+    QObject context;
+    bool called = false;
+    connect(window, &Window::bufferGeometryChanged, &context, [&]() {
+        if (!called) {
+            called = true;
+            Test::setOutputConfig({Rect(0, 0, 1280, 1024)});
+        }
+    });
+    auto result = window->updateGeometryForAssignment(target, before);
+    QVERIFY(called);
+    QVERIFY(!destination);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::Superseded);
+    QVERIFY(!result.checkpoint);
+    QCOMPARE(workspace()->outputs().size(), 1);
+}
+
+void TestXdgShellWindow::testGeometryPublicationLegacy()
+{
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = static_cast<WaylandWindow *>(Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red));
+    QVERIFY(window);
+    const auto original = window->frameGeometry();
+    const auto revision = window->m_placementContinuationRevision;
+    const auto generation = window->m_geometryUpdateGeneration;
+    window->m_pendingGeometryNotifications.frame = original.translated(-10, 0);
+    QSignalSpy frames(window, &Window::frameGeometryChanged);
+    window->updateGeometry(original);
+    QVERIFY(frames.isEmpty());
+    QVERIFY(window->m_pendingGeometryNotifications.frame);
+    QCOMPARE(window->m_placementContinuationRevision, revision);
+    QCOMPARE(window->m_geometryUpdateGeneration, generation);
+    const auto target = original.translated(30, 40);
+    window->updateGeometry(target);
+    QCOMPARE(window->frameGeometry(), target);
+    QCOMPARE(window->m_placementContinuationRevision, revision + 1);
+    QCOMPARE(window->m_geometryUpdateGeneration, generation + 1);
+    QCOMPARE(frames.count(), 1);
+    QVERIFY(!window->m_pendingGeometryNotifications.frame);
 }
 
 void TestXdgShellWindow::testGeometrySupersession_data()

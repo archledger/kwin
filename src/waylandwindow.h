@@ -40,10 +40,14 @@ protected:
     std::unique_ptr<WindowItem> createItem(Item *parentItem) override;
 
     void cleanGrouping();
-    void updateGeometry(const RectF &rect);
+    KWIN_EXPORT void updateGeometry(const RectF &rect);
     void markAsMapped();
 
 private:
+    friend class ::TestXdgShellWindow;
+
+    [[nodiscard]] KWIN_EXPORT AssignmentStepResult updateGeometryForAssignment(RectF rect, const TileAssignmentFence &before);
+    void updateGeometryInternal(const RectF &rect, AssignmentStepResult *guardedResult = nullptr);
     void updateResourceName();
 
     QString m_captionNormal;
