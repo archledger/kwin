@@ -898,7 +898,7 @@ private:
     bool m_lidSwitch = false;
     bool m_tabletPad = false;
     bool m_tabletTool = false;
-    bool m_tabletToolIsRelative;
+    bool m_tabletToolIsRelative = false;
 };
 
 class ColorManagerV1 : public QtWayland::wp_color_manager_v1

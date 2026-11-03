@@ -97,6 +97,8 @@ function(integrationTest)
     endif()
 endfunction()
 
+integrationTest(NAME testStartupDefaults SRCS startup_defaults_test.cpp LIBS KF6::ConfigCore)
+
 if(KWIN_BUILD_X11)
     integrationTest(NAME testDontCrashGlxgears SRCS dont_crash_glxgears.cpp LIBS KF6::I18n KDecoration3::KDecoration)
 endif()
