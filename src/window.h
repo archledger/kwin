@@ -62,6 +62,7 @@ class VirtualDesktop;
 class WindowItem;
 class TileManager;
 class TileAssignmentFence;
+class TilesTest;
 class TransientTileController;
 class TransientNoRequestProof;
 class TransientPlacementWriter;
@@ -1759,10 +1760,12 @@ Q_SIGNALS:
 
 private:
     friend class TileAssignmentFence;
+    friend class Tile;
     friend class WaylandWindow;
     friend class XdgSurfaceWindow;
     friend class XdgToplevelWindow;
     friend class TransientTileController;
+    friend class TilesTest;
     friend class ::TestXdgShellWindow;
 
     TileAssignmentFence makeTileAssignmentFence();
@@ -1983,6 +1986,11 @@ private:
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     bool cancelTransientRequest();
     void commitTileInternal(Tile *tile, AssignmentStepResult *guardedResult = nullptr);
+    // Every actual tile membership change of this window (ordinary or transient) is recorded here
+    // before its notification, as are the otherwise-valid public membership no-ops (managing an
+    // existing member, unmanaging or forgetting a non-member), which are newer same-window intent.
+    // Refusals and internal evacuation misses record nothing. Saturating.
+    void noteTileMembershipChanged();
 
 protected:
     Window();
@@ -2371,6 +2379,7 @@ protected:
     quint64 m_requestedTileChange = 0;
     quint64 m_committedTileChange = 0;
     quint64 m_placementContinuationRevision = 0;
+    quint64 m_tileMembershipChange = 0;
 
     // electric border/quick tiling
     std::optional<ElectricBorderMode> m_electricMode = std::nullopt;
@@ -2464,6 +2473,7 @@ private:
     const quint64 m_requestedRevision;
     const quint64 m_committedRevision;
     const quint64 m_geometryGeneration;
+    const quint64 m_membershipRevision;
     const QPointer<Tile> m_requestedTile;
     const QPointer<Tile> m_committedTile;
     const bool m_hadRequestedTile;

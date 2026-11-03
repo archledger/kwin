@@ -4423,6 +4423,11 @@ TileAssignmentFence Window::makeTileAssignmentFence()
     return TileAssignmentFence(*this);
 }
 
+void Window::noteTileMembershipChanged()
+{
+    m_tileMembershipChange = nextAssociationChange(m_tileMembershipChange);
+}
+
 TileAssignmentFence::TileAssignmentFence(Window &window)
     : m_window(&window)
     , m_windowId(window.internalId())
@@ -4430,6 +4435,7 @@ TileAssignmentFence::TileAssignmentFence(Window &window)
     , m_requestedRevision(window.m_requestedTileChange)
     , m_committedRevision(window.m_committedTileChange)
     , m_geometryGeneration(window.m_geometryRequestGeneration)
+    , m_membershipRevision(window.m_tileMembershipChange)
     , m_requestedTile(window.m_requestedTile)
     , m_committedTile(window.m_tile)
     , m_hadRequestedTile(!window.m_requestedTile.isNull())
@@ -4450,11 +4456,12 @@ bool TileAssignmentFence::isCurrentFor(const Window &window) const
     const auto exhausted = std::numeric_limits<quint64>::max();
     return m_window.data() == &window && !window.isDeleted() && window.internalId() == m_windowId
         && m_placementRevision != exhausted && m_requestedRevision != exhausted
-        && m_committedRevision != exhausted && m_geometryGeneration != exhausted
+        && m_committedRevision != exhausted && m_geometryGeneration != exhausted && m_membershipRevision != exhausted
         && window.m_placementContinuationRevision == m_placementRevision
         && window.m_requestedTileChange == m_requestedRevision
         && window.m_committedTileChange == m_committedRevision
         && window.m_geometryRequestGeneration == m_geometryGeneration
+        && window.m_tileMembershipChange == m_membershipRevision
         && (!m_hadRequestedTile || !m_requestedTile.isNull())
         && (!m_hadCommittedTile || !m_committedTile.isNull())
         && window.m_requestedTile.data() == m_requestedTile.data()
