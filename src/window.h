@@ -1750,6 +1750,18 @@ private:
 
     TileAssignmentFence makeTileAssignmentFence();
 
+    enum class AssignmentCommitOutcome {
+        Refused,
+        Superseded,
+        AppliedCurrent,
+    };
+    struct AssignmentCommitResult
+    {
+        AssignmentCommitOutcome outcome = AssignmentCommitOutcome::Refused;
+        std::unique_ptr<TileAssignmentFence> checkpoint;
+    };
+    [[nodiscard]] AssignmentCommitResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
+
     enum class TransientRequestOutcome {
         Rejected,
         Superseded,
@@ -1858,7 +1870,7 @@ private:
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     bool cancelTransientRequest();
-    void commitTileInternal(Tile *tile);
+    void commitTileInternal(Tile *tile, AssignmentCommitResult *guardedResult = nullptr);
 
 protected:
     Window();
