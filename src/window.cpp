@@ -4028,7 +4028,7 @@ void Window::setTileCompatibility(Tile *tile)
         return;
     }
 
-    Tile *previousTile = m_requestedTile;
+    const QPointer<Tile> previousTile = m_requestedTile;
     if (tile && !tile->manage(this)) {
         // A refused destination must not release the previous assignment.
         return;

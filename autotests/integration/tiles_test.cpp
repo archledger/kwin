@@ -151,6 +151,8 @@ private Q_SLOTS:
     void compatibilityAssignmentRefusal();
     void compatibilityAssignmentAcrossDesktops_data();
     void compatibilityAssignmentAcrossDesktops();
+    void compatibilityPreviousTileDestruction_data();
+    void compatibilityPreviousTileDestruction();
     void transientMembershipMutations_data();
     void transientMembershipMutations();
     void transientChildDestruction_data();
@@ -448,6 +450,73 @@ void TilesTest::compatibilityAssignmentAcrossDesktops()
     QVERIFY(!window->requestedTile());
     QVERIFY(active->windows().isEmpty());
     QCOMPARE(inactive->windows(), QList<Window *>{window});
+}
+
+void TilesTest::compatibilityPreviousTileDestruction_data()
+{
+    QTest::addColumn<bool>("propertyWrite");
+    QTest::addColumn<bool>("x11");
+    QTest::newRow("wayland-direct") << false << false;
+    QTest::newRow("wayland-property") << true << false;
+#if KWIN_BUILD_X11
+    QTest::newRow("x11-direct") << false << true;
+    QTest::newRow("x11-property") << true << true;
+#endif
+}
+
+void TilesTest::compatibilityPreviousTileDestruction()
+{
+    QFETCH(bool, propertyWrite);
+    QFETCH(bool, x11);
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+#if KWIN_BUILD_X11
+    Test::XcbConnectionPtr connection;
+#endif
+    Window *window = nullptr;
+    if (x11) {
+#if KWIN_BUILD_X11
+        connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        window = createWindow(connection.get(), Rect(0, 0, 430, 310));
+#endif
+    } else {
+        surface = Test::createSurface();
+        shell = Test::createXdgToplevelSurface(surface.get());
+        window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    }
+    QVERIFY(window);
+    QPointer<Tile> previous(m_rootTile->childTile(0));
+    QPointer<Tile> target(m_rootTile->childTile(1));
+    QVERIFY(previous && target);
+    QVERIFY(previous->manage(window));
+    QSignalSpy added(target, &Tile::windowAdded);
+    QObject context;
+    bool destroyedAfterEvacuation = false;
+    connect(target, &Tile::windowAdded, &context, [&](Window *addedWindow) {
+        QCOMPARE(addedWindow, window);
+        QVERIFY(previous);
+        QVERIFY(!previous->windows().contains(window));
+        destroyedAfterEvacuation = true;
+        delete previous.data();
+    });
+
+    if (propertyWrite) {
+        QVERIFY(window->setProperty("tile", QVariant::fromValue(target.data())));
+    } else {
+        window->setTileCompatibility(target.data());
+    }
+
+    QVERIFY(destroyedAfterEvacuation);
+    QVERIFY(!previous);
+    QVERIFY(target);
+    QCOMPARE(added.count(), 1);
+    QCOMPARE(window->requestedTile(), target.data());
+    QCOMPARE(target->windows(), QList<Window *>{window});
+    QCOMPARE(window->moveResizeGeometry(), target->windowGeometry());
+    if (x11) {
+        QCOMPARE(window->tile(), target.data());
+    }
 }
 
 void TilesTest::transientMembershipMutations_data()
