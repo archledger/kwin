@@ -147,6 +147,10 @@ private Q_SLOTS:
     void transientPublicMutations_data();
     void transientPublicMutations();
     void transientRefusesDirectManagement();
+    void compatibilityAssignmentRefusal_data();
+    void compatibilityAssignmentRefusal();
+    void compatibilityAssignmentAcrossDesktops_data();
+    void compatibilityAssignmentAcrossDesktops();
     void transientMembershipMutations_data();
     void transientMembershipMutations();
     void transientChildDestruction_data();
@@ -337,6 +341,113 @@ void TilesTest::transientRefusesDirectManagement()
     QVERIFY(keptGeometry);
     QVERIFY(empty);
     QVERIFY(silent);
+}
+
+void TilesTest::compatibilityAssignmentRefusal_data()
+{
+    QTest::addColumn<bool>("propertyWrite");
+    QTest::addColumn<bool>("x11");
+    QTest::newRow("wayland-direct") << false << false;
+    QTest::newRow("wayland-property") << true << false;
+#if KWIN_BUILD_X11
+    QTest::newRow("x11-direct") << false << true;
+    QTest::newRow("x11-property") << true << true;
+#endif
+}
+
+void TilesTest::compatibilityAssignmentRefusal()
+{
+    QFETCH(bool, propertyWrite);
+    QFETCH(bool, x11);
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+#if KWIN_BUILD_X11
+    Test::XcbConnectionPtr connection;
+#endif
+    Window *window = nullptr;
+    if (x11) {
+#if KWIN_BUILD_X11
+        connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        window = createWindow(connection.get(), Rect(0, 0, 430, 310));
+#endif
+    } else {
+        surface = Test::createSurface();
+        shell = Test::createXdgToplevelSurface(surface.get());
+        window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    }
+    QVERIFY(window);
+    auto previous = m_rootTile->childTile(0);
+    auto destination = m_tileManager->rootTile(VirtualDesktopManager::self()->desktops()[1])->childTile(0);
+    QVERIFY(previous && destination);
+    QVERIFY(!window->isOnDesktop(destination->desktop()));
+    QVERIFY(previous->manage(window));
+    const auto requestedGeometry = window->moveResizeGeometry();
+    const auto committedGeometry = window->frameGeometry();
+    const auto restoreGeometry = window->geometryRestore();
+    const auto committedTile = window->tile();
+    QSignalSpy previousWindows(previous, &Tile::windowsChanged);
+    QSignalSpy destinationWindows(destination, &Tile::windowsChanged);
+    QSignalSpy requestedChanged(window, &Window::requestedTileChanged);
+    QSignalSpy committedChanged(window, &Window::tileChanged);
+
+    if (propertyWrite) {
+        QVERIFY(window->setProperty("tile", QVariant::fromValue(destination)));
+    } else {
+        window->setTileCompatibility(destination);
+    }
+
+    QCOMPARE(window->requestedTile(), previous);
+    QCOMPARE(window->tile(), committedTile);
+    QCOMPARE(previous->windows(), QList<Window *>{window});
+    QVERIFY(destination->windows().isEmpty());
+    QCOMPARE(window->moveResizeGeometry(), requestedGeometry);
+    QCOMPARE(window->frameGeometry(), committedGeometry);
+    QCOMPARE(window->geometryRestore(), restoreGeometry);
+    QVERIFY(previousWindows.isEmpty() && destinationWindows.isEmpty());
+    QVERIFY(requestedChanged.isEmpty() && committedChanged.isEmpty());
+}
+
+void TilesTest::compatibilityAssignmentAcrossDesktops_data()
+{
+    QTest::addColumn<bool>("propertyWrite");
+    QTest::newRow("direct") << false;
+    QTest::newRow("property") << true;
+}
+
+void TilesTest::compatibilityAssignmentAcrossDesktops()
+{
+    QFETCH(bool, propertyWrite);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    QVERIFY(window);
+    window->setOnAllDesktops(true);
+    auto previous = m_rootTile->childTile(0);
+    auto inactive = m_tileManager->rootTile(VirtualDesktopManager::self()->desktops()[1])->childTile(0);
+    auto active = m_rootTile->childTile(1);
+    QVERIFY(previous && inactive && active);
+    QVERIFY(previous->manage(window));
+    const auto assign = [&](Tile *tile) {
+        if (propertyWrite) {
+            return window->setProperty("tile", QVariant::fromValue(tile));
+        }
+        window->setTileCompatibility(tile);
+        return true;
+    };
+
+    QVERIFY(assign(inactive));
+    QVERIFY(previous->windows().isEmpty());
+    QCOMPARE(inactive->windows(), QList<Window *>{window});
+    QVERIFY(!window->requestedTile());
+    QVERIFY(assign(active));
+    QCOMPARE(window->requestedTile(), active);
+    QCOMPARE(active->windows(), QList<Window *>{window});
+    QCOMPARE(inactive->windows(), QList<Window *>{window});
+    QVERIFY(assign(nullptr));
+    QVERIFY(!window->requestedTile());
+    QVERIFY(active->windows().isEmpty());
+    QCOMPARE(inactive->windows(), QList<Window *>{window});
 }
 
 void TilesTest::transientMembershipMutations_data()
