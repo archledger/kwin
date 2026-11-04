@@ -196,6 +196,8 @@ protected:
 
 private:
     friend class TilesTest;
+    // The compatibility setter consumes the private steps with its own continuation.
+    friend class Window;
     // Guarded membership steps for an ordinary ingress: refusals (the backend first, a transient
     // tile, an unresizable or applet window, a window not on this desktop, a destination that is
     // not live, the follow-up association step's read-only preflight, membership headroom) before
@@ -205,7 +207,10 @@ private:
     // sealed by its own checkpoint; then the association step chaining the last checkpoint. After
     // the first mutation every stop is Superseded; nothing is rolled back and nothing falls
     // through. A destroyed destination is never read as explicit null.
-    [[nodiscard]] Window::AssignmentStepResult manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
+    // reserve: membership increments a caller's follow-up (the compatibility setter's cleanup of the
+    // original membership) will need, held back from this step's headroom: zero or one, nothing
+    // general-purpose.
+    [[nodiscard]] Window::AssignmentStepResult manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {}, quint64 reserve = 0);
     [[nodiscard]] Window::AssignmentStepResult unmanageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
     [[nodiscard]] Window::AssignmentStepResult forgetForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
     Window::AssignmentStepResult membershipNoOp(Window *window, Window::OwnedProvenance owned) const;

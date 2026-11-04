@@ -1718,6 +1718,11 @@ private:
     // when the guarded step refused without effect, or at the exhaustion edge.
     void requestTileLegacy(Tile *tile);
     void forgetTileLegacy(Tile *tile);
+    // The compatibility setter's legacy sequence (its own cancellation, verbatim) and the remainder
+    // after a cancellation: selected for a backend without guarded requests, at the exhaustion
+    // edge, or on an ingress refused without effect.
+    void setTileCompatibilityLegacy(Tile *tile);
+    void setTileCompatibilityLegacyRemainder(Tile *tile);
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
