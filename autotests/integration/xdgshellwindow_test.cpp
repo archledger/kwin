@@ -197,6 +197,43 @@ class TestXdgShellWindow : public QObject
         std::shared_ptr<RequestAuthority> m_authority;
     };
 
+    // The lifetime rows' request: its destructor records that it ran and may reenter the window
+    // through a callback the test state owns, so a result that still borrowed the request would
+    // read destroyed memory and a result that validates before the destruction would miss the
+    // reentry. The authority is the state's, never the stack's.
+    struct LifetimeState
+    {
+        QPointer<QObject> owner;
+        bool valid = true;
+        bool destroyed = false;
+        std::function<void()> onDestroy;
+    };
+
+    class LifetimeRequestForTest : public Window::TransientTileRequest
+    {
+    public:
+        LifetimeRequestForTest(Window *window, Tile *tile, std::shared_ptr<LifetimeState> state)
+            : TransientTileRequest(window, tile, 0)
+            , m_state(std::move(state))
+        {
+        }
+
+        ~LifetimeRequestForTest() override
+        {
+            m_state->destroyed = true;
+            if (m_state->onDestroy) {
+                m_state->onDestroy();
+            }
+        }
+
+    private:
+        bool authorityIsCurrent() const override
+        {
+            return m_state->owner && m_state->valid;
+        }
+        std::shared_ptr<LifetimeState> m_state;
+    };
+
 private Q_SLOTS:
     void initTestCase();
     void init();
@@ -390,6 +427,8 @@ private Q_SLOTS:
     void testTransientOwnershipWriterLoss();
     void testTransientOwnershipExhaustion();
     void testTransientOwnershipApplied();
+    void testTransientReceiptLifetime_data();
+    void testTransientReceiptLifetime();
     void testTransientConfigureProvenance_data();
     void testTransientConfigureProvenance();
     void testTransientAssociationOrigin();
@@ -10033,6 +10072,335 @@ void TestXdgShellWindow::testTransientOwnershipApplied()
     window->destroyWindow();
     QTRY_VERIFY(!guard);
     QVERIFY(!writer.isReserved(id));
+}
+
+void TestXdgShellWindow::testTransientReceiptLifetime_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("applied-current") << 0;
+    QTest::newRow("stale-after-geometry") << 1;
+    QTest::newRow("stale-after-membership-loss") << 2;
+    QTest::newRow("stale-after-association-revision") << 3;
+    QTest::newRow("stale-after-admission-authority") << 4;
+    QTest::newRow("stale-after-writer-loss") << 5;
+    QTest::newRow("stale-after-provider-retired") << 6;
+    QTest::newRow("stale-after-owned-maximize") << 7;
+    QTest::newRow("stale-after-owned-maximize-roundtrip") << 8;
+    QTest::newRow("destructor-revokes-authority") << 9;
+    QTest::newRow("destructor-moves-window") << 10;
+    QTest::newRow("prepared-no-success") << 11;
+    QTest::newRow("executing-no-success") << 12;
+    QTest::newRow("superseded-at-request-notification") << 13;
+    QTest::newRow("superseded-before-request") << 14;
+    QTest::newRow("release-no-revival") << 15;
+    QTest::newRow("provider-retired-before-apply") << 16;
+    QTest::newRow("superseded-by-client-resize") << 17;
+}
+
+void TestXdgShellWindow::testTransientReceiptLifetime()
+{
+    // The application's qualified continuation outlives the request it was validated through:
+    // current after the request's destruction while the attempt's checkpoint, the ownership and
+    // the attempt's own bindings hold; invalidated by later changes without being refreshed; never
+    // a current success for an attempt that did not finish while Owned.
+    QFETCH(int, scenario);
+    using Result = TransientPlacementWriter::Result;
+    using Outcome = Window::AssignmentStepOutcome;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto writer = std::make_unique<TransientPlacementWriter>(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer->registerProvider(provider.get());
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    const RectF target(original.x() + 40, original.y() + 30, original.width(), original.height());
+    const QRectF manual(70, 80, 240, 140);
+    QVERIFY(writer->trackWindow(id, QStringLiteral("app")));
+    QCOMPARE(writer->record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    RequestTestTile tile(window);
+    tile.setTargetForTest(target);
+    QCOMPARE(tile.windowGeometry(), target);
+    QObject owner;
+    auto state = std::make_shared<LifetimeState>();
+    state->owner = &owner;
+    // The caller's stable admission constraint: its own state, consulted with the continuation.
+    auto admission = std::make_shared<RequestAuthority>();
+    admission->owner = &owner;
+    int admissionChecks = 0;
+    const std::function<bool()> admissionConstraint = [admission, &admissionChecks]() {
+        ++admissionChecks;
+        return admission->owner && admission->valid;
+    };
+    const auto snapshot = writer->snapshot();
+    const auto generation = window->prepareTransientOwnership(writer.get(), token, QStringLiteral("app"), snapshot.providerRevision, snapshot.mapRevision,
+                                                              std::make_unique<LifetimeRequestForTest>(window, &tile, state));
+    QVERIFY(generation);
+    QVERIFY(!window->transientOwnershipIsCurrent(generation));
+    if (scenario == 11) {
+        // Prepared: reservation only. No application starts, nothing is continued, the record stays.
+        const auto application = window->applyTransientOwnershipGuarded(generation, admissionConstraint);
+        QCOMPARE(application.receipt.outcome, Window::TransientRequestOutcome::Rejected);
+        QCOMPARE(application.continuation.outcome, Outcome::Refused);
+        QVERIFY(!application.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        QCOMPARE(admissionChecks, 0);
+        QVERIFY(!state->destroyed);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Prepared);
+        QVERIFY(writer->isReserved(id));
+        QVERIFY(window->revokeTransientOwnership(generation));
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(state->destroyed);
+        QVERIFY(!writer->isReserved(id));
+        return;
+    }
+    QVERIFY(window->activateTransientOwnership(generation));
+    QVERIFY(!window->transientOwnershipIsCurrent(generation));
+    if (scenario == 16) {
+        // The provider retired before the application: revoked before any request, the
+        // continuation concluded, the record finalized without a request.
+        provider.reset();
+        const auto application = window->applyTransientOwnershipGuarded(generation, admissionConstraint);
+        QCOMPARE(application.receipt.outcome, Window::TransientRequestOutcome::Rejected);
+        QCOMPARE(application.continuation.outcome, Outcome::Superseded);
+        QVERIFY(!application.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        QVERIFY(state->destroyed);
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(!writer->isReserved(id));
+        return;
+    }
+    QObject context;
+    bool observed = false;
+    Window::TransientApplication reentrant;
+    bool reentrantOwnershipCurrent = true;
+    if (scenario == 9) {
+        // The request's destructor ends the caller's authority: the terminal validation, which
+        // runs after that destruction, sees it.
+        state->onDestroy = [admission, window, generation, &reentrantOwnershipCurrent]() {
+            admission->valid = false;
+            reentrantOwnershipCurrent = window->transientOwnershipIsCurrent(generation);
+        };
+    } else if (scenario == 10) {
+        // The request's destructor moves the window through the public path: the ownership ends
+        // while the owner is still executing.
+        state->onDestroy = [window, manual]() {
+            window->moveResize(manual);
+        };
+    } else if (scenario == 12) {
+        // A reentrant application inside the request's own notification: the owner is executing,
+        // so nothing starts and no success is exported.
+        connect(window, &Window::frameGeometryChanged, &context, [&]() {
+            if (observed) {
+                return;
+            }
+            observed = true;
+            reentrantOwnershipCurrent = window->transientOwnershipIsCurrent(generation);
+            reentrant = window->applyTransientOwnershipGuarded(generation, admissionConstraint);
+        });
+    } else if (scenario == 13) {
+        // A public move inside the request's notification: superseded after the request, the
+        // record retained as the restoration's barrier.
+        connect(window, &Window::requestedGeometryChanged, &context, [&]() {
+            if (observed) {
+                return;
+            }
+            observed = true;
+            window->moveResize(manual);
+        });
+    } else if (scenario == 14) {
+        // A public move inside the restore capture's notification: superseded before any request,
+        // the record finalized with its NoRequest proof.
+        connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+            if (observed) {
+                return;
+            }
+            observed = true;
+            window->moveResize(manual);
+        });
+    }
+    const auto application = window->applyTransientOwnershipGuarded(generation, admissionConstraint);
+    // The request's destructor ran inside the application, before its result was concluded.
+    QVERIFY(state->destroyed);
+    if (scenario == 13 || scenario == 14) {
+        QVERIFY(observed);
+        QCOMPARE(application.receipt.outcome, Window::TransientRequestOutcome::Superseded);
+        QCOMPARE(application.continuation.outcome, Outcome::Superseded);
+        QVERIFY(!application.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        if (scenario == 13) {
+            QCOMPARE(application.receipt.progress, Window::TransientRequestProgress::Requested);
+            QVERIFY(!application.receipt.noRequestProof);
+            QVERIFY(window->m_transientOwnership);
+            QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+            QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+            QVERIFY(writer->isReserved(id));
+        } else {
+            QCOMPARE(application.receipt.progress, Window::TransientRequestProgress::NoRequest);
+            QVERIFY(application.receipt.noRequestProof);
+            QVERIFY(!window->m_transientOwnership);
+            QVERIFY(!writer->isReserved(id));
+        }
+        return;
+    }
+    QCOMPARE(application.receipt.outcome, Window::TransientRequestOutcome::Applied);
+    QCOMPARE(application.receipt.progress, Window::TransientRequestProgress::Requested);
+    QCOMPARE(application.receipt.ownershipGeneration, generation);
+    QVERIFY(application.receipt.nativeSequence);
+    QCOMPARE(application.receipt.nativeSequence, window->m_transientRequestSequence);
+    QVERIFY(!application.receipt.noRequestProof);
+    QCOMPARE(window->frameGeometry(), target);
+    if (scenario == 9) {
+        // Applied, then invalidated by the destructor: no current success; the ownership itself
+        // stands (the prerequisite changes no release policy; the caller's continuation decides).
+        QVERIFY(!reentrantOwnershipCurrent);
+        QCOMPARE(application.continuation.outcome, Outcome::Superseded);
+        QVERIFY(!application.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        QVERIFY(admissionChecks >= 1);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        return;
+    }
+    if (scenario == 10) {
+        // Applied, then the ownership ended by the destructor's public move: the record went to
+        // its restoration with the attempt's progress retained, the continuation concluded.
+        QCOMPARE(application.continuation.outcome, Outcome::Superseded);
+        QVERIFY(!application.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        QCOMPARE(QRectF(window->moveResizeGeometry()), manual);
+        return;
+    }
+    // Current after the request's destruction, bound to this ownership generation.
+    QCOMPARE(application.continuation.outcome, Outcome::AppliedCurrent);
+    QVERIFY(application.continuation.checkpoint);
+    QCOMPARE(application.continuation.owned.kind, Window::OwnedProvenance::Kind::Ownership);
+    QCOMPARE(application.continuation.owned.ownership, generation);
+    QVERIFY(!application.continuation.owned.request);
+    QVERIFY(admissionChecks >= 1);
+    QVERIFY(window->transientOwnershipIsCurrent(generation));
+    QVERIFY(window->assignmentResultIsCurrent(application.continuation));
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+    QVERIFY(!window->m_transientOwnership->request);
+    QVERIFY(writer->ownsReservation(id, QString::number(generation)));
+    const int checksAfterApplication = admissionChecks;
+    QVERIFY(window->assignmentResultIsCurrent(application.continuation));
+    QCOMPARE(admissionChecks, checksAfterApplication + 1);
+    if (scenario == 12) {
+        QVERIFY(observed);
+        QVERIFY(!reentrantOwnershipCurrent);
+        QCOMPARE(reentrant.receipt.outcome, Window::TransientRequestOutcome::Rejected);
+        QCOMPARE(reentrant.continuation.outcome, Outcome::Refused);
+        QVERIFY(!reentrant.continuation.checkpoint);
+        QVERIFY(!window->assignmentResultIsCurrent(reentrant.continuation));
+    }
+    if (scenario == 0 || scenario == 12) {
+        // Evidence of this attempt, not a replay: a second application is rejected without
+        // touching the attempt, and the continuation stays current.
+        QCOMPARE(window->applyTransientOwnership(generation).outcome, Window::TransientRequestOutcome::Rejected);
+        QCOMPARE(window->m_transientRequestSequence, application.receipt.nativeSequence);
+        QVERIFY(window->assignmentResultIsCurrent(application.continuation));
+        return;
+    }
+    // A later change invalidates the continuation; the outcome field is never refreshed.
+    switch (scenario) {
+    case 1:
+        window->moveResize(manual);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        break;
+    case 2:
+        // The tile forgets its member without any fence counter moving.
+        tile.abandonWithoutForgetForTest();
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        break;
+    case 3:
+        // The association revision alone, the pointers unchanged: the checkpoint sees it.
+        window->m_requestedTileChange = window->m_requestedTileChange + 1;
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        break;
+    case 4:
+        admission->valid = false;
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        break;
+    case 5:
+        writer.reset();
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        break;
+    case 6:
+        provider.reset();
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        break;
+    case 7:
+        // An owner may be maximized: the ownership stays current, this attempt's placement does
+        // not (its request generation and its target are gone).
+        window->maximize(MaximizeFull);
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        QVERIFY(QRectF(window->moveResizeGeometry()) != QRectF(target));
+        break;
+    case 8:
+        // Back to the managed rectangle through two further requests: the target holds again, the
+        // request generation does not.
+        window->maximize(MaximizeFull);
+        window->maximize(MaximizeRestore);
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        QCOMPARE(window->moveResizeGeometry(), target);
+        break;
+    case 17: {
+        // The client resizes itself: the compositor's intended geometry and the request generation
+        // hold and the ownership stays current, but the committed frame leaves the target and its
+        // publication advances the placement continuation revision, which the checkpoint observes.
+        const auto placementBefore = window->m_placementContinuationRevision;
+        QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+        Test::render(surface.get(), QSize(260, 140), Qt::blue);
+        QVERIFY(frameChanged.wait());
+        QVERIFY(QRectF(window->frameGeometry()) != QRectF(target));
+        QCOMPARE(window->moveResizeGeometry(), target);
+        QVERIFY(window->m_placementContinuationRevision != placementBefore);
+        QVERIFY(window->transientOwnershipIsCurrent(generation));
+        break;
+    }
+    case 15: {
+        // A release of the applied attempt keeps the record as the restoration's barrier (no
+        // readmission is possible on this window while it stands), and bringing the window back to
+        // the exact target through the public path revives nothing.
+        QVERIFY(!window->revokeTransientOwnership(generation));
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(!window->transientOwnershipIsCurrent(generation));
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        window->moveResize(target);
+        QCOMPARE(window->moveResizeGeometry(), target);
+        QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
+        QObject replacementProvider;
+        const auto replacementToken = writer->registerProvider(&replacementProvider);
+        const auto replacement = writer->snapshot();
+        QCOMPARE(window->prepareTransientOwnership(writer.get(), replacementToken, QStringLiteral("app"), replacement.providerRevision, replacement.mapRevision,
+                                                   std::make_unique<LifetimeRequestForTest>(window, &tile, std::make_shared<LifetimeState>())),
+                 quint64(0));
+        break;
+    }
+    default:
+        QFAIL("unhandled scenario");
+    }
+    QCOMPARE(application.continuation.outcome, Outcome::AppliedCurrent);
+    QVERIFY(!window->assignmentResultIsCurrent(application.continuation));
 }
 
 void TestXdgShellWindow::testTransientConfigureProvenance_data()

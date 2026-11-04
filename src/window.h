@@ -1980,6 +1980,24 @@ private:
         QUuid windowId;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
     };
+    // The application of an ownership with its qualified continuation, for a caller that goes on
+    // after it (the admission's publication). The receipt is the one applyTransientOwnership
+    // returns: this attempt's progress, identity and NoRequest proof, the restoration's evidence.
+    // The continuation supplements it: AppliedCurrent only for an applied attempt whose checkpoint
+    // (the one the native request validated itself against, taken right after its association
+    // install and preserved exactly) and stable provenance (the ownership generation, with this
+    // attempt's native sequence and progress, its allocated request generation and its target
+    // bound by value, chained with the caller's admission constraint) still hold at the terminal
+    // validation, after the request's destruction and the end of the execution. Superseded, with
+    // no checkpoint, for an attempt that ended without a current application, whether it was
+    // rejected, superseded or applied and then invalidated before that validation; Refused when
+    // the application did not start. It is evidence of this attempt, never a permission to replay
+    // it, and is never refreshed: a later change is seen by assignmentResultIsCurrent, not here.
+    struct TransientApplication
+    {
+        TransientRequestReceipt receipt;
+        AssignmentStepResult continuation;
+    };
     class TransientTileRequest
     {
     public:
@@ -2059,6 +2077,11 @@ private:
                                       quint64 providerRevision, quint64 mapRevision, std::unique_ptr<TransientTileRequest> request);
     bool activateTransientOwnership(quint64 generation);
     TransientRequestReceipt applyTransientOwnership(quint64 generation);
+    // The same application with its continuation (see TransientApplication). The admission
+    // constraint is the caller's own stable validity (the controller, tree and admission bindings
+    // the window cannot observe), evaluated with the continuation at every later boundary; it must
+    // own its state, never borrow the request's.
+    TransientApplication applyTransientOwnershipGuarded(quint64 generation, std::function<bool()> admissionConstraint = {});
     // With a result, the release's own callback-free writes are inside a checkpoint taken before
     // its notifications and validated once after its finalization (never refreshed): the caller's
     // continuation is AppliedCurrent only if nothing foreign changed. Without one, unchanged.
@@ -2070,6 +2093,13 @@ private:
     bool finishTransientRelease(quint64 generation);
     std::shared_ptr<const TransientNoRequestProof> makeTransientNoRequestProof(const TransientTileRequest &request);
     TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request);
+    // The request with its continuation translated while the request still exists: written only
+    // for an applied attempt (its outcome provisional until the caller's terminal validation);
+    // untouched otherwise, the caller concludes it.
+    TransientRequestReceipt requestTransientTile(std::unique_ptr<TransientTileRequest> request, AssignmentStepResult *continuation,
+                                                 const std::function<bool()> &admissionConstraint);
+    void translateTransientContinuation(const TransientTileRequest &request, AssignmentStepResult &validated,
+                                        const std::function<bool()> &admissionConstraint, AssignmentStepResult &continuation) const;
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     bool cancelTransientRequest();
