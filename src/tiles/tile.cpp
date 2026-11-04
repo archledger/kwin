@@ -736,8 +736,9 @@ Window::AssignmentStepResult Tile::manageForAssignment(Window *window, const Til
         result.outcome = Outcome::Superseded;
         return result;
     }
-    // Mutation-free rejections, the backend first: a backend whose protocol state commits
-    // immediately has no guarded membership step at all.
+    // Mutation-free rejections, the backend first: a backend without guarded geometry requests has
+    // no guarded membership step; X11, whose protocol state commits immediately, supports them
+    // where that commit can happen (a managed window whose geometry updates are not blocked).
     if (isTransient() || !window->supportsAssignmentGeometryRequest() || !window->isResizable() || window->isAppletPopup()
         || !window->isOnDesktop(m_desktop) || !destinationIsLive()) {
         return result;

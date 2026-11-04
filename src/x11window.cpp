@@ -1952,7 +1952,7 @@ void X11Window::doSetQuickTileMode()
     commitTile(requestedTile());
 }
 
-void X11Window::updateAllowedActions(bool force)
+void X11Window::updateAllowedActions(bool force, const std::function<bool()> &proceed)
 {
     if (!isManaged() && !force) {
         return;
@@ -1988,12 +1988,21 @@ void X11Window::updateAllowedActions(bool force)
     const NET::Actions relevant = ~(NET::ActionMove | NET::ActionResize);
     if ((allowed_actions & relevant) != (old_allowed_actions & relevant)) {
         if ((allowed_actions & NET::ActionMinimize) != (old_allowed_actions & NET::ActionMinimize)) {
+            if (proceed && !proceed()) {
+                return;
+            }
             Q_EMIT minimizeableChanged(allowed_actions & NET::ActionMinimize);
         }
         if ((allowed_actions & NET::ActionMax) != (old_allowed_actions & NET::ActionMax)) {
+            if (proceed && !proceed()) {
+                return;
+            }
             Q_EMIT maximizeableChanged(allowed_actions & NET::ActionMax);
         }
         if ((allowed_actions & NET::ActionClose) != (old_allowed_actions & NET::ActionClose)) {
+            if (proceed && !proceed()) {
+                return;
+            }
             Q_EMIT closeableChanged(allowed_actions & NET::ActionClose);
         }
     }
@@ -3461,6 +3470,198 @@ void X11Window::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
     moveResizeGuardedInternal(rect, mode, nullptr);
 }
 
+// The decoration signals' re-entrancy guard, shared by the legacy maximize and the normalization's
+// preflight.
+static bool changeMaximizeRecursion = false;
+
+void X11Window::writeMaximizeMode(MaximizeMode mode)
+{
+    max_mode = mode;
+    if (m_maximizeModeRevision != std::numeric_limits<quint64>::max()) {
+        ++m_maximizeModeRevision;
+    }
+}
+
+X11Window::GeometryConstraints X11Window::geometryConstraints() const
+{
+    GeometryConstraints constraints;
+    constraints.minimum = minSize();
+    constraints.maximum = maxSize();
+    constraints.resizeIncrements = resizeIncrements();
+    constraints.hasBaseSize = m_geometryHints.hasBaseSize();
+    constraints.baseSize = Xcb::fromXNative(m_geometryHints.baseSize());
+    constraints.hasAspect = m_geometryHints.hasAspect();
+    constraints.minAspect = m_geometryHints.minAspect();
+    constraints.maxAspect = m_geometryHints.maxAspect();
+    constraints.decorated = isDecorated();
+    constraints.decorationPolicy = m_decorationPolicy;
+    constraints.clientFrameExtents = m_clientFrameExtents;
+    constraints.xwaylandScale = kwinApp()->xwaylandScale();
+    return constraints;
+}
+
+RectF X11Window::prospectiveRestoreGeometry(MaximizeMode oldMode, const RectF &geometry) const
+{
+    RectF restore = geometry;
+    if (oldMode & MaximizeVertical) {
+        restore.setTop(geometryRestore().top());
+        restore.setBottom(geometryRestore().bottom());
+    }
+    if (oldMode & MaximizeHorizontal) {
+        restore.setLeft(geometryRestore().left());
+        restore.setRight(geometryRestore().right());
+    }
+    return restore;
+}
+
+bool X11Window::canNormalizeMaximizeForAssignment() const
+{
+    // Mutation-free refusals, the same predicate an ingress preflights before any of its own
+    // mutations. Beyond the ordinary ones (the decoration recursion guard, an owner or an active
+    // request, an unresizable or applet-popup window, an interactive or electric-border operation,
+    // a rule-forced maximize, an unsupported request): a fullscreen window, whose legacy restore
+    // is the fullscreen area and no normalization for tiling; a decorated window or the
+    // borderless-maximized policy, whose decoration transition writes geometry through public
+    // paths on X11 (excluded until it is routed through the operation); an invalid prospective
+    // restore rectangle, which the legacy path places with intermediate writes. The headroom covers
+    // the mode revision, the restore capture's placement increment plus the guarded request's
+    // worst case, and the request's own generations, so a shortage known at entry refuses rather
+    // than superseding after the mode write.
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (changeMaximizeRecursion || m_transientOwnership || m_activeTransientRequest || !isResizable() || isAppletPopup()
+        || isInteractiveMoveResize() || isElectricBorderMaximizing() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
+        || !supportsAssignmentGeometryRequest() || isFullScreen() || isDecorated() || options->borderlessMaximizedWindows()) {
+        return false;
+    }
+    if (max_mode != MaximizeRestore && !prospectiveRestoreGeometry(max_mode, moveResizeGeometry()).isValid()) {
+        return false;
+    }
+    return m_maximizeModeRevision < exhausted - 1 && m_placementContinuationRevision < exhausted - assignmentPlacementBudget
+        && m_geometryRequestGeneration < exhausted - 1 && m_geometryUpdateGeneration < exhausted - 1;
+}
+
+Window::AssignmentStepResult X11Window::normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    if (!canNormalizeMaximizeForAssignment()) {
+        return result;
+    }
+    // The constraints frozen before the first callback; the receipt pins them with the revision of
+    // the mode write, chained onto the incoming provenance and captured by value.
+    const GeometryConstraints entryConstraints = geometryConstraints();
+    const auto receiptFor = [this, owned](quint64 revision, const GeometryConstraints &constraints) {
+        return owned.withConstraint([this, revision, constraints]() {
+            return !isDeleted() && m_maximizeModeRevision == revision && geometryConstraints() == constraints;
+        });
+    };
+    const MaximizeMode oldMode = max_mode;
+    if (oldMode == MaximizeRestore) {
+        // An operation-owned no-op: nothing recorded, a fresh checkpoint, the receipt still detects
+        // a later mode change.
+        result.owned = receiptFor(m_maximizeModeRevision, entryConstraints);
+        result.checkpoint = makeTileAssignmentCheckpoint();
+        result.outcome = assignmentResultIsCurrent(result) ? AssignmentStepOutcome::AppliedCurrent : AssignmentStepOutcome::Superseded;
+        if (result.outcome != AssignmentStepOutcome::AppliedCurrent) {
+            result.checkpoint.reset();
+        }
+        return result;
+    }
+    // The validated entry state as an owned snapshot: the caller's fence is borrowed and a handler
+    // may destroy it, so it is never read again after the first callback. The entry frame is what
+    // the legacy restore capture reads.
+    const TileAssignmentFence entry = makeTileAssignmentFence();
+    const RectF entryFrame = frameGeometry();
+    const auto revisionBefore = m_maximizeModeRevision;
+    Q_EMIT maximizedAboutToChange(MaximizeRestore);
+    if (isDeleted() || !entry.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned) || m_maximizeModeRevision != revisionBefore
+        || geometryConstraints() != entryConstraints) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    writeMaximizeMode(MaximizeRestore);
+    const auto revision = m_maximizeModeRevision;
+    // From here every stop is a supersession: the mode is written, and its publication is this
+    // write's own obligation, gated by the live window and this revision alone, discharged below
+    // whatever the geometry's outcome.
+    result.outcome = AssignmentStepOutcome::Superseded;
+    const auto written = makeTileAssignmentFence();
+    const OwnedProvenance receipt = receiptFor(revision, entryConstraints);
+    const auto modeCurrent = [this, revision]() {
+        return !isDeleted() && m_maximizeModeRevision == revision;
+    };
+    AssignmentStepResult request;
+    const bool applied = [&]() {
+        // The legacy restore capture, exactly and before the decoration transition point: only the
+        // axes that were not maximized are refreshed from the entry frame, nothing while a quick
+        // tile is already requested.
+        std::unique_ptr<TileAssignmentFence> afterRestore;
+        if (requestedQuickTileMode() == QuickTileMode(QuickTileFlag::None)) {
+            RectF savedGeometry = geometryRestore();
+            if (!(oldMode & MaximizeVertical)) {
+                savedGeometry.setTop(entryFrame.y());
+                savedGeometry.setHeight(entryFrame.height());
+            }
+            if (!(oldMode & MaximizeHorizontal)) {
+                savedGeometry.setLeft(entryFrame.x());
+                savedGeometry.setWidth(entryFrame.width());
+            }
+            auto restore = setGeometryRestoreForAssignment(savedGeometry, written, receipt);
+            if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(restore)) {
+                return false;
+            }
+            afterRestore = std::move(restore.checkpoint);
+        }
+        const TileAssignmentFence &checkpoint = afterRestore ? *afterRestore : written;
+        // The decoration transition point: nothing runs here for the undecorated window. The final
+        // rectangle is read after it, as the legacy Restore branch reads its starting geometry
+        // after the decoration reactions; a validity lost since the preflight is a supersession.
+        RectF geometry = prospectiveRestoreGeometry(oldMode, moveResizeGeometry());
+        if (!geometry.isValid()) {
+            return false;
+        }
+        geometry.setSize(constrainFrameSize(geometry.size()));
+        auto guarded = requestMoveResizeGuarded(geometry, MoveResizeMode::MoveResize, checkpoint, receipt);
+        if (guarded.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(guarded.result)) {
+            return false;
+        }
+        markAsPlaced();
+        request = std::move(guarded.result);
+        return true;
+    }();
+    // The publication, in the legacy order: the state property (no callback), the allowed actions
+    // (each of its notifications behind the mode-write predicate), the maximize rules, and the
+    // mode notification last. It completes before the outcome is decided.
+    if (modeCurrent()) {
+        info->setState(NET::States(), NET::Max);
+        updateAllowedActions(false, modeCurrent);
+        if (modeCurrent()) {
+            updateWindowRules(Rules::MaximizeVert | Rules::MaximizeHoriz);
+        }
+        if (modeCurrent()) {
+            Q_EMIT maximizedChanged();
+        }
+    }
+    if (!applied) {
+        return result;
+    }
+    // AppliedCurrent needs the full validation, checkpoint and provenance, after the publication's
+    // own callbacks; it is the synchronous request completed while current, not the client's
+    // acknowledgement.
+    if (!assignmentResultIsCurrent(request)) {
+        request.checkpoint.reset();
+        return result;
+    }
+    return request;
+}
+
 void X11Window::moveResizeGuardedInternal(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded)
 {
     if (isUnmanaged()) {
@@ -3670,7 +3871,6 @@ void X11Window::configure(const Rect &nativeGeometry)
     }
 }
 
-static bool changeMaximizeRecursion = false;
 void X11Window::maximize(MaximizeMode mode, const RectF &restore)
 {
     if (isUnmanaged()) {
@@ -3710,7 +3910,7 @@ void X11Window::maximize(MaximizeMode mode, const RectF &restore)
     }
 
     Q_EMIT maximizedAboutToChange(mode);
-    max_mode = mode;
+    writeMaximizeMode(mode);
 
     // save sizes for restoring, if maximalizing
     QSizeF sz = size();
