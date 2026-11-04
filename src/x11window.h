@@ -277,10 +277,44 @@ protected:
     void doSetQuickTileMode() override;
     bool supportsAssignmentGeometryRequest() const override;
     bool assignmentPublishesImmediately() const override;
+    // The X11 normalization of a maximized window for an ordinary guarded ingress (NT02.5a2b2c2a):
+    // the undecorated window only. The decoration transition writes geometry through public paths
+    // on X11 and stays excluded until it is routed through the operation.
+    bool canNormalizeMaximizeForAssignment() const override;
+    AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {}) override;
     void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request) override;
     void publishRequestedTileForAssignment(AssignmentStepResult *carrier) override;
     // The native move-resize body, shared by the legacy path (no carrier) and the guarded dispatch.
     void moveResizeGuardedInternal(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded);
+    // Every input of the client-size constraint and of the frame/client conversion, by value: a
+    // normalization's receipt pins them, so a change at any boundary supersedes it even when the
+    // minimum and maximum stay equal.
+    struct GeometryConstraints
+    {
+        QSizeF minimum;
+        QSizeF maximum;
+        QSizeF resizeIncrements;
+        bool hasBaseSize = false;
+        QSizeF baseSize;
+        bool hasAspect = false;
+        QSize minAspect;
+        QSize maxAspect;
+        bool decorated = false;
+        DecorationPolicy decorationPolicy = DecorationPolicy::ClientPreference;
+        QMarginsF clientFrameExtents;
+        qreal xwaylandScale = 1;
+        bool operator==(const GeometryConstraints &other) const = default;
+    };
+    GeometryConstraints geometryConstraints() const;
+    // The legacy Restore rectangle before its size constraint: the maximized axes from the stored
+    // restore, the others from the given geometry. Read-only; invalid when the stored axes are.
+    RectF prospectiveRestoreGeometry(MaximizeMode oldMode, const RectF &geometry) const;
+    // The one runtime writer of the maximize mode, the legacy path included: every write advances
+    // the saturating revision a normalization's receipt pins, so a change away and back cannot
+    // revive it.
+    void writeMaximizeMode(MaximizeMode mode);
+    quint64 m_maximizeModeRevision = 0;
+    friend class TilesTest;
     // Notifications a superseded update left undelivered: the next committed update announces them
     // from the oldest unannounced value, so every transition is announced exactly once.
     struct PendingGeometryNotifications
@@ -304,7 +338,9 @@ Q_SIGNALS:
 private:
     void exportMappingState(int s); // ICCCM 4.1.3.1, 4.1.4, NETWM 2.5.1
     bool isManaged() const; ///< Returns false if this client is not yet managed
-    void updateAllowedActions(bool force = false);
+    // With a predicate, every notification is emitted only while it holds (a normalization's
+    // mode write must still be current before each one).
+    void updateAllowedActions(bool force = false, const std::function<bool()> &proceed = {});
     Rect fullscreenMonitorsArea(NETFullscreenMonitors topology) const;
     void getResourceClass();
     void getWmNormalHints();
