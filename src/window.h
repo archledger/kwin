@@ -1863,6 +1863,32 @@ private:
     // the backend; Superseded once a boundary ends it after the mode write; AppliedCurrent carries
     // the request's checkpoint and a provenance whose constraint every later step evaluates.
     [[nodiscard]] virtual AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {});
+    // A read-only check, never a grant: whether the backend's normalization step would refuse now
+    // (its mutation-free refusals, including its own headroom). The base backend has no step.
+    virtual bool canNormalizeMaximizeForAssignment() const;
+    // The guarded request's worst case in placement continuation increments: one restore capture,
+    // at most seven synchronization writes and one committed change.
+    static constexpr quint64 assignmentPlacementBudget = 1 + 7 + 1;
+    // A read-only check, never a grant: whether requestTileForAssignment(tile, ...) would refuse now.
+    // Mutation-free refusals (a transient tile, a backend without guarded requests, an owner or an
+    // active request, a transient-generation marker no ordinary step may consume, an interactive
+    // operation, the normalization's own refusals when tiling a maximized window) and the whole
+    // path's conservative headroom (the normalization's capture and request, then this step's).
+    bool canRequestTileForAssignment(Tile *tile) const;
+    // The guarded requested-association step for an ordinary ingress: its own recorded writes and
+    // guarded child calls (the 2d2 normalization when needed, whose receipt is carried forward; the
+    // restore capture; the association write; the geometry request), the quick-tile protocol state
+    // and notification as an obligation of the association write discharged while that write is
+    // current even when the geometry request stopped, and one terminal validation before the
+    // result is returned. Refused only without any effect; after the first effect every stop is
+    // Superseded. The interactive untiling adjustment stays on the legacy path, which this step
+    // never reaches because interactive operations are refused.
+    [[nodiscard]] AssignmentStepResult requestTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned = {});
+    [[nodiscard]] AssignmentStepResult forgetTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned = {});
+    // The public bodies after their cancellation, verbatim: selected by the public entry points
+    // when the guarded step refused without effect, or at the exhaustion edge.
+    void requestTileLegacy(Tile *tile);
+    void forgetTileLegacy(Tile *tile);
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
