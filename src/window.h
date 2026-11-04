@@ -1885,6 +1885,8 @@ private:
     // never reaches because interactive operations are refused.
     [[nodiscard]] AssignmentStepResult requestTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned = {});
     [[nodiscard]] AssignmentStepResult forgetTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned = {});
+    // A read-only check, never a grant: whether forgetTileForAssignment would refuse now.
+    bool canForgetTileForAssignment() const;
     // The public bodies after their cancellation, verbatim: selected by the public entry points
     // when the guarded step refused without effect, or at the exhaustion edge.
     void requestTileLegacy(Tile *tile);

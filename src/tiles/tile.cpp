@@ -415,6 +415,11 @@ bool Tile::manage(Window *window)
     if (isTransient()) {
         return false;
     }
+    if (!window || window->isDeleted()) {
+        // A deleted window is never reported as current successful management, not even as an
+        // existing member: nothing can continue from it and nothing is stamped.
+        return false;
+    }
     if (!window->isResizable() || window->isAppletPopup()) {
         return false;
     }
@@ -427,6 +432,55 @@ bool Tile::manage(Window *window)
 
     // If the window is not on the same tile's desktop
     // it can't be added
+    if (!window->isOnDesktop(m_desktop)) {
+        return false;
+    }
+
+    // The public entry point establishes its own operation after the mutation-free rejections: the
+    // qualified cancellation is its single stamp (a valid manual intent revokes automatic ownership
+    // before any new membership is published), a current continuation enters the guarded step, a
+    // refusal without effect selects the legacy remainder, and a supersession stops here with false.
+    // The destination's identity is held across the cancellation's callbacks; nothing is entered
+    // after it disappeared.
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    const auto context = assignmentContext(window);
+    auto preparation = window->cancelTransientRequestForAssignment();
+    if (preparation.outcome == Window::AssignmentStepOutcome::Superseded || !self) {
+        return false;
+    }
+    if (preparation.outcome == Window::AssignmentStepOutcome::AppliedCurrent) {
+        if (!context()) {
+            // The cancellation's callbacks changed the destination's context: the operation does
+            // not capture that changed state as fresh.
+            return false;
+        }
+        const auto step = manageForAssignment(window, *preparation.checkpoint);
+        if (step.outcome == Window::AssignmentStepOutcome::AppliedCurrent) {
+            return true;
+        }
+        if (step.outcome == Window::AssignmentStepOutcome::Superseded) {
+            return false;
+        }
+        return manageLegacy(window);
+    }
+    // Refused for exhaustion before the stamp: the legacy cancellation keeps today's behaviour at
+    // that edge. This is a legacy exclusion, not a guarded continuation.
+    window->cancelTransientRequest();
+    return self && manageLegacy(window);
+}
+
+bool Tile::manageLegacy(Window *window)
+{
+    // The cancellation's callbacks ran before this remainder: the same-window no-op rule applies
+    // at its entry, and the desktop check is the legacy body's own.
+    if (m_windows.contains(window)) {
+        window->noteTileMembershipChanged();
+        return true;
+    }
     if (!window->isOnDesktop(m_desktop)) {
         return false;
     }
@@ -475,6 +529,49 @@ bool Tile::unmanage(Window *window)
     if (isTransient()) {
         return releaseTransientWindow(window);
     }
+    if (!window || !m_windows.contains(window)) {
+        // The legacy miss: a membership-only stamp, never a cancellation; a null argument stays a
+        // plain miss.
+        if (window) {
+            window->noteTileMembershipChanged();
+        }
+        return false;
+    }
+    if (window->isDeleted()) {
+        // Nothing can continue from a deleted window (its qualified cancellation is stale by
+        // design), but a dead member must still be released: the legacy membership-only removal,
+        // on which the workspace's removal notification relies. No cancellation, no guarded step.
+        return unmanageLegacy(window);
+    }
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    auto preparation = window->cancelTransientRequestForAssignment();
+    if (preparation.outcome == Window::AssignmentStepOutcome::Superseded || !self) {
+        return false;
+    }
+    if (preparation.outcome == Window::AssignmentStepOutcome::AppliedCurrent) {
+        if (!m_windows.contains(window)) {
+            // The cancellation's callbacks removed the membership: newer intent, nothing to do here.
+            return false;
+        }
+        const auto step = unmanageForAssignment(window, *preparation.checkpoint);
+        if (step.outcome == Window::AssignmentStepOutcome::AppliedCurrent) {
+            return true;
+        }
+        if (step.outcome == Window::AssignmentStepOutcome::Superseded) {
+            return false;
+        }
+        return unmanageLegacy(window);
+    }
+    window->cancelTransientRequest();
+    return self && unmanageLegacy(window);
+}
+
+bool Tile::unmanageLegacy(Window *window)
+{
     if (!remove(window)) {
         // Nothing to remove: still newer same-window intent for any older operation (conservative
         // rule); a transient target above keeps its refusal contract instead. A null argument
@@ -497,6 +594,43 @@ void Tile::forget(Window *window)
         releaseTransientWindow(window);
         return;
     }
+    if (!window || !m_windows.contains(window)) {
+        if (window) {
+            window->noteTileMembershipChanged();
+        }
+        return;
+    }
+    if (window->isDeleted()) {
+        forgetLegacy(window);
+        return;
+    }
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    auto preparation = window->cancelTransientRequestForAssignment();
+    if (preparation.outcome == Window::AssignmentStepOutcome::Superseded || !self) {
+        return;
+    }
+    if (preparation.outcome == Window::AssignmentStepOutcome::AppliedCurrent) {
+        if (!m_windows.contains(window)) {
+            return;
+        }
+        if (forgetForAssignment(window, *preparation.checkpoint).outcome != Window::AssignmentStepOutcome::Refused) {
+            return;
+        }
+        forgetLegacy(window);
+        return;
+    }
+    window->cancelTransientRequest();
+    if (self) {
+        forgetLegacy(window);
+    }
+}
+
+void Tile::forgetLegacy(Window *window)
+{
     if (remove(window)) {
         window->forgetTile(this);
     } else if (window) {
@@ -532,6 +666,292 @@ bool Tile::remove(Window *window)
 QList<KWin::Window *> Tile::windows() const
 {
     return m_windows;
+}
+
+bool Tile::destinationIsLive() const
+{
+    // The teardown flag is set only by the manager's destructor: a live destination is validated
+    // against the workspace's current outputs and desktops.
+    return m_tiling && !m_tiling->tearingDown() && m_tiling->output() && workspace()->outputs().contains(m_tiling->output())
+        && m_desktop && VirtualDesktopManager::self()->desktops().contains(m_desktop);
+}
+
+Window::AssignmentStepResult Tile::membershipNoOp(Window *window, Window::OwnedProvenance owned) const
+{
+    // An operation-owned no-op: nothing written, no stamp (the public entry stamps), a fresh
+    // checkpoint, the incoming provenance preserved.
+    Window::AssignmentStepResult result;
+    result.owned = std::move(owned);
+    result.checkpoint = window->makeTileAssignmentCheckpoint();
+    if (window->assignmentResultIsCurrent(result)) {
+        result.outcome = Window::AssignmentStepOutcome::AppliedCurrent;
+    } else {
+        result.outcome = Window::AssignmentStepOutcome::Superseded;
+        result.checkpoint.reset();
+    }
+    return result;
+}
+
+std::function<bool()> Tile::assignmentContext(Window *window) const
+{
+    const QPointer<const Tile> self(this);
+    const QPointer<TileManager> manager(m_tiling);
+    const QPointer<VirtualDesktop> desktop(m_desktop);
+    const QPointer<Tile> parent(m_parentTile);
+    const bool hadParent = m_parentTile;
+    const bool active = isActive();
+    const RectF target = windowGeometry();
+    const QPointer<Window> guarded(window);
+    const QList<VirtualDesktop *> desktops = window->desktops();
+    return [self, manager, desktop, parent, hadParent, active, target, guarded, desktops]() {
+        return self && manager && desktop && guarded && !guarded->isDeleted() && self->m_tiling == manager && self->m_desktop == desktop
+            && self->destinationIsLive() && (!hadParent || parent) && self->m_parentTile == parent.data() && self->isActive() == active
+            && self->windowGeometry() == target && guarded->desktops() == desktops;
+    };
+}
+
+void Tile::removeForAssignment(Window *window, std::unique_ptr<TileAssignmentFence> &checkpoint, const std::function<bool()> &current)
+{
+    // The guarded removal: the write and its revision, the checkpoint sealing them, then the two
+    // notifications as the write's obligation, the second only while the operation's complete
+    // currentness (the caller's context, provenance and the checkpoint just taken) still holds.
+    m_windows.removeOne(window);
+    window->noteTileMembershipChanged();
+    checkpoint = window->makeTileAssignmentCheckpoint();
+    const QPointer<Tile> self(this);
+    Q_EMIT windowRemoved(window);
+    if (self && current()) {
+        Q_EMIT windowsChanged();
+    }
+}
+
+Window::AssignmentStepResult Tile::manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned)
+{
+    using Outcome = Window::AssignmentStepOutcome;
+    Window::AssignmentStepResult result;
+    if (!window) {
+        return result;
+    }
+    if (!before.isCurrentFor(*window) || !window->ownedProvenanceIsCurrent(owned)) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    // Mutation-free rejections, the backend first: a backend whose protocol state commits
+    // immediately has no guarded membership step at all.
+    if (isTransient() || !window->supportsAssignmentGeometryRequest() || !window->isResizable() || window->isAppletPopup()
+        || !window->isOnDesktop(m_desktop) || !destinationIsLive()) {
+        return result;
+    }
+    if (m_windows.contains(window)) {
+        return membershipNoOp(window, std::move(owned));
+    }
+    // The worklist, collected without callbacks: every tile of this desktop across outputs that
+    // holds the window, with its manager and desktop captured. Source outputs need not stay
+    // registered; the destination must.
+    struct Source
+    {
+        QPointer<Tile> tile;
+        QPointer<TileManager> manager;
+        QPointer<VirtualDesktop> desktop;
+    };
+    QList<Source> sources;
+    const auto outputs = workspace()->outputs();
+    for (LogicalOutput *output : outputs) {
+        TileManager *manager = workspace()->tileManager(output);
+        if (!manager) {
+            continue;
+        }
+        for (Tile *root : {static_cast<Tile *>(manager->rootTile(m_desktop)), static_cast<Tile *>(manager->quickRootTile(m_desktop))}) {
+            if (root) {
+                root->visitDescendants([&sources, window](Tile *tile) {
+                    if (tile->m_windows.contains(window)) {
+                        sources.append(Source{tile, tile->m_tiling, tile->m_desktop});
+                    }
+                });
+            }
+        }
+    }
+    const bool active = isActive();
+    const bool evacuates = !sources.isEmpty();
+    // The follow-up's read-only preflight before any mutation: the association when this desktop
+    // is active, the null association when an inactive one evacuates; and this step's own
+    // membership headroom, one increment per removal and one for the addition.
+    if ((active && !window->canRequestTileForAssignment(this)) || (!active && evacuates && !window->canRequestTileForAssignment(nullptr))) {
+        return result;
+    }
+    const quint64 increments = quint64(sources.size()) + 1;
+    if (window->m_tileMembershipChange >= std::numeric_limits<quint64>::max() - increments) {
+        return result;
+    }
+    // The frozen context as a predicate (the Window retained): composed into every continuation
+    // of this step together with the incoming provenance and the current checkpoint, and chained
+    // into the provenance the association step receives and returns, so its own callbacks are held
+    // to the same context.
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    const auto context = assignmentContext(window);
+    const Window::OwnedProvenance chained = owned.withConstraint(context);
+    std::unique_ptr<TileAssignmentFence> checkpoint = window->makeTileAssignmentCheckpoint();
+    const auto current = [&]() {
+        return window->ownedProvenanceIsCurrent(chained) && checkpoint && checkpoint->isCurrentFor(*window);
+    };
+    for (const Source &source : std::as_const(sources)) {
+        if (!current()) {
+            result.outcome = Outcome::Superseded;
+            return result;
+        }
+        if (!source.tile || !source.tile->m_windows.contains(window)) {
+            // Gone or emptied while the checkpoint still validates: this window's membership did
+            // not change there (a destroyed source that held it would have changed it).
+            continue;
+        }
+        if (source.tile->m_tiling != source.manager || source.tile->m_desktop != source.desktop) {
+            // A source moved to another manager or desktop is foreign context, not a miss.
+            result.outcome = Outcome::Superseded;
+            return result;
+        }
+        source.tile->removeForAssignment(window, checkpoint, current);
+    }
+    if (!current()) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    // The addition, sealed by its own checkpoint, its notifications as its obligation (the second
+    // only while the complete currentness holds).
+    m_windows.append(window);
+    window->noteTileMembershipChanged();
+    checkpoint = window->makeTileAssignmentCheckpoint();
+    Q_EMIT windowAdded(window);
+    if (self && current()) {
+        Q_EMIT windowsChanged();
+    }
+    if (!current()) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    if (active || evacuates) {
+        // The association step chaining the last checkpoint under the chained provenance; its
+        // refusal after this step's mutations is this step's supersession, never a fallback.
+        auto step = window->requestTileForAssignment(active ? this : nullptr, *checkpoint, chained);
+        if (step.outcome != Outcome::AppliedCurrent) {
+            result.outcome = Outcome::Superseded;
+            return result;
+        }
+        return step;
+    }
+    result.owned = chained;
+    result.checkpoint = std::move(checkpoint);
+    if (window->assignmentResultIsCurrent(result)) {
+        result.outcome = Outcome::AppliedCurrent;
+    } else {
+        result.outcome = Outcome::Superseded;
+        result.checkpoint.reset();
+    }
+    return result;
+}
+
+Window::AssignmentStepResult Tile::unmanageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned)
+{
+    using Outcome = Window::AssignmentStepOutcome;
+    Window::AssignmentStepResult result;
+    if (!window) {
+        return result;
+    }
+    if (!before.isCurrentFor(*window) || !window->ownedProvenanceIsCurrent(owned)) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    // A source need not be on a registered output; it must not be tearing down.
+    if (isTransient() || !window->supportsAssignmentGeometryRequest() || !m_tiling || m_tiling->tearingDown()) {
+        return result;
+    }
+    if (!m_windows.contains(window)) {
+        return membershipNoOp(window, std::move(owned));
+    }
+    // The follow-up preflighted before the removal: the null association when this is the
+    // requested tile; and one membership increment.
+    const bool clears = window->requestedTile() == this;
+    if ((clears && !window->canRequestTileForAssignment(nullptr))
+        || window->m_tileMembershipChange >= std::numeric_limits<quint64>::max() - 1) {
+        return result;
+    }
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    std::unique_ptr<TileAssignmentFence> checkpoint = window->makeTileAssignmentCheckpoint();
+    const auto current = [&]() {
+        return self && !window->isDeleted() && window->ownedProvenanceIsCurrent(owned) && checkpoint && checkpoint->isCurrentFor(*window);
+    };
+    removeForAssignment(window, checkpoint, current);
+    if (!current()) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    if (clears) {
+        auto step = window->requestTileForAssignment(nullptr, *checkpoint, owned);
+        if (step.outcome != Outcome::AppliedCurrent) {
+            result.outcome = Outcome::Superseded;
+            return result;
+        }
+        return step;
+    }
+    result.owned = std::move(owned);
+    result.checkpoint = std::move(checkpoint);
+    if (window->assignmentResultIsCurrent(result)) {
+        result.outcome = Outcome::AppliedCurrent;
+    } else {
+        result.outcome = Outcome::Superseded;
+        result.checkpoint.reset();
+    }
+    return result;
+}
+
+Window::AssignmentStepResult Tile::forgetForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned)
+{
+    using Outcome = Window::AssignmentStepOutcome;
+    Window::AssignmentStepResult result;
+    if (!window) {
+        return result;
+    }
+    if (!before.isCurrentFor(*window) || !window->ownedProvenanceIsCurrent(owned)) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    if (isTransient() || !window->supportsAssignmentGeometryRequest() || !m_tiling || m_tiling->tearingDown()) {
+        return result;
+    }
+    if (!m_windows.contains(window)) {
+        return membershipNoOp(window, std::move(owned));
+    }
+    // The forget step's own refusals, preflighted before the removal; and one membership increment.
+    if (!window->canForgetTileForAssignment() || window->m_tileMembershipChange >= std::numeric_limits<quint64>::max() - 1) {
+        return result;
+    }
+    window->ref();
+    const auto lifetime = qScopeGuard([window]() {
+        window->unref();
+    });
+    const QPointer<Tile> self(this);
+    std::unique_ptr<TileAssignmentFence> checkpoint = window->makeTileAssignmentCheckpoint();
+    const auto current = [&]() {
+        return self && !window->isDeleted() && window->ownedProvenanceIsCurrent(owned) && checkpoint && checkpoint->isCurrentFor(*window);
+    };
+    removeForAssignment(window, checkpoint, current);
+    if (!current()) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    auto step = window->forgetTileForAssignment(this, *checkpoint, owned);
+    if (step.outcome != Outcome::AppliedCurrent) {
+        result.outcome = Outcome::Superseded;
+        return result;
+    }
+    return step;
 }
 
 void Tile::insertChild(int position, Tile *item)
