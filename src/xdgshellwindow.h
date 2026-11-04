@@ -152,6 +152,7 @@ class XdgToplevelWindow final : public XdgSurfaceWindow
 {
     Q_OBJECT
     friend class ::TestXdgShellWindow;
+    friend class TilesTest;
 
     enum class PingReason {
         CloseWindow,
@@ -292,6 +293,7 @@ private:
     bool ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const;
     void maximizeOwned(const OwnedMaximize &plan, MaximizeMode mode, MaximizeMode oldMode, const RectF &oldGeometry, const RectF &clientArea);
     AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {}) override;
+    bool canNormalizeMaximizeForAssignment() const override;
     // The client's limits after the rules, without the decoration's enforced minimum.
     QSizeF ruleCheckedMinimumSize() const;
     QSizeF ruleCheckedMaximumSize() const;
