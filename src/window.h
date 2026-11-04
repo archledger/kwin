@@ -2366,6 +2366,12 @@ protected:
     // (its borders) are not versioned here.
     quint64 m_decorationGeneration = 0;
     void advanceDecorationGeneration();
+    // The installation behind setDecoration, with its own boundaries: the generation of the
+    // installed incarnation is reported at its commit, before any observer runs. Guarded, the final
+    // notification is emitted only while that incarnation is still the current one (a closure or a
+    // nested replacement inside the earlier notifications stops the obsolete installation), and the
+    // return says whether it was; unguarded, the legacy path.
+    bool installDecoration(std::shared_ptr<KDecoration3::Decoration> decoration, bool guarded, quint64 *installedGeneration = nullptr);
     QString m_desktopFileName;
 
     bool m_applicationMenuActive = false;

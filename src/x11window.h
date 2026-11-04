@@ -272,9 +272,9 @@ protected:
     void doSetQuickTileMode() override;
     bool supportsAssignmentGeometryRequest() const override;
     bool assignmentPublishesImmediately() const override;
-    // The X11 normalization of a maximized window for an ordinary guarded ingress (NT02.5a2b2c2a):
-    // the undecorated window only. The decoration transition writes geometry through public paths
-    // on X11 and stays excluded until it is routed through the operation.
+    // The X11 normalization of a maximized window for an ordinary guarded ingress (NT02.5a2b2c2a,
+    // NT02.5a2b2c2b): the decoration transition is the operation's own, its identified internal
+    // reactions recorded and folded into the single guarded request.
     bool canNormalizeMaximizeForAssignment() const override;
     AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {}) override;
     void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request) override;
@@ -297,9 +297,14 @@ protected:
         bool strictGeometry = false;
         bool decorated = false;
         DecorationPolicy decorationPolicy = DecorationPolicy::PreferredByClient;
+        QMarginsF borders;
+        quint64 decorationGeneration = 0;
+        quint64 decorationPolicyRevision = 0;
         QMarginsF clientFrameExtents;
         qreal xwaylandScale = 1;
         bool operator==(const GeometryConstraints &other) const = default;
+        // The client-side part, which the decoration transition must leave unchanged.
+        GeometryConstraints clientSide() const;
     };
     GeometryConstraints geometryConstraints() const;
     // The legacy Restore rectangle before its size constraint: the maximized axes from the stored
@@ -392,6 +397,45 @@ private:
     void updateDecoration(bool check_workspace_pos, bool force = false);
     void createDecoration();
     void destroyDecoration();
+    // The normalization's decoration transition records the decoration's identified internal
+    // reactions instead of letting them write through public paths: the border hook's workspace
+    // check and frame-extents update, a creation's gravitated frame, the update's own workspace
+    // check. The recorder is passed explicitly through these private variants (the public entry
+    // points keep their ordinary behaviour; a foreign call from a handler still writes and is
+    // detected by the fence), bound to the decoration incarnation it records for, and folds the
+    // reactions in their legacy order into a planned rectangle. Any reaction outside the supported
+    // sequences marks it foreign.
+    struct DecorationReactionRecorder
+    {
+        enum class Reaction {
+            Borders,
+            Created,
+            Destroyed,
+            UpdateCheck,
+        };
+        KDecoration3::Decoration *decoration = nullptr;
+        // The decoration generation of the incarnation recorded for, taken at that incarnation's
+        // commit (never read back after callbacks): the currentness closure's expectation and the
+        // frame-extents obligation's key, so a transition superseded after a recreation still
+        // describes the new decoration and an obsolete recorder never describes a newer one.
+        quint64 generation = 0;
+        // The policy revision the operation expects: the entry one, advanced only by the
+        // operation's own policy write, so a foreign policy-only change on the same incarnation
+        // ends the operation at the next boundary.
+        quint64 expectedPolicyRevision = 0;
+        RectF planned;
+        std::vector<Reaction> sequence;
+        bool extentsPending = false;
+        bool foreign = false;
+        std::function<bool()> current;
+        bool supported() const;
+    };
+    DecorationReactionRecorder *m_decorationReactionRecorder = nullptr;
+    bool setDecorationPolicyInternal(DecorationPolicy policy, DecorationReactionRecorder *recorder);
+    bool updateDecorationInternal(bool check_workspace_pos, bool force, DecorationReactionRecorder *recorder);
+    void createDecorationInternal(DecorationReactionRecorder *recorder);
+    void destroyDecorationInternal(DecorationReactionRecorder *recorder);
+    void recordBorderReaction(DecorationReactionRecorder &recorder);
 
     void checkOutput();
     void handleXwaylandScaleChanged();

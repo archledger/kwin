@@ -8,6 +8,7 @@
 */
 #include "kwin_wayland_test.h"
 
+#include "atoms.h"
 #include "core/output.h"
 #include "pointer_input.h"
 #include "rules.h"
@@ -23,6 +24,8 @@
 #if KWIN_BUILD_X11
 #include "utils/xcbutils.h"
 #include "x11window.h"
+#include <KDecoration3/DecoratedWindow>
+#include <KDecoration3/Decoration>
 #include <netwm.h>
 #include <xcb/xcb_icccm.h>
 #endif
@@ -3050,8 +3053,8 @@ void TilesTest::x11NormalizeMaximizeForAssignment_data()
     QTest::newRow("refused-electric-border") << 11;
     QTest::newRow("refused-headroom-revision") << 12;
     QTest::newRow("refused-placement-headroom") << 13;
-    QTest::newRow("refused-decorated") << 14;
-    QTest::newRow("refused-borderless-policy") << 15;
+    QTest::newRow("applied-full-decorated") << 14;
+    QTest::newRow("applied-borderless-recreation") << 15;
     QTest::newRow("superseded-at-about-to-change-mode-write") << 16;
     QTest::newRow("superseded-at-about-to-change-constraints") << 17;
     QTest::newRow("superseded-at-restore-signal-legacy-maximize") << 18;
@@ -3067,6 +3070,20 @@ void TilesTest::x11NormalizeMaximizeForAssignment_data()
     QTest::newRow("superseded-increments-at-restore-signal") << 28;
     QTest::newRow("superseded-aspect-presence-at-restore-signal") << 29;
     QTest::newRow("superseded-base-size-presence-at-restore-signal") << 30;
+    QTest::newRow("applied-vertical-decorated") << 31;
+    QTest::newRow("applied-client-change-frame-unchanged") << 32;
+    QTest::newRow("foreign-move-at-policy-notification") << 33;
+    QTest::newRow("foreign-policy-at-decoration-changed") << 34;
+    QTest::newRow("closure-at-decoration-changed") << 35;
+    QTest::newRow("late-replacement-at-client-notification") << 36;
+    QTest::newRow("foreign-policy-write-at-policy-notification") << 37;
+    QTest::newRow("foreign-generation-at-policy-notification") << 38;
+    QTest::newRow("quick-tile-decorated-refused") << 39;
+    QTest::newRow("cross-window-recursion-guard") << 40;
+    QTest::newRow("foreign-policy-at-maximized-signal") << 41;
+    QTest::newRow("foreign-generation-at-maximized-signal") << 42;
+    QTest::newRow("replacement-at-border-radius") << 43;
+    QTest::newRow("quick-tile-borderless-refused") << 44;
 }
 
 void TilesTest::x11NormalizeMaximizeForAssignment()
@@ -3082,7 +3099,9 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     Tile *first = m_rootTile->childTile(0);
     Tile *second = m_rootTile->childTile(1);
     QVERIFY(first && second && first->isActive());
-    const bool decorated = scenario == 14;
+    // The decorated rows (Breeze, the default fixture): the transition routed through the operation.
+    const bool decorated = scenario == 14 || scenario == 15 || (scenario >= 31 && scenario <= 39) || (scenario >= 41 && scenario <= 44);
+    const bool borderless = scenario == 15 || scenario == 33 || scenario == 34 || scenario == 35 || scenario == 37 || scenario == 38 || scenario == 43 || scenario == 44;
     KSharedConfig::Ptr rules;
     if (scenario == 10) {
         rules = KSharedConfig::openConfig(QStringLiteral("kwinrulesrc"), KConfig::SimpleConfig);
@@ -3111,11 +3130,29 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
             workspace()->slotReconfigure();
         }
     });
-    if (scenario == 15) {
+    // Breeze recommends no side borders and the automatic border size follows it, so a maximized
+    // and a restored decoration would have the same borders; the decorated rows need the real
+    // border reaction, hence an explicit normal border size for their duration.
+    KConfigGroup decorationConfig = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    if (decorated || scenario == 40) {
+        decorationConfig.writeEntry("BorderSizeAuto", false);
+        decorationConfig.writeEntry("BorderSize", QStringLiteral("Normal"));
+        kwinApp()->config()->sync();
+        workspace()->slotReconfigure();
+    }
+    const auto decorationConfigReset = qScopeGuard([&]() {
+        if (decorated || scenario == 40) {
+            decorationConfig.deleteEntry("BorderSizeAuto");
+            decorationConfig.deleteEntry("BorderSize");
+            kwinApp()->config()->sync();
+            workspace()->slotReconfigure();
+        }
+    });
+    if (borderless) {
         options->setBorderlessMaximizedWindows(true);
     }
     const auto borderlessReset = qScopeGuard([&]() {
-        if (scenario == 15) {
+        if (borderless) {
             options->setBorderlessMaximizedWindows(false);
         }
     });
@@ -3131,6 +3168,7 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     });
     QVERIFY(window);
     QCOMPARE(window->isDecorated(), decorated);
+    const QRectF frame0 = window->frameGeometry();
     const xcb_window_t windowId = window->window();
     const QPointer<Window> guard(window);
     const auto closeWindow = qScopeGuard([&]() {
@@ -3157,6 +3195,40 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         NETWinInfo info(connection.get(), windowId, kwinApp()->x11RootWindow(), NET::WMState, NET::Properties2());
         return NET::States(info.state() & NET::Max);
     };
+    // The frame extents the client reads back, which must describe the current decoration.
+    const auto frameExtentsCurrent = [&]() {
+        xcb_flush(kwinApp()->x11Connection());
+        NETWinInfo info(connection.get(), windowId, kwinApp()->x11RootWindow(), NET::WMFrameExtents, NET::Properties2());
+        const NETStrut extents = info.frameExtents();
+        return extents.left == Xcb::toXNative(window->borderLeft()) && extents.right == Xcb::toXNative(window->borderRight())
+            && extents.top == Xcb::toXNative(window->borderTop()) && extents.bottom == Xcb::toXNative(window->borderBottom());
+    };
+    // The client's own view of how often its frame extents were written: property notifications
+    // selected on the client connection, drained before the operation and counted after it (a
+    // round trip on the compositor's connection first, so its writes reach the server before the
+    // client's round trip).
+    const auto selectPropertyNotifications = [&]() {
+        const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+        xcb_change_window_attributes(connection.get(), windowId, XCB_CW_EVENT_MASK, &mask);
+        xcb_flush(connection.get());
+        free(xcb_get_input_focus_reply(connection.get(), xcb_get_input_focus(connection.get()), nullptr));
+        while (xcb_generic_event_t *event = xcb_poll_for_event(connection.get())) {
+            free(event);
+        }
+    };
+    const auto frameExtentsWrites = [&]() {
+        xcb_flush(kwinApp()->x11Connection());
+        free(xcb_get_input_focus_reply(kwinApp()->x11Connection(), xcb_get_input_focus(kwinApp()->x11Connection()), nullptr));
+        free(xcb_get_input_focus_reply(connection.get(), xcb_get_input_focus(connection.get()), nullptr));
+        int writes = 0;
+        while (xcb_generic_event_t *event = xcb_poll_for_event(connection.get())) {
+            if ((event->response_type & ~0x80) == XCB_PROPERTY_NOTIFY && reinterpret_cast<xcb_property_notify_event_t *>(event)->atom == atoms->net_frame_extents) {
+                ++writes;
+            }
+            free(event);
+        }
+        return writes;
+    };
     const auto setHints = [&](const QSize &minimum, const QSize &maximum) {
         xcb_size_hints_t hints;
         memset(&hints, 0, sizeof(hints));
@@ -3179,7 +3251,7 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         window->m_geometryHints.read();
     };
     MaximizeMode mode = MaximizeFull;
-    if (scenario == 1 || scenario == 4 || scenario == 18 || scenario == 24 || (scenario >= 28 && scenario <= 30)) {
+    if (scenario == 1 || scenario == 4 || scenario == 18 || scenario == 24 || (scenario >= 28 && scenario <= 30) || scenario == 31) {
         mode = MaximizeVertical;
     } else if (scenario == 2) {
         mode = MaximizeHorizontal;
@@ -3192,10 +3264,10 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         QCOMPARE(netState(), mode == MaximizeFull ? NET::States(NET::Max) : NET::States(mode == MaximizeVertical ? NET::MaxVert : NET::MaxHoriz));
     }
     const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
-    if (scenario == 1 || scenario == 4 || scenario == 18 || scenario == 24 || (scenario >= 28 && scenario <= 30)) {
+    if (scenario == 1 || scenario == 4 || scenario == 18 || scenario == 24 || (scenario >= 28 && scenario <= 30) || scenario == 31) {
         // The horizontal axis moves while the vertical one is maximized: the capture refreshes it
         // (a full maximize's capture would rewrite an equal restore, without a notification).
-        window->moveResize(RectF(40, window->y(), 100, window->height()));
+        window->moveResize(RectF(40, window->y(), scenario == 31 ? window->width() : 100, window->height()));
     } else if (scenario == 2) {
         window->moveResize(RectF(window->x(), 60, window->width(), 50));
     }
@@ -3242,8 +3314,60 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         QCOMPARE(QRectF(window->frameGeometry()), QRectF(area));
         window->setGeometryRestore(area);
         break;
+    case 15:
+    case 33:
+    case 34:
+    case 35:
+    case 37:
+    case 38:
+        // The borderless policy stripped the decoration at the maximize; the transition recreates it.
+        QVERIFY(!window->isDecorated());
+        break;
+    case 43:
+        // Recreated likewise; the installation's border-radius notification is the boundary this row
+        // hooks, and Breeze reports no radius change on these fixtures, so the undecorated window
+        // carries the radius a decoration with rounded corners would have left behind.
+        QVERIFY(!window->isDecorated());
+        window->setBorderRadius(BorderRadius(8));
+        QVERIFY(!window->borderRadius().isNull());
+        break;
+    case 44:
+        // Undecorated at entry under the borderless policy, a quick tile requested: the recreation's
+        // workspace check would take the special-state branch, so the preflight refuses.
+        QVERIFY(!window->isDecorated());
+        window->m_requestedTile = m_tileManager->quickTile(QuickTileFlag::Left);
+        break;
+    case 32:
+        // The restore equals the maximize area: the frame stays, the client changes with the borders.
+        window->setGeometryRestore(area);
+        break;
+    case 39:
+        window->m_requestedTile = m_tileManager->quickTile(QuickTileFlag::Left);
+        break;
     }
-    const bool expectRefusal = scenario == 5 || (scenario >= 8 && scenario <= 15) || scenario == 23;
+    std::unique_ptr<QObject> otherContext;
+    if (scenario == 40) {
+        // A second, decorated window whose legacy maximize emits its border reaction under the
+        // file-static recursion guard: a normalization of this window from that reaction is refused.
+        X11Window *other = createWindow(connection.get(), Rect(300, 300, 120, 60));
+        QVERIFY(other && other->isDecorated());
+        otherContext = std::make_unique<QObject>();
+        bool refusedUnderGuard = false;
+        connect(other, &Window::frameGeometryChanged, otherContext.get(), [&]() {
+            if (!refusedUnderGuard) {
+                refusedUnderGuard = true;
+                QVERIFY(!window->canNormalizeMaximizeForAssignment());
+                auto innerFence = window->makeTileAssignmentFence();
+                QCOMPARE(window->normalizeMaximizeForAssignment(innerFence).outcome, Outcome::Refused);
+            }
+        });
+        other->maximize(MaximizeFull);
+        QVERIFY(refusedUnderGuard);
+        QVERIFY(window->canNormalizeMaximizeForAssignment());
+        xcb_destroy_window(connection.get(), other->window());
+        xcb_flush(connection.get());
+    }
+    const bool expectRefusal = scenario == 5 || (scenario >= 8 && scenario <= 13) || scenario == 23 || scenario == 39 || scenario == 44;
     QCOMPARE(window->canNormalizeMaximizeForAssignment(), !expectRefusal);
     QCOMPARE(window->canRequestTileForAssignment(first), !expectRefusal);
     const MaximizeMode before = window->maximizeMode();
@@ -3255,7 +3379,20 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     QSignalSpy aboutToChange(window, &Window::maximizedAboutToChange);
     QSignalSpy maximizedChanged(window, &Window::maximizedChanged);
     QSignalSpy bufferChanged(window, &Window::bufferGeometryChanged);
+    QSignalSpy clientChanged(window, &Window::clientGeometryChanged);
     QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+    QSignalSpy decorationChanged(window, &Window::decorationChanged);
+    QSignalSpy policyChanged(window, &Window::decorationPolicyChanged);
+    const auto generationBefore = window->m_decorationGeneration;
+    const auto policyRevisionBefore = window->m_decorationPolicyRevision;
+    // The decorated window's later maximize signals, which a boundary failing after the first one
+    // must not emit.
+    KDecoration3::DecoratedWindow *const decoratedWindow = window->isDecorated() ? window->decoration()->window() : nullptr;
+    std::unique_ptr<QSignalSpy> decoratedHorizontally, decoratedMaximized;
+    if (decoratedWindow) {
+        decoratedHorizontally = std::make_unique<QSignalSpy>(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedHorizontallyChanged);
+        decoratedMaximized = std::make_unique<QSignalSpy>(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedChanged);
+    }
     QObject context;
     bool intervened = false;
     bool incoming = true;
@@ -3308,6 +3445,53 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
             QCOMPARE(window->m_geometryHints.minAspect(), QSize(1, INT_MAX));
             QCOMPARE(window->m_geometryHints.maxAspect(), QSize(INT_MAX, 1));
         }));
+    } else if (scenario == 33) {
+        connect(window, &Window::decorationPolicyChanged, &context, once([&]() {
+            window->moveResize(nested);
+        }));
+    } else if (scenario == 34) {
+        connect(window, &Window::decorationChanged, &context, once([&]() {
+            window->setDecorationPolicy(DecorationPolicy::None);
+        }));
+    } else if (scenario == 35) {
+        connect(window, &Window::decorationChanged, &context, once([&]() {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }));
+    } else if (scenario == 36) {
+        connect(window, &Window::clientGeometryChanged, &context, once([&]() {
+            window->setDecorationPolicy(DecorationPolicy::None);
+        }));
+    } else if (scenario == 37) {
+        // A bare policy write: no geometry, only the policy and its revision.
+        connect(window, &Window::decorationPolicyChanged, &context, once([&]() {
+            window->writeDecorationPolicy(DecorationPolicy::Server);
+        }));
+    } else if (scenario == 38) {
+        // A bare generation advance: no geometry, no decoration change.
+        connect(window, &Window::decorationPolicyChanged, &context, once([&]() {
+            window->advanceDecorationGeneration();
+        }));
+    } else if (scenario == 41) {
+        // A foreign policy change on the same incarnation inside the first maximize signal: the
+        // decoration is kept, no geometry is written, only the policy and its revision change.
+        QVERIFY(decoratedWindow);
+        connect(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedVerticallyChanged, &context, once([&]() {
+            window->setDecorationPolicy(DecorationPolicy::Server);
+        }));
+    } else if (scenario == 42) {
+        // A bare generation advance inside the first maximize signal.
+        QVERIFY(decoratedWindow);
+        connect(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedVerticallyChanged, &context, once([&]() {
+            window->advanceDecorationGeneration();
+        }));
+    } else if (scenario == 43) {
+        // A public forced recreation inside the recreation's first notification (the border
+        // radius): the installation withholds its final notification, the obligation never
+        // describes the newer decoration, and the nested legacy path wrote the extents once.
+        connect(window, &Window::borderRadiusChanged, &context, once([&]() {
+            window->updateDecoration(true, true);
+        }));
     } else if (scenario == 30) {
         // A zero base size: only the presence flag flips, the minimum stays.
         connect(window, &Window::maximizeGeometryRestoreChanged, &context, once([&]() {
@@ -3350,8 +3534,11 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     if (scenario == 6) {
         window->moveResize(RectF(window->x() + 5, window->y(), window->width(), window->height()));
     }
+    if (scenario == 14 || scenario == 15 || scenario == 43) {
+        selectPropertyNotifications();
+    }
     auto result = window->normalizeMaximizeForAssignment(fence, provenance);
-    QCOMPARE(intervened, scenario >= 16 && scenario <= 20 || scenario == 22 || scenario == 24 || (scenario >= 27 && scenario <= 30));
+    QCOMPARE(intervened, scenario >= 16 && scenario <= 20 || scenario == 22 || scenario == 24 || (scenario >= 27 && scenario <= 30) || (scenario >= 33 && scenario <= 38) || (scenario >= 41 && scenario <= 43));
     if (expectRefusal) {
         QCOMPARE(result.outcome, Outcome::Refused);
         QVERIFY(!result.checkpoint);
@@ -3360,7 +3547,7 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
         QCOMPARE(aboutToChange.count(), 0);
         QCOMPARE(maximizedChanged.count(), 0);
-        if (scenario == 5 || scenario == 14) {
+        if (scenario == 5) {
             // The legacy remainder still tiles it.
             window->requestTile(first);
             QCOMPARE(window->requestedTile(), first);
@@ -3472,6 +3659,120 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         QTRY_VERIFY(!guard);
         return;
     }
+    if (scenario == 33) {
+        // A foreign public move inside the policy notification of the recreation: the written
+        // fence detects it, the mode is still published, and the recreated decoration's extents are
+        // still the obligation's.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(nested))));
+        QCOMPARE(maximizedChanged.count(), 1);
+        QCOMPARE(netState(), NET::States());
+        QVERIFY(frameExtentsCurrent());
+        return;
+    }
+    if (scenario == 34) {
+        // A foreign public policy change inside the recreation's notification: the public path
+        // destroys the decoration again with its legacy writes, which the fence detects.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->isDecorated());
+        QCOMPARE(window->m_decorationPolicy, DecorationPolicy::None);
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(maximizedChanged.count(), 1);
+        return;
+    }
+    if (scenario == 35) {
+        // Closed inside the recreation's notification: superseded, nothing published, released once
+        // the caller's own reference goes.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(guard && guard->isDeleted());
+        QCOMPARE(maximizedChanged.count(), 0);
+        fencePtr.reset();
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    if (scenario == 36) {
+        // A late replacement inside the request's client notification: the receipt pins the
+        // incarnation, the request is superseded, the mode is still published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->isDecorated());
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(maximizedChanged.count(), 1);
+        return;
+    }
+    if (scenario == 41 || scenario == 42) {
+        // A foreign policy-only change, or a bare generation advance, inside the first maximize
+        // signal on the kept decoration: the boundary after that signal ends the operation, so the
+        // later maximize signals are never emitted; the mode is still published, the frame
+        // unchanged, the decoration kept.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(decoratedHorizontally->count(), 0);
+        QCOMPARE(decoratedMaximized->count(), 0);
+        QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(maximizedChanged.count(), 1);
+        QCOMPARE(netState(), NET::States());
+        if (scenario == 41) {
+            QCOMPARE(window->m_decorationPolicy, DecorationPolicy::Server);
+            QCOMPARE(window->m_decorationPolicyRevision, policyRevisionBefore + 1);
+            QCOMPARE(window->m_decorationGeneration, generationBefore);
+            QCOMPARE(policyChanged.count(), 1);
+            // The kept incarnation's extents are still the obligation's.
+            QVERIFY(frameExtentsCurrent());
+        } else {
+            QCOMPARE(window->m_decorationGeneration, generationBefore + 1);
+            QCOMPARE(window->m_decorationPolicyRevision, policyRevisionBefore);
+        }
+        return;
+    }
+    if (scenario == 43) {
+        // Replaced inside the recreation's border-radius notification by a public forced
+        // recreation: the outer installation announces nothing more (the nested one announced its
+        // removal and its installation), the outer's policy write is still announced once, the
+        // outer obligation never describes the newer decoration (the extents were written exactly
+        // as often as a legacy forced recreation writes them, measured the same way below: the new
+        // decoration's initial state through the hook, then the update's own write), the mode is
+        // still published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(window->m_decorationPolicy, DecorationPolicy::PreferredByClient);
+        QCOMPARE(window->m_decorationGeneration, generationBefore + 3);
+        QCOMPARE(decorationChanged.count(), 2);
+        QCOMPARE(policyChanged.count(), 1);
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(maximizedChanged.count(), 1);
+        QCOMPARE(netState(), NET::States());
+        QVERIFY(frameExtentsCurrent());
+        const int transitionWrites = frameExtentsWrites();
+        selectPropertyNotifications();
+        window->updateDecoration(true, true);
+        const int legacyWrites = frameExtentsWrites();
+        QVERIFY(legacyWrites >= 1);
+        QCOMPARE(transitionWrites, legacyWrites);
+        QVERIFY(frameExtentsCurrent());
+        return;
+    }
+    if (scenario == 37 || scenario == 38) {
+        // A bare policy write or generation advance inside the policy notification, no geometry:
+        // the boundary after that notification sees it; superseded before any request, the mode
+        // still published, the frame unchanged.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        QCOMPARE(maximizedChanged.count(), 1);
+        QCOMPARE(netState(), NET::States());
+        return;
+    }
     if (scenario == 22) {
         // A foreign membership stamp inside the publication's last notification: the geometry and
         // the mode stand, the outcome decided after the publication is a supersession.
@@ -3494,10 +3795,16 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     QCOMPARE(netState(), NET::States());
     QCOMPARE(window->m_geometryUpdateGeneration, publicationBefore + 1);
     QCOMPARE(window->m_geometryRequestGeneration, requestBefore + 1);
-    QCOMPARE(frameChanged.count(), 1);
-    QRectF expectedRestore(10, 10, 100, 50);
-    QRectF expectedFrame(10, 10, 100, 50);
-    if (scenario == 1) {
+    QCOMPARE(frameChanged.count(), scenario == 32 ? 0 : 1);
+    QRectF expectedRestore = decorated ? frame0 : QRectF(10, 10, 100, 50);
+    QRectF expectedFrame = expectedRestore;
+    if (scenario == 31) {
+        expectedRestore = QRectF(40, frame0.y(), frame0.width(), frame0.height());
+        expectedFrame = expectedRestore;
+    } else if (scenario == 32) {
+        expectedRestore = QRectF(area);
+        expectedFrame = QRectF(area);
+    } else if (scenario == 1) {
         expectedRestore = QRectF(40, 10, 100, 50);
         expectedFrame = expectedRestore;
     } else if (scenario == 2) {
@@ -3512,6 +3819,21 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
     }
     QCOMPARE(QRectF(window->geometryRestore()), expectedRestore);
     QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(RectF(expectedFrame)))));
+    if (decorated) {
+        // The transition's effects: the decoration present (recreated under the borderless policy
+        // with the policy restored), its border reaction or recreation folded into the single
+        // publication, the client inside the borders, and the frame extents describing it.
+        QVERIFY(window->isDecorated());
+        QCOMPARE(window->m_decorationPolicy, DecorationPolicy::PreferredByClient);
+        QCOMPARE(clientChanged.count(), 1);
+        QCOMPARE(frameChanged.count(), scenario == 32 ? 0 : 1);
+        QCOMPARE(QRectF(window->clientGeometry()).size(), QRectF(window->frameGeometry()).size() - QSizeF(window->borderLeft() + window->borderRight(), window->borderTop() + window->borderBottom()));
+        QVERIFY(frameExtentsCurrent());
+        if (scenario == 14 || scenario == 15) {
+            // The obligation wrote the extents once, as the legacy update would have.
+            QCOMPARE(frameExtentsWrites(), 1);
+        }
+    }
     if (scenario == 21) {
         // A bare mode revision advance (the writer, no geometry): the checkpoint stays current, the
         // receipt does not.
@@ -3846,7 +4168,7 @@ void TilesTest::x11GuardedAssignment_data()
     QTest::newRow("committed-headroom-refused") << 8;
     QTest::newRow("placement-publication-headroom-refused") << 9;
     QTest::newRow("forget-committed-headroom-refused") << 10;
-    QTest::newRow("maximized-refused-legacy") << 11;
+    QTest::newRow("maximized-decorated-applied") << 11;
     QTest::newRow("fractional-scale-rounding") << 12;
     QTest::newRow("nested-geometry-at-buffer-notification") << 13;
     QTest::newRow("closed-at-buffer-notification") << 14;
@@ -4014,7 +4336,7 @@ void TilesTest::x11GuardedAssignment()
         });
     }
     const bool forget = scenario == 3 || scenario == 10 || scenario == 15;
-    const bool expectRefusal = scenario == 0 || scenario == 1 || scenario == 8 || scenario == 9 || scenario == 10 || scenario == 11;
+    const bool expectRefusal = scenario == 0 || scenario == 1 || scenario == 8 || scenario == 9 || scenario == 10;
     if (forget) {
         QCOMPARE(window->canForgetTileForAssignment(), !expectRefusal);
     } else {
@@ -4088,30 +4410,26 @@ void TilesTest::x11GuardedAssignment()
         QCOMPARE(window->m_committedTileChange, committedBefore);
         QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
         QCOMPARE(requestedTileChanged.count(), 0);
-        if (scenario == 11) {
-            // Tiling a maximized decorated X11 window stays legacy until its decoration transition
-            // is routed through the operation (NT02.5a2b2c2b): the public path's remainder still
-            // tiles it.
-            QVERIFY(window->isDecorated());
-            window->requestTile(first);
-            QCOMPARE(window->requestedTile(), first);
-            QCOMPARE(window->tile(), first);
-        } else if (scenario == 0) {
+        if (scenario == 0) {
             window->unblockGeometryUpdates();
             QVERIFY(window->canRequestTileForAssignment(first));
         }
         return;
     }
-    if (scenario == 17) {
-        // The undecorated maximized window takes the guarded ingress: normalized by the X11
-        // override (the mode published, its restore the entry frame), then assigned and committed.
+    if (scenario == 11 || scenario == 17) {
+        // The maximized window, decorated (its decoration transition the operation's own) or not,
+        // takes the guarded ingress: normalized by the X11 override (the mode published, its restore
+        // the entry frame), then assigned and committed.
+        QCOMPARE(window->isDecorated(), scenario == 11);
         QCOMPARE(result.outcome, Outcome::AppliedCurrent);
         QVERIFY(window->assignmentResultIsCurrent(result));
         QCOMPARE(window->maximizeMode(), MaximizeRestore);
         QCOMPARE(window->requestedTile(), first);
         QCOMPARE(window->tile(), first);
         QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
-        QCOMPARE(QRectF(window->geometryRestore()), QRectF(10, 10, 100, 50));
+        if (scenario == 17) {
+            QCOMPARE(QRectF(window->geometryRestore()), QRectF(10, 10, 100, 50));
+        }
         QCOMPARE(tileChanged.count(), 1);
         QCOMPARE(requestedTileChanged.count(), 1);
         xcb_flush(kwinApp()->x11Connection());
