@@ -432,6 +432,10 @@ private:
     xcb_window_t m_originalTransientForId;
     Xcb::MotifHints m_motif;
     DecorationPolicy m_decorationPolicy = DecorationPolicy::PreferredByClient;
+    // Versions every change of the policy: advanced, saturating, together with the value and before
+    // the decoration update that may notify observers.
+    quint64 m_decorationPolicyRevision = 0;
+    void writeDecorationPolicy(DecorationPolicy policy);
     bool m_wantsNoDecoration = false;
     bool ignore_focus_stealing = false; ///< Don't apply focus stealing prevention to this client
     bool is_shape = false;

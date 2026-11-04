@@ -2649,10 +2649,32 @@ void Window::setDecoration(std::shared_ptr<KDecoration3::Decoration> decoration)
             }
         });
     }
-    m_decoration.decoration = decoration;
+    // The new pointer and the generation are installed before any observer runs (the border-radius
+    // and input-shape updates, the displaced decoration's release, the notification); the displaced
+    // decoration outlives the installation so its release sees the new state. A nested replacement
+    // advances again, and nothing here writes the generation afterwards. The window outlives the
+    // installation too (a handler may close it and drop its last reference), and the displaced
+    // decoration, which the window parents, is released before that retention ends, in this order:
+    // the window's destruction would otherwise delete it first. The incoming ownership is moved
+    // into the member for the same reason: a copy kept by this parameter would outlive the
+    // retention.
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const std::shared_ptr<KDecoration3::Decoration> displaced = std::move(m_decoration.decoration);
+    m_decoration.decoration = std::move(decoration);
+    advanceDecorationGeneration();
     updateDecorationInputShape();
     updateDecorationBorderRadius();
     Q_EMIT decorationChanged();
+}
+
+void Window::advanceDecorationGeneration()
+{
+    if (m_decorationGeneration != std::numeric_limits<quint64>::max()) {
+        ++m_decorationGeneration;
+    }
 }
 
 void Window::updateDecorationInputShape()
@@ -5444,11 +5466,32 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
         qCWarning(KWIN_CORE) << "Window::checkWorkspacePosition: called for a closed window. Consider this a bug";
         return;
     }
-    if (isDock() || isDesktop() || !isPlaceable()) {
+    // The decision is read-only; this wrapper keeps the legacy writes and their order: the special
+    // branch moves first and moves the restore fields afterwards, and an ordinary rectangle is
+    // requested publicly even when it equals the current one (the request records intent).
+    const WorkspacePositionDecision decision = workspacePositionDecision(oldGeometry, oldOutput, moveResizeGeometry());
+    switch (decision.kind) {
+    case WorkspacePositionDecision::Kind::NoOp:
+        return;
+    case WorkspacePositionDecision::Kind::LegacySpecial:
+        moveResize(ensureSpecialStateGeometry(decision.geometry));
+        setFullscreenGeometryRestore(moveToArea(m_fullscreenGeometryRestore, decision.oldScreenArea, decision.screenArea));
+        setGeometryRestore(moveToArea(m_maximizeGeometryRestore, decision.oldScreenArea, decision.screenArea));
+        return;
+    case WorkspacePositionDecision::Kind::Geometry:
+        moveResize(decision.geometry);
         return;
     }
+}
 
-    RectF newGeom = moveResizeGeometry();
+Window::WorkspacePositionDecision Window::workspacePositionDecision(RectF oldGeometry, LogicalOutput *oldOutput, const RectF &current) const
+{
+    WorkspacePositionDecision decision;
+    if (isDeleted() || isDock() || isDesktop() || !isPlaceable()) {
+        return decision;
+    }
+
+    RectF newGeom = current;
 
     if (!oldGeometry.isValid()) {
         oldGeometry = newGeom;
@@ -5481,10 +5524,11 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
     }
 
     if (isRequestedFullScreen() || requestedMaximizeMode() != MaximizeRestore || requestedQuickTileMode() != QuickTileMode(QuickTileFlag::None)) {
-        moveResize(ensureSpecialStateGeometry(newGeom));
-        setFullscreenGeometryRestore(moveToArea(m_fullscreenGeometryRestore, oldScreenArea, screenArea));
-        setGeometryRestore(moveToArea(m_maximizeGeometryRestore, oldScreenArea, screenArea));
-        return;
+        decision.kind = WorkspacePositionDecision::Kind::LegacySpecial;
+        decision.geometry = newGeom;
+        decision.oldScreenArea = oldScreenArea;
+        decision.screenArea = screenArea;
+        return decision;
     }
 
     const RectF oldGeomTall = RectF(QPointF(oldGeometry.left(), oldScreenArea.top()), QPointF(oldGeometry.right(), oldScreenArea.bottom())); // Full screen height
@@ -5634,10 +5678,14 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
     // Obey size hints. TODO: We really should make sure it stays in the right place
     newGeom.setSize(constrainFrameSize(newGeom.size()));
 
-    moveResize(m_rules.checkGeometry(newGeom));
+    decision.kind = WorkspacePositionDecision::Kind::Geometry;
+    decision.geometry = m_rules.checkGeometry(newGeom);
+    decision.oldScreenArea = oldScreenArea;
+    decision.screenArea = screenArea;
+    return decision;
 }
 
-void Window::checkOffscreenPosition(RectF *geom, const RectF &screenArea)
+void Window::checkOffscreenPosition(RectF *geom, const RectF &screenArea) const
 {
     if (geom->left() > screenArea.right()) {
         geom->moveLeft(screenArea.right() - screenArea.width() / 4);

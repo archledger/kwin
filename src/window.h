@@ -1167,6 +1167,25 @@ public:
     virtual bool takesAsyncFocus() const;
     virtual bool wantsInput() const = 0;
     void checkWorkspacePosition(RectF oldGeometry = RectF(), LogicalOutput *oldOutput = nullptr);
+    // The workspace-position decision of checkWorkspacePosition, read-only: nothing for a deleted,
+    // dock, desktop or unplaceable window; the legacy special-state branch (which also moves the
+    // restore fields between the areas) for a fullscreen, maximized or quick-tiled request, with
+    // the rectangle it starts from and both areas; otherwise the rectangle after the strut, edge,
+    // offscreen, size-constraint and rule checks, which the wrapper requests publicly even when it
+    // equals the current one.
+    struct WorkspacePositionDecision
+    {
+        enum class Kind {
+            NoOp,
+            LegacySpecial,
+            Geometry,
+        };
+        Kind kind = Kind::NoOp;
+        RectF geometry;
+        RectF oldScreenArea;
+        RectF screenArea;
+    };
+    WorkspacePositionDecision workspacePositionDecision(RectF oldGeometry, LogicalOutput *oldOutput, const RectF &current) const;
 #if KWIN_BUILD_X11
     virtual xcb_timestamp_t userTime() const;
 #endif
@@ -2000,7 +2019,7 @@ protected:
     void exitQuickTileMode();
 
     // geometry handling
-    void checkOffscreenPosition(RectF *geom, const RectF &screenArea);
+    void checkOffscreenPosition(RectF *geom, const RectF &screenArea) const;
     qreal borderLeft() const;
     qreal borderRight() const;
     qreal borderTop() const;
@@ -2342,6 +2361,11 @@ protected:
         QElapsedTimer doubleClickTimer;
         RegionF inputRegion;
     } m_decoration;
+    // Versions every installation, removal and replacement of the decoration: advanced, saturating,
+    // together with the pointer and before any observer runs. Changes within the same decoration
+    // (its borders) are not versioned here.
+    quint64 m_decorationGeneration = 0;
+    void advanceDecorationGeneration();
     QString m_desktopFileName;
 
     bool m_applicationMenuActive = false;
