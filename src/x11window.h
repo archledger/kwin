@@ -23,6 +23,8 @@
 #include <QFlags>
 #include <QPixmap>
 #include <QPointer>
+
+#include <optional>
 // X
 #include <NETWM>
 #include <xcb/res.h>
@@ -273,6 +275,25 @@ protected:
     QSizeF resizeIncrements() const override;
     bool acceptsFocus() const override;
     void doSetQuickTileMode() override;
+    bool supportsAssignmentGeometryRequest() const override;
+    bool assignmentPublishesImmediately() const override;
+    void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request) override;
+    void publishRequestedTileForAssignment(AssignmentStepResult *carrier) override;
+    // The native move-resize body, shared by the legacy path (no carrier) and the guarded dispatch.
+    void moveResizeGuardedInternal(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded);
+    // Notifications a superseded update left undelivered: the next committed update announces them
+    // from the oldest unannounced value, so every transition is announced exactly once.
+    struct PendingGeometryNotifications
+    {
+        std::optional<RectF> buffer;
+        std::optional<RectF> client;
+        std::optional<RectF> frame;
+        bool outputPending = false;
+        bool outputWasNull = false;
+        QPointer<LogicalOutput> output;
+        bool shape = false;
+    };
+    PendingGeometryNotifications m_pendingGeometryNotifications;
     void moveResizeInternal(const RectF &rect, MoveResizeMode mode) override;
     std::unique_ptr<WindowItem> createItem(Item *parentItem) override;
     void doSetNextTargetScale() override;

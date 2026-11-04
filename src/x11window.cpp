@@ -26,6 +26,7 @@
 #include "placement.h"
 #include "scene/windowitem.h"
 #include "shadow.h"
+#include "tiles/tile.h"
 #include "utils/envvar.h"
 #include "virtualdesktops.h"
 #include "wayland/surface.h"
@@ -45,6 +46,7 @@
 #include <xcb/xcb_icccm.h>
 // system
 #include <unistd.h>
+#include <utility>
 // c++
 #include <cmath>
 #include <csignal>
@@ -3403,10 +3405,69 @@ void X11Window::blockGeometryUpdates(bool block)
 /**
  * Reimplemented to inform the client about the new window position.
  */
+bool X11Window::supportsAssignmentGeometryRequest() const
+{
+    // The native geometry commits synchronously, so the guarded request is supported where that
+    // commit can happen: a managed window whose geometry updates are not blocked. The dispatch
+    // rechecks both, since a callback may change them after a preflight.
+    return !isUnmanaged() && isManaged() && !areGeometryUpdatesBlocked();
+}
+
+bool X11Window::assignmentPublishesImmediately() const
+{
+    return true;
+}
+
+void X11Window::dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request)
+{
+    moveResizeGuardedInternal(rect, mode, &request);
+}
+
+void X11Window::publishRequestedTileForAssignment(AssignmentStepResult *carrier)
+{
+    // The immediate commit as the association write's own publication. With a carrier: the incoming
+    // continuation validated before anything, an equal committed tile left alone without a fresh
+    // checkpoint, the headroom reserved before the parent's mutation rechecked (a callback may have
+    // consumed it), only this write sealed by the commit writer, which checks the full currentness
+    // (checkpoint and provenance) after its own callbacks. Without one: the obligation alone, for
+    // an operation already superseded, which it never resurrects.
+    Tile *const target = m_requestedTile;
+    if (target && target->isTransient()) {
+        return;
+    }
+    if (!carrier) {
+        commitTileInternal(target, nullptr);
+        return;
+    }
+    if (!assignmentResultIsCurrent(*carrier)) {
+        carrier->checkpoint.reset();
+        return;
+    }
+    if (m_tile == target) {
+        return;
+    }
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (m_committedTileChange >= exhausted - 1 || m_placementContinuationRevision >= exhausted - 1) {
+        carrier->checkpoint.reset();
+        return;
+    }
+    // The commit writer validates the full carrier (checkpoint and provenance) after tileChanged
+    // and before any further notification.
+    commitTileInternal(target, carrier);
+}
+
 void X11Window::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
+{
+    moveResizeGuardedInternal(rect, mode, nullptr);
+}
+
+void X11Window::moveResizeGuardedInternal(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest *guarded)
 {
     if (isUnmanaged()) {
         qCWarning(KWIN_CORE) << "Cannot move or resize unmanaged window" << this;
+        if (guarded) {
+            guarded->result.checkpoint.reset();
+        }
         return;
     }
 
@@ -3415,48 +3476,161 @@ void X11Window::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
     const RectF bufferGeometry = nextFrameRectToBufferRect(frameGeometry);
     const qreal bufferScale = kwinApp()->xwaylandScale();
 
-    if (m_bufferGeometry == bufferGeometry && m_clientGeometry == clientGeometry && m_frameGeometry == frameGeometry && m_bufferScale == bufferScale) {
+    auto &pending = m_pendingGeometryNotifications;
+    const bool changed = m_bufferGeometry != bufferGeometry || m_clientGeometry != clientGeometry || m_frameGeometry != frameGeometry || m_bufferScale != bufferScale;
+    const bool hasPending = pending.buffer || pending.client || pending.frame || pending.outputPending || pending.shape;
+    if (!changed && (!guarded || !hasPending)) {
+        if (guarded) {
+            // Nothing to publish and nothing pending: the request's own checkpoint stands.
+            guarded->dispatch = AssignmentRequestDispatch::Published;
+            guarded->result.outcome = AssignmentStepOutcome::AppliedCurrent;
+        }
         return;
     }
+    // From here a publication happens: a committed change, or (guarded, unchanged) the delivery of
+    // what an older superseded frame left pending, under its own validated continuation.
 
-    Q_EMIT frameGeometryAboutToChange();
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    if (changed) {
+        Q_EMIT frameGeometryAboutToChange();
+    }
+
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (guarded) {
+        // Validated after the boundary and before the prepared values are written: the request's
+        // carrier, the native commit still possible (a block raised by a callback supersedes rather
+        // than reporting a publication), and the publication headroom (fences do not observe the
+        // publication generation).
+        if (!assignmentResultIsCurrent(guarded->result) || isDeleted() || isUnmanaged() || areGeometryUpdatesBlocked()
+            || m_geometryUpdateGeneration >= exhausted - 1 || m_placementContinuationRevision >= exhausted - 1) {
+            guarded->result.checkpoint.reset();
+            return;
+        }
+    } else if (isDeleted() || m_geometryUpdateGeneration == exhausted) {
+        return;
+    }
 
     const RectF oldBufferGeometry = m_bufferGeometry;
     const RectF oldFrameGeometry = m_frameGeometry;
     const RectF oldClientGeometry = m_clientGeometry;
     LogicalOutput *oldOutput = m_output;
+    LogicalOutput *const nextOutput = changed ? workspace()->outputAt(frameGeometry.center()) : oldOutput;
 
-    m_frameGeometry = frameGeometry;
-    m_clientGeometry = clientGeometry;
-    m_bufferGeometry = bufferGeometry;
-    m_bufferScale = bufferScale;
-    m_output = workspace()->outputAt(frameGeometry.center());
+    // A newer committed update inherits the notifications an older one has not delivered yet, so
+    // every transition is announced once, from its oldest unannounced value.
+    if (bufferGeometry != oldBufferGeometry && !pending.buffer) {
+        pending.buffer = oldBufferGeometry;
+    }
+    if (clientGeometry != oldClientGeometry && !pending.client) {
+        pending.client = oldClientGeometry;
+    }
+    if (frameGeometry != oldFrameGeometry && !pending.frame) {
+        pending.frame = oldFrameGeometry;
+    }
+    if (nextOutput != oldOutput && !pending.outputPending) {
+        pending.outputPending = true;
+        pending.outputWasNull = !oldOutput;
+        pending.output = oldOutput;
+    }
+    if (bufferGeometry.size() != oldBufferGeometry.size()) {
+        pending.shape = true;
+    }
 
-    if (!areGeometryUpdatesBlocked()) {
+    if (changed) {
+        m_frameGeometry = frameGeometry;
+        m_clientGeometry = clientGeometry;
+        m_bufferGeometry = bufferGeometry;
+        m_bufferScale = bufferScale;
+        m_output = nextOutput;
+        // A committed change supersedes placement, as the Wayland one does.
+        if (m_placementContinuationRevision != exhausted) {
+            ++m_placementContinuationRevision;
+        }
+    }
+    // Every publication, a change or a delivery of pending notifications, is versioned.
+    const auto generation = ++m_geometryUpdateGeneration;
+
+    if (changed && !areGeometryUpdatesBlocked()) {
         configure(Xcb::toXNative(m_bufferGeometry));
     }
 
-    updateWindowRules(Rules::Position | Rules::Size);
+    const QPointer<LogicalOutput> expectedOutput(m_output);
+    const bool hadExpectedOutput = m_output;
+    if (guarded) {
+        // Sealed before any callback: this write is the request's own.
+        guarded->dispatch = AssignmentRequestDispatch::Published;
+        guarded->result.checkpoint = makeTileAssignmentCheckpoint();
+    }
+    // Revalidated at every boundary: a newer committed update or the window's closure ends this
+    // frame's announcements (the newer update delivers what is still pending), and with a carrier
+    // the request's currentness and the output expectation hold too.
+    const auto current = [&]() {
+        if (isDeleted()) {
+            pending = {};
+            return false;
+        }
+        return generation == m_geometryUpdateGeneration
+            && (!guarded || (assignmentResultIsCurrent(guarded->result) && (!hadExpectedOutput || expectedOutput) && m_output == expectedOutput.data()));
+    };
+    const auto finish = qScopeGuard([&]() {
+        if (guarded) {
+            if (current()) {
+                guarded->result.outcome = AssignmentStepOutcome::AppliedCurrent;
+            } else {
+                guarded->result.checkpoint.reset();
+            }
+        }
+    });
 
-    if (isActive()) {
-        workspace()->setActiveOutput(output());
-    }
-    workspace()->updateStackingOrder();
-
-    if (oldBufferGeometry != m_bufferGeometry) {
-        Q_EMIT bufferGeometryChanged(oldBufferGeometry);
-    }
-    if (oldClientGeometry != m_clientGeometry) {
-        Q_EMIT clientGeometryChanged(oldClientGeometry);
-    }
-    if (oldFrameGeometry != m_frameGeometry) {
-        Q_EMIT frameGeometryChanged(oldFrameGeometry);
-    }
-    if (oldOutput != m_output) {
-        Q_EMIT outputChanged(oldOutput);
+    if (changed) {
+        updateWindowRules(Rules::Position | Rules::Size);
+        if (!current()) {
+            return;
+        }
+        if (isActive()) {
+            workspace()->setActiveOutput(output());
+        }
+        workspace()->updateStackingOrder();
+        if (!current()) {
+            return;
+        }
     }
 
-    if (oldBufferGeometry.size() != bufferGeometry.size()) {
+    if (auto old = std::exchange(pending.buffer, std::nullopt); old && *old != m_bufferGeometry) {
+        Q_EMIT bufferGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
+    }
+    if (auto old = std::exchange(pending.client, std::nullopt); old && *old != m_clientGeometry) {
+        Q_EMIT clientGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
+    }
+    if (auto old = std::exchange(pending.frame, std::nullopt); old && *old != m_frameGeometry) {
+        Q_EMIT frameGeometryChanged(*old);
+        if (!current()) {
+            return;
+        }
+    }
+    if (pending.outputPending) {
+        const auto output = pending.output;
+        const bool wasNull = pending.outputWasNull;
+        pending.outputPending = false;
+        pending.output.clear();
+        // A destroyed old output is not evidence of a net-zero transition.
+        if ((!wasNull && !output) || output.data() != m_output) {
+            Q_EMIT outputChanged(output.data());
+            if (!current()) {
+                return;
+            }
+        }
+    }
+    if (std::exchange(pending.shape, false)) {
         updateShapeRegion();
     }
 }

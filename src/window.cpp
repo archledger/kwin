@@ -3632,6 +3632,16 @@ bool Window::supportsAssignmentGeometryRequest() const
     return false;
 }
 
+bool Window::assignmentPublishesImmediately() const
+{
+    return false;
+}
+
+void Window::publishRequestedTileForAssignment(AssignmentStepResult *)
+{
+    doSetQuickTileMode();
+}
+
 void Window::dispatchAssignmentGeometryRequest(const RectF &, MoveResizeMode, AssignmentGeometryRequest &)
 {
     // Only a backend that opted in through supportsAssignmentGeometryRequest() is dispatched to.
@@ -3682,9 +3692,12 @@ bool Window::canRequestTileForAssignment(Tile *tile) const
     }
     // A conservative bound for the whole path, not a count of expected increments: the
     // normalization's capture and request, then this step's capture and request; two request
-    // generations; one association change.
+    // generations; one association change; for a backend that commits immediately, the
+    // publication's committed-association change and its placement increment too.
+    const quint64 publication = assignmentPublishesImmediately() ? 1 : 0;
     return m_requestedTileChange < exhausted - 1
-        && m_placementContinuationRevision < exhausted - 2 * assignmentPlacementBudget
+        && (!publication || m_committedTileChange < exhausted - 1)
+        && m_placementContinuationRevision < exhausted - 2 * assignmentPlacementBudget - publication
         && m_geometryRequestGeneration < exhausted - 2 && m_geometryUpdateGeneration < exhausted - 2;
 }
 
@@ -3771,7 +3784,10 @@ Window::AssignmentStepResult Window::requestTileForAssignment(Tile *tile, const 
             && m_requestedTile.data() == target.data() && targetAlive() && m_requestedTransientTileGeneration == 0;
     };
     if (obligationCurrent()) {
-        doSetQuickTileMode();
+        // The publication carries the step's continuation only while the operation succeeded; a
+        // superseded request still publishes the still-current association without being
+        // resurrected by it. Commit first, then the notification, each behind the same recheck.
+        publishRequestedTileForAssignment(applied ? &request.result : nullptr);
         if (obligationCurrent()) {
             Q_EMIT requestedTileChanged();
         }
@@ -3787,10 +3803,13 @@ Window::AssignmentStepResult Window::requestTileForAssignment(Tile *tile, const 
 
 bool Window::canForgetTileForAssignment() const
 {
-    // Mutation-free refusals, including the backend whose protocol state commits immediately, and
-    // the headroom of the one association change the forget step makes.
+    // Mutation-free refusals (a backend without guarded requests included) and the headroom of
+    // the one association change the forget step makes, plus the publication's committed change
+    // and placement increment for a backend that commits immediately.
+    const auto exhausted = std::numeric_limits<quint64>::max();
     return !isDeleted() && supportsAssignmentGeometryRequest() && !m_transientOwnership && !m_activeTransientRequest
-        && m_requestedTransientTileGeneration == 0 && m_requestedTileChange < std::numeric_limits<quint64>::max() - 1;
+        && m_requestedTransientTileGeneration == 0 && m_requestedTileChange < exhausted - 1
+        && (!assignmentPublishesImmediately() || (m_committedTileChange < exhausted - 1 && m_placementContinuationRevision < exhausted - 1));
 }
 
 Window::AssignmentStepResult Window::forgetTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned)
@@ -3829,14 +3848,17 @@ Window::AssignmentStepResult Window::forgetTileForAssignment(Tile *tile, const T
             && m_requestedTile.isNull() && m_requestedTransientTileGeneration == 0;
     };
     if (obligationCurrent()) {
-        doSetQuickTileMode();
+        publishRequestedTileForAssignment(&result);
         if (obligationCurrent()) {
             Q_EMIT requestedTileChanged();
         }
     }
+    // Terminal validation: a publication that promoted the carrier does not survive a later
+    // supersession.
     if (assignmentResultIsCurrent(result)) {
         result.outcome = AssignmentStepOutcome::AppliedCurrent;
     } else {
+        result.outcome = AssignmentStepOutcome::Superseded;
         result.checkpoint.reset();
     }
     return result;
@@ -4530,9 +4552,10 @@ void Window::commitTileInternal(Tile *tile, AssignmentStepResult *guardedResult)
     Q_EMIT tileChanged(tile);
 
     const auto current = [&]() {
+        // The full carrier (its checkpoint and its provenance), before any further notification.
         return !isDeleted() && m_tile == committed && m_committedTileChange == change
             && change != std::numeric_limits<quint64>::max()
-            && (!guardedResult || (guardedResult->checkpoint && guardedResult->checkpoint->isCurrentFor(*this)));
+            && (!guardedResult || assignmentResultIsCurrent(*guardedResult));
     };
     if (!current()) {
         if (guardedResult) {
