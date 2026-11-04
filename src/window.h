@@ -1833,7 +1833,11 @@ private:
                                       quint64 providerRevision, quint64 mapRevision, std::unique_ptr<TransientTileRequest> request);
     bool activateTransientOwnership(quint64 generation);
     TransientRequestReceipt applyTransientOwnership(quint64 generation);
-    bool revokeTransientOwnership(quint64 generation);
+    // With a result, the release's own callback-free writes are inside a checkpoint taken before
+    // its notifications and validated once after its finalization (never refreshed): the caller's
+    // continuation is AppliedCurrent only if nothing foreign changed. Without one, unchanged.
+    bool revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded = nullptr);
+    void qualifyReleaseContinuation(AssignmentStepResult &guarded) const;
     bool beginTransientRelease(quint64 generation);
     TransientAssociationChanges detachTransientAssociation(quint64 generation);
     void notifyTransientAssociation(quint64 generation, const TransientAssociationChanges &changes);
@@ -1843,6 +1847,14 @@ private:
     bool transientRequestTargetIsCurrent(const TransientTileRequest &request) const;
     bool transientRequestIsCurrent(const TransientTileRequest &request) const;
     bool cancelTransientRequest();
+    // The public cancellation boundary as a qualified continuation for a guarded ingress: the
+    // placement stamp and, for an owner, the release's writes are the caller's own; the release's
+    // notifications are callback boundaries. Refused only for exhaustion detected before the stamp;
+    // afterwards Superseded when the continuation is stale (a deleted window, a foreign change), else
+    // AppliedCurrent with the checkpoint to continue from, even when the release could not finalize
+    // (the owner then stays, and a consumer's own entry refusal decides). The release completes
+    // exactly as without a result; nothing is rolled back.
+    [[nodiscard]] AssignmentStepResult cancelTransientRequestForAssignment();
     void commitTileInternal(Tile *tile, AssignmentStepResult *guardedResult = nullptr);
     // Every actual tile membership change of this window (ordinary or transient) is recorded here
     // before its notification, as are the otherwise-valid public membership no-ops (managing an
