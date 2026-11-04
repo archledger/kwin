@@ -725,7 +725,7 @@ void Tile::removeForAssignment(Window *window, std::unique_ptr<TileAssignmentFen
     }
 }
 
-Window::AssignmentStepResult Tile::manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned)
+Window::AssignmentStepResult Tile::manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned, quint64 reserve)
 {
     using Outcome = Window::AssignmentStepOutcome;
     Window::AssignmentStepResult result;
@@ -775,11 +775,13 @@ Window::AssignmentStepResult Tile::manageForAssignment(Window *window, const Til
     const bool evacuates = !sources.isEmpty();
     // The follow-up's read-only preflight before any mutation: the association when this desktop
     // is active, the null association when an inactive one evacuates; and this step's own
-    // membership headroom, one increment per removal and one for the addition.
+    // membership headroom, one increment per removal and one for the addition, plus the caller's
+    // reserved follow-up.
     if ((active && !window->canRequestTileForAssignment(this)) || (!active && evacuates && !window->canRequestTileForAssignment(nullptr))) {
         return result;
     }
-    const quint64 increments = quint64(sources.size()) + 1;
+    Q_ASSERT(reserve <= 1);
+    const quint64 increments = quint64(sources.size()) + 1 + std::min<quint64>(reserve, 1);
     if (window->m_tileMembershipChange >= std::numeric_limits<quint64>::max() - increments) {
         return result;
     }

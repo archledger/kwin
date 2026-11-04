@@ -199,6 +199,8 @@ private Q_SLOTS:
     void unmanageForAssignment();
     void publicTileEntryPoints_data();
     void publicTileEntryPoints();
+    void setTileCompatibility_data();
+    void setTileCompatibility();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -2637,6 +2639,366 @@ void TilesTest::publicTileEntryPoints()
         QVERIFY(second->windows().isEmpty());
         break;
     }
+    }
+}
+
+void TilesTest::setTileCompatibility_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::addColumn<bool>("property");
+    const struct
+    {
+        const char *name;
+        int scenario;
+    } rows[] = {
+        {"applied-same-desktop", 0},
+        {"applied-inactive-across-desktops", 1},
+        {"null-target", 2},
+        {"equal-marker-cleared", 3},
+        {"absent-original-with-destination", 4},
+        {"null-with-absent-original", 5},
+        {"context-changed-during-cancellation", 6},
+        {"cleanup-headroom-refused-legacy", 7},
+        {"original-readded-at-windows-changed", 8},
+        {"cleanup-notification-installs-another", 9},
+        {"x11-legacy", 10},
+        {"interactive-refused-legacy-remainder", 11},
+        {"exhaustion-edge-legacy", 12},
+        {"superseded-preparation-stops", 13},
+        {"target-destroyed-during-cancellation", 14},
+        {"cleanup-association-preflight-refused-legacy", 15},
+        {"context-changed-destination-installed-during-cancellation", 16},
+        {"already-member-destination", 17},
+        {"null-target-membership-exhaustion-legacy", 18},
+    };
+    for (const auto &row : rows) {
+        QTest::addRow("%s-direct", row.name) << row.scenario << false;
+        QTest::addRow("%s-property", row.name) << row.scenario << true;
+    }
+}
+
+void TilesTest::setTileCompatibility()
+{
+    // The compatibility setter consumes the guarded ingress with its own continuation: the
+    // destination's context and the original membership captured before the first callback, the
+    // complete path preflighted before any guarded mutation, the ingress and the cleanup of the
+    // captured original consumed on currentness; legacy only at the initial refusal, unsupported
+    // backend and exhaustion boundaries. The property write's boolean means Qt accepted the write.
+    QFETCH(int, scenario);
+    QFETCH(bool, property);
+    using Result = TransientPlacementWriter::Result;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second && first->isActive());
+    Tile *inactive = m_tileManager->rootTile(VirtualDesktopManager::self()->desktops()[1])->childTile(0);
+    QVERIFY(inactive && !inactive->isActive());
+    const auto assign = [&](Window *window, Tile *tile) {
+        if (property) {
+            QVERIFY(window->setProperty("tile", QVariant::fromValue(tile)));
+        } else {
+            window->setTileCompatibility(tile);
+        }
+    };
+    if (scenario == 10) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        const auto membership = window->m_tileMembershipChange;
+        // The legacy sequence, selected before any guarded mutation: the evacuation, the addition
+        // and the committed association, then the legacy cleanup's public miss stamp.
+        assign(window, second);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(window->tile(), second);
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membership + 3);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.compat"));
+    QVERIFY(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const QRectF original = window->frameGeometry();
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+        configure.clear();
+    };
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    const bool owner = scenario == 6 || scenario == 13 || scenario == 14 || scenario == 16;
+    if (owner) {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.compat");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        const auto state = writer.snapshot();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        QCOMPARE(window->requestedTile(), leaf);
+    }
+    const bool allDesktops = scenario == 1 || scenario == 7 || scenario == 9 || scenario == 15 || scenario == 17;
+    if (allDesktops) {
+        window->setOnAllDesktops(true);
+    }
+    const bool managedFirst = scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3 || scenario == 7 || scenario == 8 || scenario == 9
+        || scenario == 11 || scenario == 12 || scenario == 15 || scenario == 17 || scenario == 18;
+    if (managedFirst) {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        ack(Qt::cyan);
+        if (scenario == 17) {
+            // The destination already holds the window (an independent membership on another
+            // desktop): the ingress is a no-op, the original is still cleaned.
+            QVERIFY(inactive->manage(window));
+            QVERIFY(inactive->windows().contains(window));
+            QCOMPARE(window->requestedTile(), first);
+        }
+    } else if (scenario == 4 || scenario == 5) {
+        // An association without a membership.
+        window->requestTile(first);
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(!first->windows().contains(window));
+        ack(Qt::cyan);
+    }
+    switch (scenario) {
+    case 3:
+    case 15:
+        window->m_requestedTransientTileGeneration = 5;
+        break;
+    case 7:
+        window->m_tileMembershipChange = maximum - 2;
+        break;
+    case 11:
+        workspace()->activateWindow(window);
+        workspace()->slotWindowMove();
+        QVERIFY(window->isInteractiveMove());
+        break;
+    case 12:
+        window->m_placementContinuationRevision = maximum - 1;
+        break;
+    case 18:
+        window->m_tileMembershipChange = maximum - 1;
+        break;
+    }
+    const auto interactiveReset = qScopeGuard([&]() {
+        if (scenario == 11 && window->isInteractiveMove()) {
+            window->keyPressEvent(Qt::Key_Escape);
+        }
+    });
+    const QPointer<Tile> firstGuard(first);
+    const auto membershipBefore = window->m_tileMembershipChange;
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QObject context;
+    bool intervened = false;
+    const auto once = [&](std::function<void()> action) {
+        return [&, action]() {
+            if (!intervened) {
+                intervened = true;
+                action();
+            }
+        };
+    };
+    if (leaf) {
+        connect(leaf, &Tile::windowRemoved, &context, once([&]() {
+            if (scenario == 6) {
+                // The destination's geometry changed inside the release, without touching the
+                // window's counters: the setter's captured context is stale.
+                static_cast<CustomTile *>(first)->setRelativeGeometry(RectF(0, 0, 0.3, 1));
+            } else if (scenario == 16) {
+                // The release installs the very destination (through the legacy path, the owner
+                // still restoring), changes its geometry and leaves a marker: the release's verdict
+                // makes the preparation stale, so the setter acts on nothing, not even its equal
+                // path. (The explicit context check behind it is not independently observable: a
+                // release that leaves the counters alone is stopped by the chained provenance at
+                // the ingress's entry instead.)
+                QVERIFY(first->manage(window));
+                QCOMPARE(window->requestedTile(), first);
+                static_cast<CustomTile *>(first)->setRelativeGeometry(RectF(0, 0, 0.3, 1));
+                window->m_requestedTransientTileGeneration = 5;
+            } else if (scenario == 13) {
+                QVERIFY(!second->unmanage(window));
+            } else {
+                m_rootTile->destroyChild(first);
+            }
+        }));
+    } else if (scenario == 8) {
+        // The original membership re-added, property-only with its stamp, inside the destination's
+        // final notification: the ingress is stale after it.
+        connect(second, &Tile::windowsChanged, &context, once([&]() {
+            first->m_windows.append(window);
+            window->noteTileMembershipChanged();
+        }));
+    } else if (scenario == 9) {
+        // The cleanup's own notification installs another assignment.
+        connect(first, &Tile::windowRemoved, &context, once([&]() {
+            QVERIFY(second->manage(window));
+        }));
+    }
+    Tile *destination = second;
+    if (scenario == 1 || scenario == 7 || scenario == 9 || scenario == 15 || scenario == 17) {
+        destination = inactive;
+    } else if (scenario == 2 || scenario == 5 || scenario == 18) {
+        destination = nullptr;
+    } else if (scenario == 3) {
+        destination = first;
+    } else if (owner) {
+        destination = first;
+    }
+    configure.clear();
+    assign(window, destination);
+    QCOMPARE(intervened, scenario == 6 || scenario == 8 || scenario == 9 || scenario == 13 || scenario == 14 || scenario == 16);
+    switch (scenario) {
+    case 0:
+        // The ingress evacuated the original and requested the destination; the cleanup is an
+        // operation-owned no-op without a stamp.
+        QCOMPARE(window->requestedTile(), second);
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 2);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 1:
+        // An inactive destination on another desktop: the membership added without an association,
+        // then the captured original cleaned with its association cleared.
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 2);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 2:
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 3:
+        // The setter's public equal path: the marker cleared, nothing else.
+        QCOMPARE(window->m_requestedTransientTileGeneration, quint64(0));
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 4:
+        // No original membership: nothing cleaned, nothing stamped for it.
+        QCOMPARE(window->requestedTile(), second);
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        break;
+    case 5:
+        // An explicit null with no original membership keeps the association (the legacy miss did
+        // not clear it either) and stamps nothing.
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 6:
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        break;
+    case 7:
+        // The ingress alone had headroom; the whole path did not: the legacy remainder completes
+        // the move at the exhaustion edge (the membership revision saturates and the association
+        // fails closed), and the guarded path never left the window in both tiles.
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, maximum);
+        QCOMPARE(window->requestedTile(), first);
+        break;
+    case 8:
+        // The ingress is stale after the re-addition: no cleanup, the write stands, the
+        // association untouched.
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 9:
+        // The nested assignment installed inside the cleanup stands; the cleanup's null association
+        // never runs over it.
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), second);
+        break;
+    case 11:
+        // The ingress refused without effect: the legacy remainder moves the window.
+        QCOMPARE(window->requestedTile(), second);
+        QVERIFY(second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        break;
+    case 12:
+        // The legacy sequence at the exhaustion edge: its cancellation saturates and returns.
+        QCOMPARE(window->m_placementContinuationRevision, maximum);
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(first->windows().contains(window));
+        QVERIFY(!second->windows().contains(window));
+        break;
+    case 13:
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        break;
+    case 14:
+        QVERIFY(!firstGuard);
+        QVERIFY(!window->requestedTile());
+        break;
+    case 15:
+        // The cleanup's null association is refused by the marker: known before any guarded
+        // mutation, the legacy remainder moves the window and consumes the marker.
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_requestedTransientTileGeneration, quint64(0));
+        break;
+    case 16:
+        // The nested assignment stands (newer intent inside the release); the setter acted on
+        // nothing, not even its equal path.
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->m_requestedTransientTileGeneration, quint64(5));
+        break;
+    case 17:
+        // The ingress was a no-op on the already-member destination; the captured original was
+        // cleaned with its association cleared.
+        QVERIFY(inactive->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        break;
+    case 18:
+        // No ingress runs for a null target, so the cleanup's own membership increment is the
+        // preflight: known short, the legacy remainder removes the original at the exhaustion edge
+        // (the revision saturates and the association fails closed).
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, maximum);
+        QCOMPARE(window->requestedTile(), first);
+        break;
     }
 }
 

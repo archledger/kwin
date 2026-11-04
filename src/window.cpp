@@ -4733,7 +4733,93 @@ void Window::setTileCompatibility(Tile *tile)
     if (isDeleted() || (tile && tile->isTransient())) {
         return;
     }
+    if (!supportsAssignmentGeometryRequest()) {
+        // A backend without guarded requests keeps the legacy sequence, selected before any
+        // guarded mutation.
+        setTileCompatibilityLegacy(tile);
+        return;
+    }
 
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // Captured before the first callback: the destination's identity, presence and frozen context
+    // (validated after the preparation and chained into the ingress's provenance, so a destination
+    // changed during the cancellation is never taken as fresh); the original association's
+    // identity, presence and membership. The cleanup names only that original, never a tile a
+    // callback selected.
+    const QPointer<Tile> target(tile);
+    const bool hadTarget = tile;
+    const std::function<bool()> context = tile ? tile->assignmentContext(this) : std::function<bool()>();
+    const QPointer<Tile> previous(m_requestedTile);
+    const bool hadOriginalMembership = m_requestedTile && m_requestedTile->windows().contains(this);
+    auto preparation = cancelTransientRequestForAssignment();
+    if (preparation.outcome == AssignmentStepOutcome::Superseded) {
+        return;
+    }
+    if (preparation.outcome == AssignmentStepOutcome::Refused) {
+        // Exhaustion known before the stamp: the full legacy sequence with its own cancellation (a
+        // legacy exclusion, not a guarded continuation).
+        setTileCompatibilityLegacy(tile);
+        return;
+    }
+    if ((hadTarget && !target) || (context && !context()) || !assignmentResultIsCurrent(preparation)) {
+        return;
+    }
+    if (m_requestedTile == tile) {
+        // The setter's public equal path after its stamp: the marker cleared, nothing else.
+        m_requestedTransientTileGeneration = 0;
+        return;
+    }
+    // The complete selected path preflighted before any guarded mutation: the original's cleanup
+    // takes one membership increment (reserved in the ingress's headroom, checked here when no
+    // ingress runs) and, when the original stays requested (no destination, or an inactive one
+    // that does not evacuate it), the null association. A shortage known here selects the legacy
+    // remainder; one consumed by a later callback stops the setter without rollback.
+    const bool cleans = hadOriginalMembership && previous && previous->windows().contains(this);
+    const bool clearsOriginal = cleans && m_requestedTile == previous.data()
+        && (!tile || (!tile->isActive() && tile->desktop() != previous->desktop()));
+    if ((clearsOriginal && !canRequestTileForAssignment(nullptr))
+        || (cleans && !tile && m_tileMembershipChange >= std::numeric_limits<quint64>::max() - 1)) {
+        setTileCompatibilityLegacyRemainder(tile);
+        return;
+    }
+    std::unique_ptr<TileAssignmentFence> checkpoint = std::move(preparation.checkpoint);
+    OwnedProvenance owned;
+    if (context) {
+        owned = owned.withConstraint(context);
+    }
+    if (tile) {
+        auto ingress = target->manageForAssignment(this, *checkpoint, owned, cleans ? 1 : 0);
+        if (ingress.outcome == AssignmentStepOutcome::Refused) {
+            // Mutation-free: the legacy remainder after the qualified cancellation (a legacy
+            // exclusion; its own public stamps are part of it).
+            setTileCompatibilityLegacyRemainder(tile);
+            return;
+        }
+        if (ingress.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(ingress)) {
+            // Superseded, not refused: an incomplete assignment whose writes stand (a membership
+            // may remain without a requested association); the setter stops.
+            return;
+        }
+        checkpoint = std::move(ingress.checkpoint);
+        owned = ingress.owned;
+    }
+    if (!cleans || !previous || !previous->windows().contains(this)) {
+        // Absent, destroyed (skipped, never replaced), or already evacuated by the ingress: nothing
+        // to clean and nothing stamped.
+        return;
+    }
+    // The cleanup of the captured original only, chaining the ingress's checkpoint and provenance:
+    // a revision moved since stops it at its entry; any outcome but current success ends the
+    // setter with no retry, fallback, replacement target or refreshed checkpoint.
+    const auto cleanup = previous->unmanageForAssignment(this, *checkpoint, owned);
+    (void)cleanup;
+}
+
+void Window::setTileCompatibilityLegacy(Tile *tile)
+{
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
@@ -4750,7 +4836,11 @@ void Window::setTileCompatibility(Tile *tile)
         m_requestedTransientTileGeneration = 0;
         return;
     }
+    setTileCompatibilityLegacyRemainder(tile);
+}
 
+void Window::setTileCompatibilityLegacyRemainder(Tile *tile)
+{
     const QPointer<Tile> previousTile = m_requestedTile;
     if (tile && !tile->manage(this)) {
         // A refused destination must not release the previous assignment.
