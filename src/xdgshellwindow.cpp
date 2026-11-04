@@ -2412,6 +2412,22 @@ void XdgToplevelWindow::maximizeOwned(const OwnedMaximize &plan, MaximizeMode mo
     markAsPlaced();
 }
 
+bool XdgToplevelWindow::canNormalizeMaximizeForAssignment() const
+{
+    // This is an ordinary normalization: an owner or an active request keeps its own path (an
+    // ingress revokes at its public cancellation boundary first), a rule or a running operation
+    // keeps the mode, the decoration's recursion guard is honoured, and the whole step must have
+    // headroom before anything is written: the restore capture takes one placement continuation
+    // increment and the guarded request reserves its synchronization writes plus one committed
+    // change, so a shortage known at entry refuses rather than superseding after the mode write.
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    return !(changeMaximizeRecursion || m_transientOwnership || m_activeTransientRequest || !isResizable() || isAppletPopup()
+             || isInteractiveMoveResize() || isElectricBorderMaximizing() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
+             || !supportsAssignmentGeometryRequest() || m_requestedMaximizeRevision >= exhausted - 1
+             || m_placementContinuationRevision >= exhausted - assignmentPlacementBudget || m_geometryRequestGeneration >= exhausted - 1
+             || m_geometryUpdateGeneration >= exhausted - 1);
+}
+
 Window::AssignmentStepResult XdgToplevelWindow::normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned)
 {
     ref();
@@ -2423,20 +2439,9 @@ Window::AssignmentStepResult XdgToplevelWindow::normalizeMaximizeForAssignment(c
         result.outcome = AssignmentStepOutcome::Superseded;
         return result;
     }
-    // Mutation-free refusals. This is an ordinary normalization: an owner or an active request
-    // keeps its own path (an ingress revokes at its public cancellation boundary first), a rule or
-    // a running operation keeps the mode, the decoration's recursion guard is honoured, and the
-    // whole operation must have headroom before anything is written: the restore capture takes
-    // one placement continuation increment and the guarded request reserves its synchronization
-    // writes (at most seven) plus one committed change, so a shortage known at entry refuses here
-    // rather than superseding after the mode write.
-    const auto exhausted = std::numeric_limits<quint64>::max();
-    constexpr quint64 placementBudget = 1 + 7 + 1;
-    if (changeMaximizeRecursion || m_transientOwnership || m_activeTransientRequest || !isResizable() || isAppletPopup()
-        || isInteractiveMoveResize() || isElectricBorderMaximizing() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
-        || !supportsAssignmentGeometryRequest() || m_requestedMaximizeRevision >= exhausted - 1
-        || m_placementContinuationRevision >= exhausted - placementBudget || m_geometryRequestGeneration >= exhausted - 1
-        || m_geometryUpdateGeneration >= exhausted - 1) {
+    // Mutation-free refusals, the same predicate an ingress preflights before any of its own
+    // mutations.
+    if (!canNormalizeMaximizeForAssignment()) {
         return result;
     }
     // The size limits frozen before the first callback: the effective ones, which every boundary

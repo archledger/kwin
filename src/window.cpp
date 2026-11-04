@@ -3664,6 +3664,179 @@ Window::AssignmentStepResult Window::normalizeMaximizeForAssignment(const TileAs
     return AssignmentStepResult();
 }
 
+bool Window::canNormalizeMaximizeForAssignment() const
+{
+    return false;
+}
+
+bool Window::canRequestTileForAssignment(Tile *tile) const
+{
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (isDeleted() || (tile && tile->isTransient()) || !supportsAssignmentGeometryRequest()
+        || m_transientOwnership || m_activeTransientRequest || m_requestedTransientTileGeneration != 0
+        || isInteractiveMoveResize()) {
+        return false;
+    }
+    if (tile && requestedMaximizeMode() != MaximizeRestore && !canNormalizeMaximizeForAssignment()) {
+        return false;
+    }
+    // A conservative bound for the whole path, not a count of expected increments: the
+    // normalization's capture and request, then this step's capture and request; two request
+    // generations; one association change.
+    return m_requestedTileChange < exhausted - 1
+        && m_placementContinuationRevision < exhausted - 2 * assignmentPlacementBudget
+        && m_geometryRequestGeneration < exhausted - 2 && m_geometryUpdateGeneration < exhausted - 2;
+}
+
+Window::AssignmentStepResult Window::requestTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    if (!canRequestTileForAssignment(tile)) {
+        return result;
+    }
+    // The destination's identity and its original presence, captured before the first callback: a
+    // destination destroyed by a callback ends the step and is never read as explicit null.
+    const QPointer<Tile> target(tile);
+    const bool hadTarget = tile;
+    const auto targetAlive = [&]() {
+        return !hadTarget || target;
+    };
+    if (m_requestedTile == tile) {
+        // An operation-owned no-op: nothing written (the transient marker is zero, the preflight
+        // refuses otherwise), a fresh checkpoint, the incoming provenance preserved.
+        result.owned = owned;
+        result.checkpoint = makeTileAssignmentCheckpoint();
+        result.outcome = assignmentResultIsCurrent(result) ? AssignmentStepOutcome::AppliedCurrent : AssignmentStepOutcome::Superseded;
+        if (result.outcome != AssignmentStepOutcome::AppliedCurrent) {
+            result.checkpoint.reset();
+        }
+        return result;
+    }
+    // The validated entry state as an owned snapshot; the caller's fence is never read again.
+    std::unique_ptr<TileAssignmentFence> checkpoint = makeTileAssignmentCheckpoint();
+    if (tile && requestedMaximizeMode() != MaximizeRestore) {
+        auto normalization = normalizeMaximizeForAssignment(*checkpoint, owned);
+        if (normalization.outcome == AssignmentStepOutcome::Refused) {
+            // Mutation-free, before any effect of this step: still a refusal of the whole step.
+            return result;
+        }
+        if (normalization.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(normalization) || !targetAlive()) {
+            result.outcome = AssignmentStepOutcome::Superseded;
+            return result;
+        }
+        // The normalization's receipt (its requested-mode revision and frozen limits) and its
+        // checkpoint are this step's continuation from here.
+        owned = normalization.owned;
+        checkpoint = std::move(normalization.checkpoint);
+    }
+    if (tile && !m_requestedTile && !m_tile) {
+        // Entering tiling from no association: the legacy capture, through the guarded writer. A
+        // failure here, after the normalization may have run, is a supersession, never a fallback.
+        auto restore = setGeometryRestoreForAssignment(quickTileGeometryRestore(), *checkpoint, owned);
+        if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(restore) || !targetAlive()) {
+            result.outcome = AssignmentStepOutcome::Superseded;
+            return result;
+        }
+        checkpoint = std::move(restore.checkpoint);
+    }
+    // The association write, sealed by its own checkpoint; from here every stop is Superseded.
+    m_requestedTile = tile;
+    m_requestedTransientTileGeneration = 0;
+    m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
+    const auto association = m_requestedTileChange;
+    const auto written = makeTileAssignmentFence();
+    result.outcome = AssignmentStepOutcome::Superseded;
+    RectF geometry = moveResizeGeometry();
+    if (tile) {
+        geometry = tile->windowGeometry();
+    } else if (geometryRestore().isValid()) {
+        geometry = geometryRestore();
+    }
+    auto request = requestMoveResizeGuarded(geometry, MoveResizeMode::MoveResize, written, owned);
+    const bool applied = request.result.outcome == AssignmentStepOutcome::AppliedCurrent && assignmentResultIsCurrent(request.result);
+    // The obligation of the association write, discharged while that write is current whatever
+    // the geometry request did: the backend's quick-tile protocol state, then the notification,
+    // each behind the same recheck (live window, unchanged and unexhausted association revision,
+    // the destination's identity with its original presence, no transient marker).
+    const auto obligationCurrent = [&]() {
+        return !isDeleted() && association != std::numeric_limits<quint64>::max() && m_requestedTileChange == association
+            && m_requestedTile.data() == target.data() && targetAlive() && m_requestedTransientTileGeneration == 0;
+    };
+    if (obligationCurrent()) {
+        doSetQuickTileMode();
+        if (obligationCurrent()) {
+            Q_EMIT requestedTileChanged();
+        }
+    }
+    // Terminal validation, before the result is returned: the request's carrier (its checkpoint and
+    // the provenance) only if it applied and nothing foreign happened since, including inside the
+    // obligation's own callbacks.
+    if (applied && assignmentResultIsCurrent(request.result)) {
+        result = std::move(request.result);
+    }
+    return result;
+}
+
+Window::AssignmentStepResult Window::forgetTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    // Mutation-free refusals, including the backend whose protocol state commits immediately, and
+    // the headroom of the one association change this step makes.
+    if (isDeleted() || !supportsAssignmentGeometryRequest() || m_transientOwnership || m_activeTransientRequest
+        || m_requestedTransientTileGeneration != 0 || m_requestedTileChange >= std::numeric_limits<quint64>::max() - 1) {
+        return result;
+    }
+    if (m_requestedTile != tile) {
+        // An operation-owned no-op: nothing written, the incoming provenance preserved.
+        result.owned = owned;
+        result.checkpoint = makeTileAssignmentCheckpoint();
+        result.outcome = assignmentResultIsCurrent(result) ? AssignmentStepOutcome::AppliedCurrent : AssignmentStepOutcome::Superseded;
+        if (result.outcome != AssignmentStepOutcome::AppliedCurrent) {
+            result.checkpoint.reset();
+        }
+        return result;
+    }
+    m_requestedTile = nullptr;
+    m_requestedTransientTileGeneration = 0;
+    m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
+    const auto association = m_requestedTileChange;
+    result.outcome = AssignmentStepOutcome::Superseded;
+    result.owned = owned;
+    result.checkpoint = makeTileAssignmentCheckpoint();
+    const auto obligationCurrent = [&]() {
+        return !isDeleted() && association != std::numeric_limits<quint64>::max() && m_requestedTileChange == association
+            && m_requestedTile.isNull() && m_requestedTransientTileGeneration == 0;
+    };
+    if (obligationCurrent()) {
+        doSetQuickTileMode();
+        if (obligationCurrent()) {
+            Q_EMIT requestedTileChanged();
+        }
+    }
+    if (assignmentResultIsCurrent(result)) {
+        result.outcome = AssignmentStepOutcome::AppliedCurrent;
+    } else {
+        result.checkpoint.reset();
+    }
+    return result;
+}
+
 bool Window::assignmentResultIsCurrent(const AssignmentStepResult &result) const
 {
     return result.checkpoint && result.checkpoint->isCurrentFor(*this) && ownedProvenanceIsCurrent(result.owned);
@@ -4374,7 +4547,38 @@ void Window::requestTile(Tile *tile)
     if (tile && tile->isTransient()) {
         return;
     }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // The public entry point establishes its own operation: the qualified cancellation is its
+    // single stamp, a current continuation enters the guarded step, a refusal without effect
+    // selects the legacy remainder before any mutation, and a supersession stops here (never a
+    // fresh fence). The destination's identity is captured before the cancellation's callbacks.
+    const QPointer<Tile> target(tile);
+    const bool hadTarget = tile;
+    auto preparation = cancelTransientRequestForAssignment();
+    if (preparation.outcome == AssignmentStepOutcome::Superseded) {
+        return;
+    }
+    if (preparation.outcome == AssignmentStepOutcome::AppliedCurrent) {
+        if (hadTarget && !target) {
+            return;
+        }
+        if (requestTileForAssignment(tile, *preparation.checkpoint).outcome != AssignmentStepOutcome::Refused) {
+            return;
+        }
+        requestTileLegacy(tile);
+        return;
+    }
+    // Refused for exhaustion before the stamp: the legacy cancellation keeps today's behaviour at
+    // that edge. This is a legacy exclusion, not a guarded continuation.
     cancelTransientRequest();
+    requestTileLegacy(tile);
+}
+
+void Window::requestTileLegacy(Tile *tile)
+{
     if (isDeleted()) {
         return;
     }
@@ -4420,7 +4624,27 @@ void Window::requestTile(Tile *tile)
 
 void Window::forgetTile(Tile *tile)
 {
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    auto preparation = cancelTransientRequestForAssignment();
+    if (preparation.outcome == AssignmentStepOutcome::Superseded) {
+        return;
+    }
+    if (preparation.outcome == AssignmentStepOutcome::AppliedCurrent) {
+        if (forgetTileForAssignment(tile, *preparation.checkpoint).outcome != AssignmentStepOutcome::Refused) {
+            return;
+        }
+        forgetTileLegacy(tile);
+        return;
+    }
     cancelTransientRequest();
+    forgetTileLegacy(tile);
+}
+
+void Window::forgetTileLegacy(Tile *tile)
+{
     if (m_requestedTile != tile) {
         return;
     }

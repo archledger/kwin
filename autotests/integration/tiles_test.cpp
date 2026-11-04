@@ -10,6 +10,7 @@
 
 #include "core/output.h"
 #include "pointer_input.h"
+#include "rules.h"
 #include "tiles/tilemanager.h"
 #include "tiles/transientplacementwriter.h"
 #include "tiles/transienttilecontroller.h"
@@ -17,6 +18,7 @@
 #include "wayland_server.h"
 #include "window.h"
 #include "workspace.h"
+#include "xdgshellwindow.h"
 
 #if KWIN_BUILD_X11
 #include "x11window.h"
@@ -24,6 +26,8 @@
 #include <xcb/xcb_icccm.h>
 #endif
 
+#include <KConfigGroup>
+#include <KSharedConfig>
 #include <QAbstractItemModelTester>
 #include <QChildEvent>
 #include <QPointer>
@@ -129,6 +133,29 @@ static X11Window *createWindow(xcb_connection_t *connection, const Rect &geometr
 class TilesTest : public QObject
 {
     Q_OBJECT
+
+    struct RequestAuthority
+    {
+        QPointer<QObject> owner;
+        bool valid = true;
+    };
+
+    class RequestForTest : public Window::TransientTileRequest
+    {
+    public:
+        RequestForTest(Window *window, Tile *tile, std::shared_ptr<RequestAuthority> authority, quint64 generation = 0)
+            : TransientTileRequest(window, tile, generation)
+            , m_authority(std::move(authority))
+        {
+        }
+
+    private:
+        bool authorityIsCurrent() const override
+        {
+            return m_authority->owner && m_authority->valid;
+        }
+        std::shared_ptr<RequestAuthority> m_authority;
+    };
 private Q_SLOTS:
     void initTestCase();
     void init();
@@ -160,6 +187,12 @@ private Q_SLOTS:
     void membershipRevision();
     void membershipDuringTransientAdmission_data();
     void membershipDuringTransientAdmission();
+    void requestTileForAssignment_data();
+    void requestTileForAssignment();
+    void forgetTileForAssignment_data();
+    void forgetTileForAssignment();
+    void publicRequestTileBoundary_data();
+    void publicRequestTileBoundary();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -868,6 +901,893 @@ void TilesTest::membershipDuringTransientAdmission()
     } else {
         QVERIFY(!window->requestedTile());
         QVERIFY(!first->windows().contains(window));
+    }
+}
+
+namespace
+{
+
+// A transient tile a reservation can name, as in the Xdg suite: the request's target predicate
+// requires a transient tile on the current desktop whose geometry the window can take.
+class RequestTestTile : public Tile
+{
+public:
+    explicit RequestTestTile(Window *window)
+        : Tile(workspace()->tileManager(window->moveResizeOutput()), nullptr, Type::Transient)
+        , m_window(window)
+    {
+        m_desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+        m_relativeGeometry = RectF(0.25, 0.25, 0.5, 0.5);
+        m_padding = 0;
+        m_windows.append(window);
+    }
+
+    ~RequestTestTile() override
+    {
+        m_windows.clear();
+        if (m_window && !m_window->isDeleted()) {
+            m_window->forgetTile(this);
+        }
+    }
+
+private:
+    QPointer<Window> m_window;
+};
+
+// An Xdg window shown and settled: the activation's configure acknowledged and rendered, so no
+// native geometry is pending when a guarded step starts.
+Window *showSettledXdgWindow(std::unique_ptr<KWayland::Client::Surface> &surface, std::unique_ptr<Test::XdgToplevel> &shell, const QString &appId = {})
+{
+    surface = Test::createSurface();
+    shell = Test::createXdgToplevelSurface(surface.get());
+    if (!appId.isEmpty()) {
+        shell->set_app_id(appId);
+    }
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(430, 310), Qt::blue);
+    if (!window || (configure.isEmpty() && !configure.wait())) {
+        return nullptr;
+    }
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    const QSize size = toplevelConfigure.last().at(0).value<QSize>();
+    Test::render(surface.get(), size.isEmpty() ? QSize(430, 310) : size, Qt::blue);
+    return Test::waylandSync() ? window : nullptr;
+}
+
+XdgToplevelInterface::States tiledStates(Qt::Edges anchors)
+{
+    XdgToplevelInterface::States states;
+    if (anchors & Qt::LeftEdge) {
+        states |= XdgToplevelInterface::State::TiledLeft;
+    }
+    if (anchors & Qt::RightEdge) {
+        states |= XdgToplevelInterface::State::TiledRight;
+    }
+    if (anchors & Qt::TopEdge) {
+        states |= XdgToplevelInterface::State::TiledTop;
+    }
+    if (anchors & Qt::BottomEdge) {
+        states |= XdgToplevelInterface::State::TiledBottom;
+    }
+    return states;
+}
+
+constexpr XdgToplevelInterface::States allTiledStates = XdgToplevelInterface::State::TiledLeft | XdgToplevelInterface::State::TiledRight
+    | XdgToplevelInterface::State::TiledTop | XdgToplevelInterface::State::TiledBottom;
+
+}
+
+void TilesTest::requestTileForAssignment_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("x11-refused") << 0;
+    QTest::newRow("transient-tile-refused") << 1;
+    QTest::newRow("owner-refused") << 2;
+    QTest::newRow("interactive-refused") << 3;
+    QTest::newRow("rule-forced-maximize-refused") << 4;
+    QTest::newRow("marker-refused") << 5;
+    QTest::newRow("headroom-placement-refused") << 6;
+    QTest::newRow("headroom-association-refused") << 7;
+    QTest::newRow("headroom-geometry-refused") << 8;
+    QTest::newRow("equal-no-op") << 9;
+    QTest::newRow("applied-from-floating") << 10;
+    QTest::newRow("applied-from-maximized") << 11;
+    QTest::newRow("applied-null") << 12;
+    QTest::newRow("aggregate-headroom-refused") << 13;
+    QTest::newRow("aggregate-boundary-applied") << 14;
+    QTest::newRow("superseded-at-restore-signal") << 15;
+    QTest::newRow("nested-request-at-requested-geometry") << 16;
+    QTest::newRow("nested-null-at-requested-tile-changed") << 17;
+    QTest::newRow("close-at-requested-geometry") << 18;
+    QTest::newRow("partial-failure-published") << 19;
+    QTest::newRow("target-destroyed-at-requested-geometry") << 20;
+    QTest::newRow("provenance-lapsed-at-normalization") << 21;
+    QTest::newRow("child-stop-after-normalization") << 22;
+    QTest::newRow("equal-nested-at-requested-geometry") << 23;
+    QTest::newRow("restore-changed-at-requested-tile-changed") << 24;
+    QTest::newRow("stale-fence") << 25;
+}
+
+void TilesTest::requestTileForAssignment()
+{
+    // The guarded requested-association step: refusals without effect, operation-owned no-ops,
+    // its own recorded writes and guarded child calls, the obligation of the association write
+    // discharged while that write is current, and one terminal validation.
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    using Result = TransientPlacementWriter::Result;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second && first->isActive());
+    if (scenario == 0) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        const auto placement = window->m_placementContinuationRevision;
+        const auto association = window->m_requestedTileChange;
+        QVERIFY(!window->canRequestTileForAssignment(first));
+        auto fence = window->makeTileAssignmentFence();
+        const auto result = window->requestTileForAssignment(first, fence);
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_placementContinuationRevision, placement);
+        QCOMPARE(window->m_requestedTileChange, association);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    KSharedConfig::Ptr rules;
+    if (scenario == 4) {
+        rules = KSharedConfig::openConfig(QStringLiteral("kwinrulesrc"), KConfig::SimpleConfig);
+        for (const QString &group : rules->groupList()) {
+            rules->deleteGroup(group);
+        }
+        workspace()->rulebook()->setConfig(rules);
+        rules->group(QStringLiteral("General")).writeEntry("rules", QStringList{QStringLiteral("association-rule")});
+        KConfigGroup group = rules->group(QStringLiteral("association-rule"));
+        group.writeEntry("maximizehoriz", true);
+        group.writeEntry("maximizehorizrule", int(Rules::Force));
+        group.writeEntry("maximizevert", true);
+        group.writeEntry("maximizevertrule", int(Rules::Force));
+        group.writeEntry("wmclass", "org.example.association");
+        group.writeEntry("wmclasscomplete", false);
+        group.writeEntry("wmclassmatch", int(Rules::ExactMatch));
+        group.sync();
+        workspace()->slotReconfigure();
+    }
+    const auto rulesReset = qScopeGuard([&]() {
+        if (rules) {
+            for (const QString &group : rules->groupList()) {
+                rules->deleteGroup(group);
+            }
+            rules->sync();
+            workspace()->slotReconfigure();
+        }
+    });
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.association"));
+    QVERIFY(window);
+    auto *const xdg = static_cast<XdgToplevelWindow *>(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+        configure.clear();
+    };
+    const QRectF original = window->frameGeometry();
+    if (scenario == 4) {
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+    }
+    // Owners: the controller admission fixture.
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    quint64 reservation = 0;
+    std::unique_ptr<RequestTestTile> reservationTile;
+    if (scenario == 1 || scenario == 2) {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.association");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        QVERIFY(leaf && leaf->isTransient());
+        if (scenario == 2) {
+            // An owner without an association: a Prepared reservation, whose transient marker is
+            // zero, so only the owner clause can refuse it.
+            const auto state = writer.snapshot();
+            reservationTile = std::make_unique<RequestTestTile>(window);
+            reservation = window->prepareTransientOwnership(&writer, token, key, state.providerRevision, state.mapRevision,
+                                                            std::make_unique<RequestForTest>(window, reservationTile.get(), authority));
+            QVERIFY(reservation);
+            QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Prepared);
+            QCOMPARE(window->m_requestedTransientTileGeneration, quint64(0));
+        }
+    }
+    const auto reservationReset = qScopeGuard([&]() {
+        if (reservation && window->m_transientOwnership) {
+            window->revokeTransientOwnership(reservation);
+        }
+    });
+    // Starting states.
+    const bool maximized = scenario == 11 || scenario == 13 || scenario == 14 || scenario == 19 || scenario == 21 || scenario == 22;
+    const bool tiledFirst = scenario == 9 || scenario == 12;
+    QRectF maximizedFrame;
+    if (maximized) {
+        window->maximize(MaximizeFull);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        ack(Qt::green);
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        maximizedFrame = window->frameGeometry();
+    }
+    if (tiledFirst) {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        ack(Qt::cyan);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(first->windowGeometry()));
+    }
+    if (scenario == 3) {
+        workspace()->activateWindow(window);
+        workspace()->slotWindowMove();
+        QVERIFY(window->isInteractiveMove());
+    }
+    const auto interactiveReset = qScopeGuard([&]() {
+        if (scenario == 3 && window->isInteractiveMove()) {
+            window->keyPressEvent(Qt::Key_Escape);
+        }
+    });
+    switch (scenario) {
+    case 5:
+        window->m_requestedTransientTileGeneration = 5;
+        break;
+    case 6:
+        window->m_placementContinuationRevision = maximum - 18;
+        break;
+    case 7:
+        window->m_requestedTileChange = maximum - 1;
+        break;
+    case 8:
+        window->m_geometryRequestGeneration = maximum - 2;
+        break;
+    case 13:
+        // The normalization alone would pass its own budget; the whole path does not.
+        window->m_placementContinuationRevision = maximum - 15;
+        QVERIFY(window->canNormalizeMaximizeForAssignment());
+        break;
+    case 14:
+        window->m_placementContinuationRevision = maximum - 19;
+        break;
+    }
+    Tile *tile = first;
+    if (scenario == 1) {
+        tile = leaf;
+    } else if (scenario == 12) {
+        tile = nullptr;
+    }
+    const QPointer<Tile> targetGuard(tile);
+    const auto placementBefore = window->m_placementContinuationRevision;
+    const auto associationBefore = window->m_requestedTileChange;
+    const auto modeBefore = window->requestedMaximizeMode();
+    const QRectF restoreBefore = window->geometryRestore();
+    const QRectF geometryBefore = window->moveResizeGeometry();
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy aboutToChange(window, &Window::maximizedAboutToChange);
+    QObject context;
+    bool intervened = false;
+    int frameAboutToChange = 0;
+    bool incoming = true;
+    const RectF other(40, 40, 200, 100);
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (scenario) {
+        case 15:
+        case 24:
+            window->setGeometryRestore(other);
+            break;
+        case 16:
+            window->requestTile(second);
+            break;
+        case 17:
+            window->requestTile(nullptr);
+            break;
+        case 18:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        case 19:
+            xdg->m_minimumSize = QSizeF(original.width() + 100, 0);
+            break;
+        case 20:
+            // The destination deleted synchronously by its parent.
+            m_rootTile->destroyChild(first);
+            break;
+        case 21:
+            incoming = false;
+            break;
+        case 22:
+            window->m_placementContinuationRevision = window->m_placementContinuationRevision + 1;
+            break;
+        case 23:
+            window->requestTile(first);
+            break;
+        }
+    };
+    if (scenario == 15) {
+        connect(window, &Window::maximizeGeometryRestoreChanged, &context, intervene);
+    } else if (scenario == 16 || scenario == 18 || scenario == 20 || scenario == 23) {
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    } else if (scenario == 17 || scenario == 24) {
+        connect(window, &Window::requestedTileChanged, &context, intervene);
+    } else if (scenario == 19) {
+        // The second geometry request of the path: the association's, after the normalization's.
+        connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+            if (++frameAboutToChange == 2) {
+                intervene();
+            }
+        });
+    } else if (scenario == 21) {
+        connect(window, &Window::maximizedAboutToChange, &context, intervene);
+    } else if (scenario == 22) {
+        // The normalization's own geometry request: a foreign placement change right after it.
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    }
+    Window::OwnedProvenance provenance;
+    if (scenario == 21) {
+        provenance = provenance.withConstraint([&incoming]() {
+            return incoming;
+        });
+    }
+    QPointer<Window> guard(window);
+    // The caller's fence, owned here: the one reference the close row releases before awaiting the
+    // destruction it observed logically.
+    std::unique_ptr<TileAssignmentFence> fencePtr = window->makeTileAssignmentCheckpoint();
+    const TileAssignmentFence &fence = *fencePtr;
+    if (scenario == 25) {
+        window->moveResize(RectF(10, 10, 300, 200));
+        QVERIFY(!fence.isCurrentFor(*window));
+    }
+    const bool expectRefusal = scenario <= 8 || scenario == 13;
+    // The preflight takes no fence: a stale fence is the step's supersession, not a refusal.
+    QCOMPARE(window->canRequestTileForAssignment(tile), !expectRefusal);
+    configure.clear();
+    const auto result = window->requestTileForAssignment(tile, fence, provenance);
+    QCOMPARE(intervened, scenario >= 15 && scenario <= 24);
+    if (scenario == 18) {
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(guard && guard->isDeleted());
+        fencePtr.reset();
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    if (expectRefusal) {
+        // Refused: nothing written, nothing notified, no checkpoint.
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(window->requestedMaximizeMode(), modeBefore);
+        QCOMPARE(QRectF(window->geometryRestore()), restoreBefore);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(aboutToChange.count(), 0);
+        if (scenario == 2) {
+            QVERIFY(window->m_transientOwnership && window->m_transientOwnership->generation == reservation);
+            QVERIFY(!window->requestedTile());
+        } else if (scenario == 5) {
+            // The legacy public path still consumes the marker.
+            window->requestTile(first);
+            QCOMPARE(window->requestedTile(), first);
+            QCOMPARE(window->m_requestedTransientTileGeneration, quint64(0));
+        }
+        return;
+    }
+    if (scenario == 25) {
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        return;
+    }
+    const auto tiled = xdg->m_nextStates & allTiledStates;
+    switch (scenario) {
+    case 9:
+        // An operation-owned no-op: nothing recorded, a fresh current checkpoint.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        break;
+    case 10:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(result.owned.kind, Window::OwnedProvenance::Kind::None);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_requestedTileChange, associationBefore + 1);
+        QCOMPARE(QRectF(window->geometryRestore()), original);
+        QCOMPARE(restoreChanged.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(first->windowGeometry()));
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        break;
+    case 11:
+    case 14:
+        // The normalization inside: the mode restored, its receipt carried as the provenance.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(result.owned.kind, Window::OwnedProvenance::Kind::Operation);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(aboutToChange.count(), 1);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(first->windowGeometry()));
+        QCOMPARE(requestedGeometry.count(), 2);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        break;
+    case 12:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    case 15:
+        // A foreign restore write during this step's capture: superseded before the association
+        // write; nothing of the association happened.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(QRectF(window->geometryRestore()), QRectF(other));
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        break;
+    case 16:
+        // The nested public request of another tile holds the newer intent: the outer's
+        // obligation sees a newer association and skips, so only the nested publication happens.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(second->windowGeometry()));
+        QCOMPARE(tiled, tiledStates(second->anchors()));
+        break;
+    case 17:
+        // The nested public untiling inside the outer's own notification.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 2);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    case 19:
+        // The association's geometry request stops on the chained receipt (a limit raised at its
+        // boundary), the association stands, and its obligation is still discharged.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        // The request wrote its rectangle before the boundary stopped it: nothing rolls back, the
+        // committed frame is still the maximized one, and only the normalization's request notified.
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(first->windowGeometry()));
+        QCOMPARE(QRectF(window->frameGeometry()), maximizedFrame);
+        break;
+    case 20:
+        // The destination destroyed inside the geometry request: no publication of an explicit
+        // null, the operation ends.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!targetGuard);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 21:
+        // The incoming provenance lapsed inside the normalization: nothing written at all.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(aboutToChange.count(), 1);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        break;
+    case 22:
+        // The normalization ran, then a foreign change ended the path: its effect stands, no
+        // association, no fallback.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 1);
+        break;
+    case 23:
+        // The equal nested public request is a no-op for the association but stamps the placement:
+        // the association's publication is discharged exactly once, the result is stale.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        break;
+    case 24:
+        // The notification's own callback changed only the restore: the association stands, the
+        // continuation is stale.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(QRectF(window->geometryRestore()), QRectF(other));
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    }
+}
+
+void TilesTest::forgetTileForAssignment_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("applied") << 0;
+    QTest::newRow("no-op-other-tile") << 1;
+    QTest::newRow("x11-refused") << 2;
+    QTest::newRow("owner-refused") << 3;
+    QTest::newRow("marker-refused") << 4;
+    QTest::newRow("headroom-refused") << 5;
+    QTest::newRow("boundary-applied") << 6;
+    QTest::newRow("nested-request-at-requested-tile-changed") << 7;
+    QTest::newRow("stale-fence") << 8;
+}
+
+void TilesTest::forgetTileForAssignment()
+{
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    using Result = TransientPlacementWriter::Result;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second);
+    if (scenario == 2) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        const auto association = window->m_requestedTileChange;
+        auto fence = window->makeTileAssignmentFence();
+        const auto result = window->forgetTileForAssignment(first, fence);
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_requestedTileChange, association);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.forget"));
+    QVERIFY(window);
+    auto *const xdg = static_cast<XdgToplevelWindow *>(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const QRectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *tile = first;
+    if (scenario == 3) {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.forget");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        const auto state = writer.snapshot();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        tile = controller.tile();
+    } else {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(first->windowGeometry()));
+    }
+    switch (scenario) {
+    case 1:
+        tile = second;
+        break;
+    case 4:
+        window->m_requestedTransientTileGeneration = 5;
+        break;
+    case 5:
+        window->m_requestedTileChange = maximum - 1;
+        break;
+    case 6:
+        window->m_requestedTileChange = maximum - 2;
+        break;
+    }
+    const auto associationBefore = window->m_requestedTileChange;
+    const QRectF geometryBefore = window->moveResizeGeometry();
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QObject context;
+    bool intervened = false;
+    if (scenario == 7) {
+        connect(window, &Window::requestedTileChanged, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                window->requestTile(second);
+            }
+        });
+    }
+    auto fence = window->makeTileAssignmentFence();
+    if (scenario == 8) {
+        window->moveResize(RectF(10, 10, 300, 200));
+        QVERIFY(!fence.isCurrentFor(*window));
+    }
+    const auto result = window->forgetTileForAssignment(tile, fence);
+    const auto tiled = xdg->m_nextStates & allTiledStates;
+    switch (scenario) {
+    case 0:
+    case 6:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_requestedTileChange, associationBefore + 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    case 1:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 3:
+    case 4:
+    case 5:
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), tile);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 7:
+        QVERIFY(intervened);
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(requestedTileChanged.count(), 2);
+        break;
+    case 8:
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        break;
+    }
+}
+
+void TilesTest::publicRequestTileBoundary_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("x11-legacy") << 0;
+    QTest::newRow("interactive-legacy") << 1;
+    QTest::newRow("exhaustion-edge-legacy") << 2;
+    QTest::newRow("reentrancy-closed") << 3;
+    QTest::newRow("target-destroyed-during-cancellation") << 4;
+    QTest::newRow("superseded-preparation-stops") << 5;
+    QTest::newRow("marker-consumed-by-legacy") << 6;
+}
+
+void TilesTest::publicRequestTileBoundary()
+{
+    // The public entry point establishes its own operation: one stamp through the qualified
+    // cancellation, the guarded step on a current continuation, the legacy remainder on a refusal
+    // without effect, a stop on supersession; X11, interactive and exhaustion stay legacy.
+    QFETCH(int, scenario);
+    using Result = TransientPlacementWriter::Result;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second);
+    if (scenario == 0) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+        const auto placement = window->m_placementContinuationRevision;
+        window->requestTile(first);
+        // The legacy sequence: the association, the immediate commit, one notification.
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        // The legacy body's own moveResize cancels again: the stamp count is not its invariant.
+        QVERIFY(window->m_placementContinuationRevision > placement);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.boundary"));
+    QVERIFY(window);
+    auto *const xdg = static_cast<XdgToplevelWindow *>(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const QRectF original = window->frameGeometry();
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+        configure.clear();
+    };
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    if (scenario == 4 || scenario == 5) {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.boundary");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        const auto state = writer.snapshot();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        QCOMPARE(window->requestedTile(), leaf);
+    }
+    if (scenario == 1) {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        ack(Qt::cyan);
+        workspace()->activateWindow(window);
+        workspace()->slotWindowMove();
+        QVERIFY(window->isInteractiveMove());
+    }
+    const auto interactiveReset = qScopeGuard([&]() {
+        if (scenario == 1 && window->isInteractiveMove()) {
+            window->keyPressEvent(Qt::Key_Escape);
+        }
+    });
+    if (scenario == 2) {
+        window->m_placementContinuationRevision = maximum - 1;
+    } else if (scenario == 6) {
+        window->m_requestedTransientTileGeneration = 5;
+    }
+    const QPointer<Tile> firstGuard(first);
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QObject context;
+    bool intervened = false;
+    if (scenario == 3) {
+        connect(window, &Window::requestedGeometryChanged, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                window->requestTile(second);
+            }
+        });
+    } else if (scenario == 4 || scenario == 5) {
+        connect(leaf, &Tile::windowRemoved, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                if (scenario == 4) {
+                    m_rootTile->destroyChild(first);
+                } else {
+                    QVERIFY(!second->unmanage(window));
+                }
+            }
+        });
+    }
+    const auto placementBefore = window->m_placementContinuationRevision;
+    configure.clear();
+    window->requestTile(scenario == 1 ? nullptr : first);
+    const auto tiled = xdg->m_nextStates & allTiledStates;
+    switch (scenario) {
+    case 1:
+        // Interactive: the guarded step refuses, the legacy remainder untiles with its adjustment.
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    case 2:
+        // The exhaustion edge keeps the legacy cancellation (saturating) and the legacy body.
+        QCOMPARE(window->m_placementContinuationRevision, maximum);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 3:
+        // Reentrancy closed on the guarded path: the nested request's publication only.
+        QVERIFY(intervened);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(second->anchors()));
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(second->windowGeometry()));
+        break;
+    case 4:
+        // The destination disappeared inside the cancellation's release: the entry point stops
+        // after the release's own publication; nothing names an explicit null.
+        QVERIFY(intervened);
+        QVERIFY(!firstGuard);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        break;
+    case 5:
+        // A foreign stamp inside the release: the preparation is stale and the entry point stops.
+        QVERIFY(intervened);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        break;
+    case 6:
+        // The marker refuses the guarded step; the legacy remainder consumes it.
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_requestedTransientTileGeneration, quint64(0));
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QVERIFY(window->m_placementContinuationRevision > placementBefore);
+        break;
     }
 }
 
