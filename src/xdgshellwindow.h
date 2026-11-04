@@ -291,6 +291,10 @@ private:
     std::optional<OwnedMaximize> ownedMaximizePlan(MaximizeMode mode, MaximizeMode oldMode, const RectF &restore) const;
     bool ownedMaximizeFeasible(const RectF &managed, MaximizeMode mode, MaximizeMode oldMode) const;
     void maximizeOwned(const OwnedMaximize &plan, MaximizeMode mode, MaximizeMode oldMode, const RectF &oldGeometry, const RectF &clientArea);
+    AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {}) override;
+    // The client's limits after the rules, without the decoration's enforced minimum.
+    QSizeF ruleCheckedMinimumSize() const;
+    QSizeF ruleCheckedMaximumSize() const;
     void writeRequestedMaximizeMode(MaximizeMode mode);
     // Advanced by every requested-fullscreen write, the state the client is told; the intent
     // revision is advanced by those writes and by every requested-output write as well, since the

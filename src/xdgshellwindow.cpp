@@ -720,17 +720,26 @@ MaximizeMode XdgToplevelWindow::requestedMaximizeMode() const
     return m_requestedMaximizeMode;
 }
 
+QSizeF XdgToplevelWindow::ruleCheckedMinimumSize() const
+{
+    return rules()->checkMinSize(m_minimumSize);
+}
+
+QSizeF XdgToplevelWindow::ruleCheckedMaximumSize() const
+{
+    return rules()->checkMaxSize(QSizeF(m_maximumSize.width() > 0 ? m_maximumSize.width() : INT_MAX,
+                                        m_maximumSize.height() > 0 ? m_maximumSize.height() : INT_MAX));
+}
+
 QSizeF XdgToplevelWindow::minSize() const
 {
     const int enforcedMinimum = m_nextDecoration ? 150 : 20;
-    return rules()->checkMinSize(m_minimumSize).expandedTo(QSizeF(enforcedMinimum, enforcedMinimum));
+    return ruleCheckedMinimumSize().expandedTo(QSizeF(enforcedMinimum, enforcedMinimum));
 }
 
 QSizeF XdgToplevelWindow::maxSize() const
 {
-    return rules()->checkMaxSize(QSizeF(m_maximumSize.width() > 0 ? m_maximumSize.width() : INT_MAX,
-                                        m_maximumSize.height() > 0 ? m_maximumSize.height() : INT_MAX))
-        .expandedTo(minSize());
+    return ruleCheckedMaximumSize().expandedTo(minSize());
 }
 
 bool XdgToplevelWindow::isFullScreen() const
@@ -2442,6 +2451,184 @@ void XdgToplevelWindow::maximizeOwned(const OwnedMaximize &plan, MaximizeMode mo
         return;
     }
     markAsPlaced();
+}
+
+Window::AssignmentStepResult XdgToplevelWindow::normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned)
+{
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentStepResult result;
+    if (!before.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned)) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    // Mutation-free refusals. This is an ordinary normalization: an owner or an active request
+    // keeps its own path (an ingress revokes at its public cancellation boundary first), a rule or
+    // a running operation keeps the mode, the decoration's recursion guard is honoured, and the
+    // whole operation must have headroom before anything is written: the restore capture takes
+    // one placement continuation increment and the guarded request reserves its synchronization
+    // writes (at most seven) plus one committed change, so a shortage known at entry refuses here
+    // rather than superseding after the mode write.
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    constexpr quint64 placementBudget = 1 + 7 + 1;
+    if (changeMaximizeRecursion || m_transientOwnership || m_activeTransientRequest || !isResizable() || isAppletPopup()
+        || isInteractiveMoveResize() || isElectricBorderMaximizing() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
+        || !supportsAssignmentGeometryRequest() || m_requestedMaximizeRevision >= exhausted - 1
+        || m_placementContinuationRevision >= exhausted - placementBudget || m_geometryRequestGeneration >= exhausted - 1
+        || m_geometryUpdateGeneration >= exhausted - 1) {
+        return result;
+    }
+    // The size limits frozen before the first callback: the effective ones, which every boundary
+    // up to the operation's own decoration transition must find unchanged, and the client's
+    // rule-checked ones, which that transition itself does not touch. The receipt pins the
+    // effective limits the geometry is computed under; its constraint is chained onto the incoming
+    // provenance and captured by value.
+    const QSizeF entryMinimum = minSize();
+    const QSizeF entryMaximum = maxSize();
+    const QSizeF clientMinimum = ruleCheckedMinimumSize();
+    const QSizeF clientMaximum = ruleCheckedMaximumSize();
+    const auto entryLimitsHold = [&]() {
+        return minSize() == entryMinimum && maxSize() == entryMaximum;
+    };
+    const auto receiptFor = [this, owned](quint64 revision, const QSizeF &minimum, const QSizeF &maximum) {
+        return owned.withConstraint([this, revision, minimum, maximum]() {
+            return !isDeleted() && m_requestedMaximizeRevision == revision && minSize() == minimum && maxSize() == maximum;
+        });
+    };
+    const MaximizeMode oldMode = m_requestedMaximizeMode;
+    if (oldMode == MaximizeRestore) {
+        // An operation-owned no-op: nothing recorded, a fresh checkpoint, the receipt still detects
+        // a later requested-mode change.
+        result.owned = receiptFor(m_requestedMaximizeRevision, entryMinimum, entryMaximum);
+        result.checkpoint = makeTileAssignmentCheckpoint();
+        result.outcome = assignmentResultIsCurrent(result) ? AssignmentStepOutcome::AppliedCurrent : AssignmentStepOutcome::Superseded;
+        if (result.outcome != AssignmentStepOutcome::AppliedCurrent) {
+            result.checkpoint.reset();
+        }
+        return result;
+    }
+    // The validated entry state as an owned snapshot: the caller's fence is borrowed and a handler
+    // may destroy it, so it is never read again after the first callback. The other inputs are
+    // frozen as the legacy path reads them.
+    const TileAssignmentFence entry = makeTileAssignmentFence();
+    const RectF oldGeometry = moveResizeGeometry();
+    const RectF clientArea = workspace()->clientArea(MaximizeArea, this, moveResizeOutput());
+    const auto revisionBefore = m_requestedMaximizeRevision;
+    Q_EMIT maximizedAboutToChange(MaximizeRestore);
+    if (isDeleted() || !entry.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned) || m_requestedMaximizeRevision != revisionBefore || !entryLimitsHold()) {
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    writeRequestedMaximizeMode(MaximizeRestore);
+    const auto revision = m_requestedMaximizeRevision;
+    // From here every stop is a supersession: the mode is written and its publication is this
+    // write's own obligation, discharged while the write is current.
+    result.outcome = AssignmentStepOutcome::Superseded;
+    const auto publish = qScopeGuard([this, revision]() {
+        if (!isDeleted() && m_requestedMaximizeRevision == revision) {
+            doSetMaximized();
+        }
+    });
+    const auto written = makeTileAssignmentFence();
+    const auto current = [&]() {
+        return !isDeleted() && written.isCurrentFor(*this) && ownedProvenanceIsCurrent(owned) && m_requestedMaximizeRevision == revision && entryLimitsHold();
+    };
+    if (m_nextDecoration) {
+        // Every signal is a callback boundary of its own, and a handler may replace the decoration.
+        const QPointer<KDecoration3::DecoratedWindow> decorated(m_nextDecoration->window());
+        changeMaximizeRecursion = true;
+        const auto recursion = qScopeGuard([this]() {
+            changeMaximizeRecursion = false;
+        });
+        const auto decorationCurrent = [&]() {
+            return current() && decorated && m_nextDecoration && m_nextDecoration->window() == decorated.data();
+        };
+        if (oldMode & MaximizeVertical) {
+            Q_EMIT decorated->maximizedVerticallyChanged(false);
+            if (!decorationCurrent()) {
+                return result;
+            }
+        }
+        if (oldMode & MaximizeHorizontal) {
+            Q_EMIT decorated->maximizedHorizontallyChanged(false);
+            if (!decorationCurrent()) {
+                return result;
+            }
+        }
+        if (oldMode == MaximizeFull) {
+            Q_EMIT decorated->maximizedChanged(false);
+            if (!decorationCurrent()) {
+                return result;
+            }
+        }
+    }
+    QSizeF minimum = entryMinimum;
+    QSizeF maximum = entryMaximum;
+    if (options->borderlessMaximizedWindows()) {
+        // The operation's own decoration transition changes the enforced minimum, so the receipt
+        // is established against the limits after it. What must not change across it: the policy
+        // this operation set, the client's rule-checked limits, and the fenced state.
+        setNoBorder(false);
+        if (isDeleted() || !written.isCurrentFor(*this) || !ownedProvenanceIsCurrent(owned) || m_requestedMaximizeRevision != revision
+            || decorationPolicy() != rules()->checkDecorationPolicy(DecorationPolicy::PreferredByClient)
+            || ruleCheckedMinimumSize() != clientMinimum || ruleCheckedMaximumSize() != clientMaximum) {
+            return result;
+        }
+        minimum = minSize();
+        maximum = maxSize();
+    }
+    const OwnedProvenance receipt = receiptFor(revision, minimum, maximum);
+    // The legacy restore capture, exactly: only the axes that were not maximized are refreshed
+    // from the old geometry, and nothing is captured while a quick tile is already requested.
+    std::unique_ptr<TileAssignmentFence> afterRestore;
+    if (requestedQuickTileMode() == QuickTileMode(QuickTileFlag::None)) {
+        RectF savedGeometry = geometryRestore();
+        if (!(oldMode & MaximizeVertical)) {
+            savedGeometry.setTop(oldGeometry.top());
+            savedGeometry.setBottom(oldGeometry.bottom());
+        }
+        if (!(oldMode & MaximizeHorizontal)) {
+            savedGeometry.setLeft(oldGeometry.left());
+            savedGeometry.setRight(oldGeometry.right());
+        }
+        auto restore = setGeometryRestoreForAssignment(savedGeometry, written, receipt);
+        if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(restore)) {
+            return result;
+        }
+        afterRestore = std::move(restore.checkpoint);
+    }
+    const TileAssignmentFence &checkpoint = afterRestore ? *afterRestore : written;
+    // The legacy geometry: a valid restore is returned to, clamped to the minimum and centred per
+    // axis; an invalid one lets the client choose its size from the maximize area's origin.
+    RectF geometry = oldGeometry;
+    if (oldMode & MaximizeHorizontal) {
+        if (geometryRestore().isValid()) {
+            geometry.setWidth(std::max(geometryRestore().width(), minimum.width()));
+            geometry.moveHorizontalCenter(geometryRestore().horizontalCenter());
+        } else {
+            geometry.setX(clientArea.x());
+            geometry.setWidth(0);
+        }
+    }
+    if (oldMode & MaximizeVertical) {
+        if (geometryRestore().isValid()) {
+            geometry.setHeight(std::max(geometryRestore().height(), minimum.height()));
+            geometry.moveVerticalCenter(geometryRestore().verticalCenter());
+        } else {
+            geometry.setY(clientArea.y());
+            geometry.setHeight(0);
+        }
+    }
+    auto request = requestMoveResizeGuarded(geometry, MoveResizeMode::MoveResize, checkpoint, receipt);
+    if (request.result.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(request.result)) {
+        return result;
+    }
+    markAsPlaced();
+    // AppliedCurrent is this synchronous request, completed while current; not the client's
+    // acknowledgement. The carrier keeps the request's checkpoint and the receipt's provenance.
+    return std::move(request.result);
 }
 
 XdgPopupWindow::XdgPopupWindow(XdgPopupInterface *shellSurface)

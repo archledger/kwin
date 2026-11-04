@@ -1613,6 +1613,10 @@ private:
             None,
             Request,
             Ownership,
+            // An ordinary operation's own validity (for example a normalization's requested-mode
+            // revision), evaluated like an ownership constraint but without any ownership
+            // exemption: the request path treats it as ordinary provenance.
+            Operation,
         };
         // A declared constructor rather than member initializers: those would be a complete-class
         // context of Window and unusable in the default arguments below.
@@ -1640,6 +1644,25 @@ private:
             owned.constraint = std::move(constraint);
             return owned;
         }
+        // The incoming provenance with one more constraint chained onto it (both must hold); a
+        // provenance without kind becomes an Operation one. Every kind evaluates its constraint
+        // in addition to its own identity, so the operation's validity is carried into every
+        // child boundary and every later step that receives the result.
+        OwnedProvenance withConstraint(std::function<bool()> extra) const
+        {
+            OwnedProvenance chained = *this;
+            if (chained.kind == Kind::None) {
+                chained.kind = Kind::Operation;
+            }
+            if (!chained.constraint) {
+                chained.constraint = std::move(extra);
+            } else {
+                chained.constraint = [previous = chained.constraint, extra = std::move(extra)]() {
+                    return previous() && extra();
+                };
+            }
+            return chained;
+        }
 
         Kind kind;
         TransientTileRequest *request;
@@ -1659,6 +1682,14 @@ private:
     // with this window as member in a current context, and the association unchanged. Admission
     // feasibility is deliberately not reused: an owner may legitimately be maximized.
     bool transientOwnershipIsCurrent(quint64 generation) const;
+    // A heap checkpoint for a result carrier; the fence constructor itself stays Window-private.
+    std::unique_ptr<TileAssignmentFence> makeTileAssignmentCheckpoint();
+    // Normalizes a maximized window to the Restore mode for an ordinary guarded ingress, with its
+    // own recorded writes and guarded child calls. Refused without effect on a backend without
+    // guarded requests, for an owner or an active request, and for every mutation-free refusal of
+    // the backend; Superseded once a boundary ends it after the mode write; AppliedCurrent carries
+    // the request's checkpoint and a provenance whose constraint every later step evaluates.
+    [[nodiscard]] virtual AssignmentStepResult normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned = {});
     [[nodiscard]] AssignmentStepResult commitTileForAssignment(Tile *target, const TileAssignmentFence &before);
     [[nodiscard]] AssignmentStepResult setGeometryRestoreForAssignment(RectF desired, const TileAssignmentFence &before, OwnedProvenance owned = {});
     void setGeometryRestoreInternal(const RectF &desired, AssignmentStepResult *guardedResult = nullptr);
