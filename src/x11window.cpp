@@ -34,7 +34,9 @@
 #include "wayland_server.h"
 #include "workspace.h"
 #include <KDecoration3/DecoratedWindow>
+
 #include <KDecoration3/Decoration>
+#include <algorithm>
 // KDE
 #include <KApplicationTrader>
 #include <KStartupInfo>
@@ -900,9 +902,14 @@ DecorationPolicy X11Window::decorationPolicy() const
 
 void X11Window::setDecorationPolicy(DecorationPolicy policy)
 {
+    setDecorationPolicyInternal(policy, nullptr);
+}
+
+bool X11Window::setDecorationPolicyInternal(DecorationPolicy policy, DecorationReactionRecorder *recorder)
+{
     const DecorationPolicy effectivePolicy = rules()->checkDecorationPolicy(policy);
     if (m_decorationPolicy == effectivePolicy) {
-        return;
+        return true;
     }
     // The window outlives the whole transition: a handler of one of its notifications may close it
     // and drop its last reference, and the steps after that still run on this object.
@@ -911,9 +918,21 @@ void X11Window::setDecorationPolicy(DecorationPolicy policy)
         unref();
     });
     writeDecorationPolicy(effectivePolicy);
-    updateDecoration(true, false);
-    updateWindowRules(Rules::DecorationPolicy);
-    Q_EMIT decorationPolicyChanged();
+    const auto policyRevision = m_decorationPolicyRevision;
+    if (recorder) {
+        // The operation's own write: the one advance its boundaries expect.
+        recorder->expectedPolicyRevision = policyRevision;
+    }
+    const bool updated = updateDecorationInternal(true, false, recorder);
+    // The write's own obligations (the rules, the notification). On the owned path they are gated
+    // by the write's currentness alone: a nested foreign write has announced its own policy, a
+    // closure announces nothing, and the operation's state does not withhold a real change's
+    // announcement. The public path keeps its legacy behaviour.
+    if (!recorder || (!isDeleted() && m_decorationPolicyRevision == policyRevision)) {
+        updateWindowRules(Rules::DecorationPolicy);
+        Q_EMIT decorationPolicyChanged();
+    }
+    return updated && (!recorder || recorder->current());
 }
 
 void X11Window::writeDecorationPolicy(DecorationPolicy policy)
@@ -1022,12 +1041,27 @@ static QPointF gravityReferencePoint(const QMarginsF &margins, xcb_gravity_t gra
 
 void X11Window::updateDecoration(bool check_workspace_pos, bool force)
 {
+    updateDecorationInternal(check_workspace_pos, force, nullptr);
+}
+
+bool X11Window::updateDecorationInternal(bool check_workspace_pos, bool force, DecorationReactionRecorder *recorder)
+{
     // The window outlives the update: its steps after a closure inside a notification still run
-    // on this object.
+    // on this object. With a recorder, no geometry-update block (its release would send a
+    // configure for writes that were only recorded), the frame-margin rectangle and the workspace
+    // check are recorded, and every callback-producing step revalidates.
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
+    if (recorder && !recorder->sequence.empty()) {
+        // The update starts from the window's written geometry: reactions recorded before it (a
+        // kept decoration's border changes) would have moved the window first, so no supported
+        // sequence contains them, and the legacy writes below follow. A creation the update would
+        // need is then not installed (the closure is no longer current); the normalization refuses
+        // a decorated window whose restore writes the policy, so it never reaches this.
+        recorder->foreign = true;
+    }
     const RectF oldGeometry = moveResizeGeometry();
 
     const QMarginsF previousFrameMargins = frameMargins();
@@ -1038,13 +1072,13 @@ void X11Window::updateDecoration(bool check_workspace_pos, bool force)
     switch (preferredDecorationMode()) {
     case DecorationMode::None:
     case DecorationMode::Client:
-        destroyDecoration();
+        destroyDecorationInternal(recorder);
         break;
     case DecorationMode::Shadow:
-        createDecoration(KDecoration3::Style::Shadow, force);
+        createDecorationInternal(KDecoration3::Style::Shadow, force, recorder);
         break;
     case DecorationMode::Server:
-        createDecoration(KDecoration3::Style::Titled, force);
+        createDecorationInternal(KDecoration3::Style::Titled, force, recorder);
         break;
     }
 
@@ -1055,12 +1089,36 @@ void X11Window::updateDecoration(bool check_workspace_pos, bool force)
 
     const RectF geometry(pos() - previousFrameAdjustment + currentFrameAdjustement, clientSizeToFrameSize(clientSize()));
 
+    if (recorder && !recorder->foreign) {
+        if (!recorder->current()) {
+            return false;
+        }
+        // Recorded, not written: the frame-margin rectangle the legacy update requests (nothing was
+        // written, so the position and the client size are still the ones it reads), then its
+        // workspace check of the entry geometry against that rectangle.
+        recorder->planned = geometry;
+        if (check_workspace_pos) {
+            recorder->sequence.push_back(DecorationReactionRecorder::Reaction::UpdateCheck);
+            const auto decision = workspacePositionDecision(oldGeometry, nullptr, recorder->planned);
+            if (decision.kind == WorkspacePositionDecision::Kind::Geometry) {
+                recorder->planned = decision.geometry;
+            } else if (decision.kind == WorkspacePositionDecision::Kind::LegacySpecial) {
+                recorder->foreign = true;
+            }
+        }
+        return recorder->current();
+    }
+
+    // The legacy writes; with a recorder, after an unsupported reaction (a destruction, or reactions
+    // recorded before the update), which wrote or writes here through the public paths the fence
+    // detects: the operation supersedes.
     blockGeometryUpdates(true);
     moveResize(geometry);
     if (check_workspace_pos) {
         checkWorkspacePosition(oldGeometry);
     }
     blockGeometryUpdates(false);
+    return !recorder;
 }
 
 void X11Window::invalidateDecoration()
@@ -1070,7 +1128,13 @@ void X11Window::invalidateDecoration()
 
 void X11Window::createDecoration(KDecoration3::Style style, bool force)
 {
+    createDecorationInternal(style, force, nullptr);
+}
+
+void X11Window::createDecorationInternal(KDecoration3::Style style, bool force, DecorationReactionRecorder *recorder)
+{
     if ((decoration() && decoration()->style() == style) && !force) {
+        // The kept decoration: no installation and nothing recorded.
         return;
     }
 
@@ -1082,11 +1146,28 @@ void X11Window::createDecoration(KDecoration3::Style style, bool force)
         unref();
     });
     std::shared_ptr<KDecoration3::Decoration> decoration(Workspace::self()->decorationBridge()->createDecoration(this, style));
+    KDecoration3::Decoration *const installed = decoration.get();
+    if (recorder) {
+        // Bound before the new decoration can notify anything: its border notifications within the
+        // transition are recorded reactions, not legacy writes. (Its initial state, applied below,
+        // precedes the border hook and notifies nothing.)
+        recorder->decoration = installed;
+        recorder->sequence.push_back(DecorationReactionRecorder::Reaction::Created);
+    }
     if (decoration) {
         decoration->apply(decoration->nextState()->clone());
 
-        connect(decoration.get(), &KDecoration3::Decoration::bordersChanged, this, [this]() {
+        // The border hook: its identified reaction is recorded while a normalization's recorder is
+        // bound to this very decoration, by identity and by the incarnation's generation (an address
+        // a newer decoration reuses within the transition is not this one); otherwise the legacy
+        // writes.
+        connect(decoration.get(), &KDecoration3::Decoration::bordersChanged, this, [this, installed]() {
             if (isDeleted()) {
+                return;
+            }
+            if (m_decorationReactionRecorder && m_decorationReactionRecorder->decoration == installed
+                && m_decorationGeneration == m_decorationReactionRecorder->generation) {
+                recordBorderReaction(*m_decorationReactionRecorder);
                 return;
             }
             const RectF oldGeometry = moveResizeGeometry();
@@ -1100,18 +1181,51 @@ void X11Window::createDecoration(KDecoration3::Style style, bool force)
             }
         });
     }
-
-    setDecoration(std::move(decoration));
+    if (recorder && !recorder->current()) {
+        // The operation ended while the initial state was applied (a closure, or any change the
+        // recorder's boundary detects): nothing more is installed for it; the decoration goes with
+        // this function's reference, and the window keeps the written policy until the next
+        // decoration update, as it does when no decoration can be created.
+        return;
+    }
+    // The installation reports the incarnation's generation at its commit, before any observer
+    // runs, and (guarded) withholds its final notification once that incarnation is gone.
+    quint64 installedGeneration = 0;
+    const bool installationCurrent = installDecoration(std::move(decoration), recorder != nullptr, &installedGeneration);
+    if (recorder) {
+        recorder->generation = installedGeneration;
+        // The installation's obligations. Its frame extents are the operation's from here, whatever
+        // the geometry's outcome. Its shadow is its own: updated while it is the current
+        // incarnation, whatever the operation's state (a replacement's own installation covers the
+        // newer one).
+        recorder->extentsPending = true;
+        if (!installationCurrent || isDeleted() || m_decorationGeneration != installedGeneration) {
+            return;
+        }
+        updateShadow();
+        return;
+    }
     updateShadow();
     updateFrameExtents();
 }
 
 void X11Window::destroyDecoration()
 {
+    destroyDecorationInternal(nullptr);
+}
+
+void X11Window::destroyDecorationInternal(DecorationReactionRecorder *recorder)
+{
     if (!decoration()) {
         return;
     }
 
+    if (recorder) {
+        // Never part of a supported sequence: the legacy writes follow, here and in the update,
+        // which the fence detects.
+        recorder->sequence.push_back(DecorationReactionRecorder::Reaction::Destroyed);
+        recorder->foreign = true;
+    }
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
@@ -1119,6 +1233,18 @@ void X11Window::destroyDecoration()
     setDecoration(nullptr);
     updateShadow();
     updateFrameExtents();
+}
+
+void X11Window::recordBorderReaction(DecorationReactionRecorder &recorder)
+{
+    recorder.sequence.push_back(DecorationReactionRecorder::Reaction::Borders);
+    const auto decision = workspacePositionDecision(recorder.planned, nullptr, recorder.planned);
+    if (decision.kind == WorkspacePositionDecision::Kind::Geometry) {
+        recorder.planned = decision.geometry;
+    } else if (decision.kind == WorkspacePositionDecision::Kind::LegacySpecial) {
+        recorder.foreign = true;
+    }
+    recorder.extentsPending = true;
 }
 
 void X11Window::detectNoBorder()
@@ -3529,9 +3655,51 @@ X11Window::GeometryConstraints X11Window::geometryConstraints() const
     constraints.maxAspect = m_geometryHints.maxAspect();
     constraints.decorated = isDecorated();
     constraints.decorationPolicy = m_decorationPolicy;
+    constraints.borders = QMarginsF(borderLeft(), borderTop(), borderRight(), borderBottom());
+    constraints.decorationGeneration = m_decorationGeneration;
+    constraints.decorationPolicyRevision = m_decorationPolicyRevision;
     constraints.clientFrameExtents = m_clientFrameExtents;
     constraints.xwaylandScale = kwinApp()->xwaylandScale();
     return constraints;
+}
+
+X11Window::GeometryConstraints X11Window::GeometryConstraints::clientSide() const
+{
+    GeometryConstraints client = *this;
+    client.decorated = false;
+    client.decorationPolicy = DecorationPolicy::ClientPreference;
+    client.borders = QMarginsF();
+    client.decorationGeneration = 0;
+    client.decorationPolicyRevision = 0;
+    return client;
+}
+
+bool X11Window::DecorationReactionRecorder::supported(bool updated) const
+{
+    // Without a policy write, the kept decoration's border reactions alone. With one, the update it
+    // runs: a creation first when it recreates, the update's own workspace check exactly once after
+    // it (since 6.8 the update moves and checks whether or not it recreates), then border reactions;
+    // nothing else (a destruction, or a reaction between the creation and the check, whose legacy
+    // write the update's rectangle would not fold in).
+    if (foreign) {
+        return false;
+    }
+    size_t index = 0;
+    if (updated) {
+        if (index < sequence.size() && sequence[index] == Reaction::Created) {
+            ++index;
+        }
+        if (index >= sequence.size() || sequence[index] != Reaction::UpdateCheck) {
+            return false;
+        }
+        ++index;
+    }
+    for (; index < sequence.size(); ++index) {
+        if (sequence[index] != Reaction::Borders) {
+            return false;
+        }
+    }
+    return true;
 }
 
 RectF X11Window::prospectiveRestoreGeometry(MaximizeMode oldMode, const RectF &geometry) const
@@ -3554,9 +3722,9 @@ bool X11Window::canNormalizeMaximizeForAssignment() const
     // mutations. Beyond the ordinary ones (the decoration recursion guard, an owner or an active
     // request, an unresizable or applet-popup window, an interactive or electric-border operation,
     // a rule-forced maximize, an unsupported request): a fullscreen window, whose legacy restore
-    // is the fullscreen area and no normalization for tiling; a decorated window or the
-    // borderless-maximized policy, whose decoration transition writes geometry through public
-    // paths on X11 (excluded until it is routed through the operation); an invalid prospective
+    // is the fullscreen area and no normalization for tiling; the decoration transition's own
+    // bounds below (a decorated window or the borderless-maximized policy, whose transition is the
+    // operation's own); an invalid prospective
     // restore rectangle, which the legacy path places with intermediate writes. The headroom covers
     // the mode revision, the restore capture's placement increment plus the guarded request's
     // worst case, and the request's own generations, so a shortage known at entry refuses rather
@@ -3564,14 +3732,34 @@ bool X11Window::canNormalizeMaximizeForAssignment() const
     const auto exhausted = std::numeric_limits<quint64>::max();
     if (changeMaximizeRecursion || m_transientOwnership || m_activeTransientRequest || !isResizable() || isAppletPopup()
         || isInteractiveMoveResize() || isElectricBorderMaximizing() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
-        || !supportsAssignmentGeometryRequest() || isFullScreen() || isDecorated() || options->borderlessMaximizedWindows()) {
+        || !supportsAssignmentGeometryRequest() || isFullScreen()) {
+        return false;
+    }
+    // The decoration transition's own bounds: its reactions' workspace check would take the
+    // special-state branch for a requested quick tile (its restore-field effects are not routed),
+    // whether a kept decoration reacts or the borderless policy's restoration recreates one (an
+    // undecorated window at entry; refused conservatively even when the client would prefer its
+    // own decorations and no recreation would follow); and a decoration without its decorated
+    // window has no signals to route.
+    const bool restoresPolicy = options->borderlessMaximizedWindows() && m_decorationPolicy != rules()->checkDecorationPolicy(DecorationPolicy::ClientPreference);
+    if ((isDecorated() || restoresPolicy) && requestedQuickTileMode() != QuickTileMode(QuickTileFlag::None)) {
+        return false;
+    }
+    // Since 6.8 the policy write's decoration update moves from the window's written geometry, which
+    // a kept decoration's border reactions would already have moved: a decorated window whose
+    // restore also writes the policy is refused (no supported sequence records both).
+    if (isDecorated() && restoresPolicy) {
+        return false;
+    }
+    if (isDecorated() && !decoration()->window()) {
         return false;
     }
     if (max_mode != MaximizeRestore && !prospectiveRestoreGeometry(max_mode, moveResizeGeometry()).isValid()) {
         return false;
     }
     return m_maximizeModeRevision < exhausted - 1 && m_placementContinuationRevision < exhausted - assignmentPlacementBudget
-        && m_geometryRequestGeneration < exhausted - 1 && m_geometryUpdateGeneration < exhausted - 1;
+        && m_geometryRequestGeneration < exhausted - 1 && m_geometryUpdateGeneration < exhausted - 1
+        && m_decorationGeneration < exhausted - 1 && m_decorationPolicyRevision < exhausted - 1;
 }
 
 Window::AssignmentStepResult X11Window::normalizeMaximizeForAssignment(const TileAssignmentFence &before, OwnedProvenance owned)
@@ -3627,11 +3815,12 @@ Window::AssignmentStepResult X11Window::normalizeMaximizeForAssignment(const Til
     // whatever the geometry's outcome.
     result.outcome = AssignmentStepOutcome::Superseded;
     const auto written = makeTileAssignmentFence();
-    const OwnedProvenance receipt = receiptFor(revision, entryConstraints);
+    const OwnedProvenance entryReceipt = receiptFor(revision, entryConstraints);
     const auto modeCurrent = [this, revision]() {
         return !isDeleted() && m_maximizeModeRevision == revision;
     };
     AssignmentStepResult request;
+    DecorationReactionRecorder recorder;
     const bool applied = [&]() {
         // The legacy restore capture, exactly and before the decoration transition point: only the
         // axes that were not maximized are refreshed from the entry frame, nothing while a quick
@@ -3647,17 +3836,101 @@ Window::AssignmentStepResult X11Window::normalizeMaximizeForAssignment(const Til
                 savedGeometry.setLeft(entryFrame.x());
                 savedGeometry.setWidth(entryFrame.width());
             }
-            auto restore = setGeometryRestoreForAssignment(savedGeometry, written, receipt);
+            auto restore = setGeometryRestoreForAssignment(savedGeometry, written, entryReceipt);
             if (restore.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(restore)) {
                 return false;
             }
             afterRestore = std::move(restore.checkpoint);
         }
         const TileAssignmentFence &checkpoint = afterRestore ? *afterRestore : written;
-        // The decoration transition point: nothing runs here for the undecorated window. The final
-        // rectangle is read after it, as the legacy Restore branch reads its starting geometry
-        // after the decoration reactions; a validity lost since the preflight is a supersession.
-        RectF geometry = prospectiveRestoreGeometry(oldMode, moveResizeGeometry());
+        // The decoration transition as the operation's own: the decorated window's maximized
+        // signals (a kept decoration's border reaction recorded) and, under the borderless policy,
+        // the policy the legacy restore would set (the recreation recorded), with no geometry-update
+        // block; every callback-producing step revalidates, and a public write from a foreign
+        // handler reaches the fence. The client-side constraints must hold across it; the
+        // decoration-side ones are validated as the exact authorized incarnation afterwards.
+        recorder.decoration = decoration();
+        recorder.generation = m_decorationGeneration;
+        recorder.expectedPolicyRevision = m_decorationPolicyRevision;
+        recorder.planned = moveResizeGeometry();
+        const GeometryConstraints entryClient = entryConstraints.clientSide();
+        recorder.current = [&]() {
+            // The checkpoint after the restore capture, not the fence before it; the incarnation
+            // and the policy revision the recorder expects (its own recorded creation and the
+            // operation's own policy write advance them), so a foreign policy-only change or a bare
+            // generation advance on the same incarnation ends the operation at the next boundary.
+            return !isDeleted() && checkpoint.isCurrentFor(*this) && ownedProvenanceIsCurrent(owned) && m_maximizeModeRevision == revision
+                && geometryConstraints().clientSide() == entryClient && m_decorationGeneration == recorder.generation
+                && m_decorationPolicyRevision == recorder.expectedPolicyRevision && !recorder.foreign;
+        };
+        const auto generationBefore = m_decorationGeneration;
+        const DecorationPolicy policyBefore = m_decorationPolicy;
+        const auto policyRevisionBefore = m_decorationPolicyRevision;
+        DecorationPolicy expectedPolicy = policyBefore;
+        {
+            // The recorder's active scope: the border hook records only while it lasts, and it ends
+            // before the geometry request, so a border reaction inside the request's notifications
+            // writes through the legacy path and the receipt detects it.
+            m_decorationReactionRecorder = &recorder;
+            const auto recorderReset = qScopeGuard([this]() {
+                m_decorationReactionRecorder = nullptr;
+            });
+            if (isDecorated() && decoration()->window()) {
+                const QPointer<KDecoration3::DecoratedWindow> decorated(decoration()->window());
+                changeMaximizeRecursion = true;
+                const auto recursion = qScopeGuard([]() {
+                    changeMaximizeRecursion = false;
+                });
+                const auto signalCurrent = [&]() {
+                    return recorder.current() && decorated;
+                };
+                if (oldMode & MaximizeVertical) {
+                    Q_EMIT decorated->maximizedVerticallyChanged(false);
+                    if (!signalCurrent()) {
+                        return false;
+                    }
+                }
+                if (oldMode & MaximizeHorizontal) {
+                    Q_EMIT decorated->maximizedHorizontallyChanged(false);
+                    if (!signalCurrent()) {
+                        return false;
+                    }
+                }
+                if (oldMode == MaximizeFull) {
+                    Q_EMIT decorated->maximizedChanged(false);
+                    if (!signalCurrent()) {
+                        return false;
+                    }
+                }
+            }
+            if (options->borderlessMaximizedWindows()) {
+                // The legacy restore's setNoBorder(false): the policy preferred by the client,
+                // through the recorder-aware path.
+                expectedPolicy = rules()->checkDecorationPolicy(DecorationPolicy::ClientPreference);
+                if (!setDecorationPolicyInternal(DecorationPolicy::ClientPreference, &recorder)) {
+                    return false;
+                }
+            }
+            // After the transition, the explicit validation of the authorized changes: the
+            // supported reaction sequence, the exact incarnation (its identity, and the generation
+            // equal to the entry one plus the recorded creations) and the expected policy
+            // transition, so an away-and-back change cannot hide. The closure's generation and
+            // policy-revision clauses already stop the operation at the boundary where such a
+            // change happens; these comparisons are the final, redundant layer.
+            const auto created = std::count(recorder.sequence.begin(), recorder.sequence.end(), DecorationReactionRecorder::Reaction::Created);
+            const quint64 expectedGeneration = generationBefore + created;
+            const quint64 expectedPolicyRevision = policyRevisionBefore + (expectedPolicy != policyBefore ? 1 : 0);
+            if (!recorder.current() || !recorder.supported(expectedPolicy != policyBefore) || decoration() != recorder.decoration || m_decorationGeneration != expectedGeneration
+                || recorder.generation != expectedGeneration || m_decorationPolicy != expectedPolicy || m_decorationPolicyRevision != expectedPolicyRevision) {
+                return false;
+            }
+        }
+        // The receipt against what holds now, the post-transition borders included.
+        const OwnedProvenance receipt = receiptFor(revision, geometryConstraints());
+        // The final rectangle from the planned one, as the legacy Restore branch reads its starting
+        // geometry after the decoration reactions; a validity lost since the preflight is a
+        // supersession.
+        RectF geometry = prospectiveRestoreGeometry(oldMode, recorder.planned);
         if (!geometry.isValid()) {
             return false;
         }
@@ -3670,6 +3943,13 @@ Window::AssignmentStepResult X11Window::normalizeMaximizeForAssignment(const Til
         request = std::move(guarded.result);
         return true;
     }();
+    // The frame-extents update the transition recorded: an obligation of the decoration
+    // incarnation it recorded for, discharged whatever the geometry's outcome, so a superseded
+    // request never leaves the extents describing the old decoration and an obsolete recorder
+    // never overwrites a newer decoration's.
+    if (recorder.extentsPending && !isDeleted() && decoration() == recorder.decoration && m_decorationGeneration == recorder.generation) {
+        updateFrameExtents();
+    }
     // The publication, in the legacy order: the state property (no callback), the allowed actions
     // (each of its notifications behind the mode-write predicate), the maximize rules, and the
     // mode notification last. It completes before the outcome is decided.

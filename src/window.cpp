@@ -2698,8 +2698,16 @@ void Window::cancelInteractiveMoveResize()
 
 void Window::setDecoration(std::shared_ptr<KDecoration3::Decoration> decoration)
 {
+    installDecoration(std::move(decoration), false);
+}
+
+bool Window::installDecoration(std::shared_ptr<KDecoration3::Decoration> decoration, bool guarded, quint64 *installedGeneration)
+{
     if (m_decoration.decoration == decoration) {
-        return;
+        if (installedGeneration) {
+            *installedGeneration = m_decorationGeneration;
+        }
+        return true;
     }
     if (decoration) {
         connect(decoration.get(), &KDecoration3::Decoration::shadowChanged, this, [this]() {
@@ -2744,9 +2752,19 @@ void Window::setDecoration(std::shared_ptr<KDecoration3::Decoration> decoration)
     const std::shared_ptr<KDecoration3::Decoration> displaced = std::move(m_decoration.decoration);
     m_decoration.decoration = std::move(decoration);
     advanceDecorationGeneration();
+    const quint64 installed = m_decorationGeneration;
+    if (installedGeneration) {
+        *installedGeneration = installed;
+    }
     updateDecorationInputShape();
     updateDecorationBorderRadius();
+    if (guarded && (isDeleted() || m_decorationGeneration != installed)) {
+        // Closed or replaced inside the border-radius notification: the newer installation
+        // announced its own state, this one announces nothing more.
+        return false;
+    }
     Q_EMIT decorationChanged();
+    return !guarded || (!isDeleted() && m_decorationGeneration == installed);
 }
 
 void Window::advanceDecorationGeneration()
