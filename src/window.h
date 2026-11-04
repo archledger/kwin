@@ -1591,6 +1591,7 @@ private:
     friend class WaylandWindow;
     friend class XdgSurfaceWindow;
     friend class XdgToplevelWindow;
+    friend class X11Window;
     friend class TransientTileController;
     friend class TilesTest;
     friend class ::TestXdgShellWindow;
@@ -2024,6 +2025,15 @@ protected:
     // a dispatcher reports what it staged or published through the stack-bound request.
     virtual bool supportsAssignmentGeometryRequest() const;
     virtual void dispatchAssignmentGeometryRequest(const RectF &rect, MoveResizeMode mode, AssignmentGeometryRequest &request);
+    // Whether the backend's quick-tile protocol state commits immediately (an X11 window): the
+    // association write's publication is then a committed-association change the steps budget.
+    virtual bool assignmentPublishesImmediately() const;
+    // The association write's publication, the obligation of the guarded association and forget
+    // steps. With a carrier (the step's current continuation) a backend that commits immediately
+    // records that commit as the carrier's own write; without one it publishes the still-current
+    // association of an operation already superseded, which it never resurrects. The base
+    // implementation stages the protocol state (doSetQuickTileMode) and touches no counter.
+    virtual void publishRequestedTileForAssignment(AssignmentStepResult *carrier);
 
 private:
     // Declared after MoveResizeMode; they belong with the private guarded entries above. The owned
