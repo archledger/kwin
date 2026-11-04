@@ -18,6 +18,7 @@
 #include "decorations/settings.h"
 #include "effect/effecthandler.h"
 #include "pointer_input.h"
+#include "rules.h"
 #include "tiles/tilemanager.h"
 #include "tiles/transientplacementwriter.h"
 #include "tiles/transienttilecontroller.h"
@@ -56,6 +57,7 @@
 #include <QTimer>
 
 #include <KConfigGroup>
+#include <KSharedConfig>
 
 #include <KPluginFactory>
 #include <KPluginMetaData>
@@ -360,6 +362,10 @@ private Q_SLOTS:
     void testOwnedFullScreenSupersession();
     void testOwnedFullScreenDecorated_data();
     void testOwnedFullScreenDecorated();
+    void testNormalizeMaximize_data();
+    void testNormalizeMaximize();
+    void testNormalizeMaximizeSupersession_data();
+    void testNormalizeMaximizeSupersession();
     void testTransientNoRequestProofReplay();
     void testNoRequestFinalization_data();
     void testNoRequestFinalization();
@@ -7976,6 +7982,729 @@ void TestXdgShellWindow::testOwnedFullScreenDecorated()
     QCOMPARE(QRectF(window->frameGeometry()), managed);
     QVERIFY(owned());
     QCOMPARE(window->tile(), leaf);
+}
+
+void TestXdgShellWindow::testNormalizeMaximize_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("full") << 0;
+    QTest::newRow("horizontal") << 1;
+    QTest::newRow("vertical") << 2;
+    QTest::newRow("decorated-full") << 3;
+    QTest::newRow("restore-no-op") << 4;
+    QTest::newRow("no-op-lagging-acknowledgement") << 5;
+    QTest::newRow("quick-tile-skips-capture") << 6;
+    QTest::newRow("invalid-restore") << 7;
+    QTest::newRow("captures-only-unmaximized-axis") << 8;
+    QTest::newRow("stale-fence") << 9;
+    QTest::newRow("lapsed-provenance") << 10;
+    QTest::newRow("refused-owner") << 11;
+    QTest::newRow("refused-unresizable") << 12;
+    QTest::newRow("refused-fullscreen") << 13;
+    QTest::newRow("refused-rule-forced") << 14;
+    QTest::newRow("refused-electric-border") << 15;
+    QTest::newRow("refused-headroom") << 16;
+    QTest::newRow("refused-recursion-at-decoration-signal") << 17;
+    QTest::newRow("refused-placement-headroom") << 18;
+    QTest::newRow("placement-budget-boundary") << 19;
+    QTest::newRow("chained-provenance") << 20;
+}
+
+void TestXdgShellWindow::testNormalizeMaximize()
+{
+    // The guarded normalization makes its own recorded writes and guarded child calls, refuses
+    // without effect where the backend would refuse, and returns a receipt whose validity every
+    // later step evaluates.
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    const bool decorated = scenario == 3 || scenario == 17;
+    KSharedConfig::Ptr rules;
+    if (scenario == 14) {
+        rules = KSharedConfig::openConfig(QStringLiteral("kwinrulesrc"), KConfig::SimpleConfig);
+        for (const QString &group : rules->groupList()) {
+            rules->deleteGroup(group);
+        }
+        workspace()->rulebook()->setConfig(rules);
+        rules->group(QStringLiteral("General")).writeEntry("rules", QStringList{QStringLiteral("normalize-rule")});
+        KConfigGroup group = rules->group(QStringLiteral("normalize-rule"));
+        group.writeEntry("maximizehoriz", true);
+        group.writeEntry("maximizehorizrule", int(Rules::Force));
+        group.writeEntry("maximizevert", true);
+        group.writeEntry("maximizevertrule", int(Rules::Force));
+        group.writeEntry("wmclass", "org.example.normalize");
+        group.writeEntry("wmclasscomplete", false);
+        group.writeEntry("wmclassmatch", int(Rules::ExactMatch));
+        group.sync();
+        workspace()->slotReconfigure();
+    }
+    const auto rulesReset = qScopeGuard([&]() {
+        if (rules) {
+            for (const QString &group : rules->groupList()) {
+                rules->deleteGroup(group);
+            }
+            rules->sync();
+            workspace()->slotReconfigure();
+        }
+    });
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), decorated ? Test::CreationSetup::CreateOnly : Test::CreationSetup::CreateAndConfigure));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+    shell->set_app_id(QStringLiteral("org.example.normalize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    if (decorated) {
+        decoration = Test::createXdgToplevelDecorationV1(shell.get());
+        decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+        surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        QVERIFY(configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    }
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(configure.count() >= (decorated ? 2 : 1) || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>().isEmpty() ? QSize(200, 100) : toplevelConfigure.last().at(0).value<QSize>(), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const auto xdg = static_cast<XdgToplevelWindow *>(window);
+    const QRectF original = window->frameGeometry();
+    const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+    };
+    MaximizeMode mode = MaximizeFull;
+    if (scenario == 1) {
+        mode = MaximizeHorizontal;
+    } else if (scenario == 2) {
+        mode = MaximizeVertical;
+    }
+    // Rows that start maximized through the public path, acknowledged.
+    if (scenario <= 3 || scenario == 5 || scenario == 7 || scenario == 9 || scenario == 10 || scenario == 15 || scenario == 16 || scenario == 17 || scenario == 20) {
+        configure.clear();
+        window->maximize(mode);
+        QCOMPARE(window->requestedMaximizeMode(), mode);
+        ack(Qt::green);
+        QCOMPARE(window->maximizeMode(), mode);
+    }
+    if (scenario == 14) {
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+    }
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    auto *const quickTile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+    QVERIFY(quickTile);
+    switch (scenario) {
+    case 5:
+        // The requested mode is Restore while the acknowledged one still lags.
+        window->maximize(MaximizeRestore);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        break;
+    case 6:
+        // Tiled, then horizontally maximized by a property-only write: the vertical extents of the
+        // tile differ from the restore's, so a capture would be visible; it must be skipped.
+        configure.clear();
+        window->requestTile(quickTile);
+        QCOMPARE(window->requestedTile(), quickTile);
+        ack(Qt::blue);
+        QVERIFY(QRectF(window->moveResizeGeometry()).height() != original.height());
+        xdg->m_requestedMaximizeMode = MaximizeHorizontal;
+        ++xdg->m_requestedMaximizeRevision;
+        break;
+    case 7:
+        window->setGeometryRestore(RectF());
+        QVERIFY(!window->geometryRestore().isValid());
+        break;
+    case 8:
+    case 18:
+    case 19:
+        // Horizontally maximized, then moved vertically: only the vertical axis is captured. The
+        // capture changes the restore, so the placement budget is exercised in full: a shortage
+        // known at entry (the capture would leave the request short) is refused before anything is
+        // written, and the last admissible value completes.
+        configure.clear();
+        window->maximize(MaximizeHorizontal);
+        ack(Qt::green);
+        QCOMPARE(window->maximizeMode(), MaximizeHorizontal);
+        configure.clear();
+        window->moveResize(RectF(area.x(), 50, area.width(), 300));
+        ack(Qt::cyan);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(area.x(), 50, area.width(), 300));
+        QCOMPARE(QRectF(window->geometryRestore()), original);
+        if (scenario == 18) {
+            window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - 3;
+        } else if (scenario == 19) {
+            window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - 10;
+        }
+        break;
+    case 11: {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.normalize");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+        auto manager = workspace()->tileManager(window->moveResizeOutput());
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+        QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        const auto state = writer.snapshot();
+        configure.clear();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        break;
+    }
+    case 12:
+        shell->set_min_size(200, 100);
+        shell->set_max_size(200, 100);
+        surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(!window->isResizable());
+        xdg->m_requestedMaximizeMode = MaximizeFull;
+        ++xdg->m_requestedMaximizeRevision;
+        break;
+    case 13:
+        configure.clear();
+        window->setFullScreen(true);
+        QVERIFY(window->isRequestedFullScreen());
+        QVERIFY(!window->isResizable());
+        xdg->m_requestedMaximizeMode = MaximizeFull;
+        ++xdg->m_requestedMaximizeRevision;
+        break;
+    case 15:
+        window->setElectricBorderMode(ElectricBorderMode(MaximizeFull));
+        window->setElectricBorderMaximizing(true);
+        QVERIFY(window->isElectricBorderMaximizing());
+        break;
+    case 16:
+        xdg->m_requestedMaximizeRevision = std::numeric_limits<quint64>::max() - 1;
+        break;
+    }
+    const auto electricReset = qScopeGuard([&]() {
+        if (scenario == 15) {
+            window->setElectricBorderMaximizing(false);
+            window->setElectricBorderMode(std::nullopt);
+        }
+    });
+    const MaximizeMode before = window->requestedMaximizeMode();
+    const auto revisionBefore = xdg->m_requestedMaximizeRevision;
+    const QRectF restoreBefore = window->geometryRestore();
+    const QRectF geometryBefore = window->moveResizeGeometry();
+    QSignalSpy aboutToChange(window, &Window::maximizedAboutToChange);
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    auto fence = window->makeTileAssignmentFence();
+    if (scenario == 9) {
+        // A later public request makes the input stale before the step runs.
+        window->moveResize(RectF(0, 0, 300, 200));
+        QVERIFY(!fence.isCurrentFor(*window));
+    }
+    if (scenario == 17) {
+        // A public unmaximize of a decorated window emits its decoration signals under the recursion
+        // guard; a private entry from there is refused without effect.
+        auto decoratedWindow = window->nextDecoration()->window();
+        QVERIFY(decoratedWindow);
+        QObject context;
+        std::optional<Outcome> nested;
+        connect(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedChanged, &context, [&]() {
+            if (!nested) {
+                auto inner = window->makeTileAssignmentFence();
+                nested = window->normalizeMaximizeForAssignment(inner).outcome;
+            }
+        });
+        configure.clear();
+        window->maximize(MaximizeRestore);
+        QVERIFY(nested.has_value());
+        QCOMPARE(*nested, Outcome::Refused);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(aboutToChange.count(), 1);
+        return;
+    }
+    Window::OwnedProvenance provenance;
+    bool incoming = true;
+    if (scenario == 10) {
+        provenance = provenance.withConstraint([]() {
+            return false;
+        });
+    } else if (scenario == 20) {
+        // An incoming constraint that holds; the receipt must be chained onto it, not replace it.
+        provenance = provenance.withConstraint([&incoming]() {
+            return incoming;
+        });
+    }
+    // Only what the step itself publishes is read afterwards.
+    configure.clear();
+    toplevelConfigure.clear();
+    const auto result = window->normalizeMaximizeForAssignment(fence, provenance);
+    if (scenario == 9 || scenario == 10) {
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), before);
+        QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore);
+        QCOMPARE(aboutToChange.count(), 0);
+        QCOMPARE(restoreChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), scenario == 9 ? 1 : 0);
+        return;
+    }
+    if (scenario >= 11 && scenario <= 18) {
+        // Refused: nothing written, nothing notified, no checkpoint.
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), before);
+        QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore);
+        QCOMPARE(QRectF(window->geometryRestore()), restoreBefore);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        QCOMPARE(aboutToChange.count(), 0);
+        QCOMPARE(restoreChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        if (scenario == 11) {
+            QVERIFY(window->ownedTransientPlacementGeneration());
+            QCOMPARE(window->requestedTile(), leaf);
+        }
+        return;
+    }
+    QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+    QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+    QVERIFY(window->assignmentResultIsCurrent(result));
+    QCOMPARE(result.owned.kind, Window::OwnedProvenance::Kind::Operation);
+    QVERIFY(result.owned.constraint);
+    QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+    if (scenario == 4 || scenario == 5) {
+        // The operation-owned no-op: nothing recorded, the requested mode governs.
+        QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore);
+        QCOMPARE(aboutToChange.count(), 0);
+        QCOMPARE(restoreChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        // A later requested-mode change still invalidates the receipt while the fence stays current.
+        xdg->m_requestedMaximizeMode = MaximizeFull;
+        ++xdg->m_requestedMaximizeRevision;
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+        QVERIFY(!window->assignmentResultIsCurrent(result));
+        xdg->m_requestedMaximizeMode = MaximizeRestore;
+        return;
+    }
+    QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore + 1);
+    QCOMPARE(aboutToChange.count(), 1);
+    QCOMPARE(requestedGeometry.count(), 1);
+    QRectF expectedRestore = restoreBefore;
+    QRectF expected = geometryBefore;
+    switch (scenario) {
+    case 0:
+    case 1:
+    case 2:
+    case 20:
+        // The restore was captured by the public maximize; the released axes return to it.
+        expected = original;
+        if (mode == MaximizeHorizontal) {
+            expected.setTop(geometryBefore.top());
+            expected.setBottom(geometryBefore.bottom());
+        } else if (mode == MaximizeVertical) {
+            expected.setLeft(geometryBefore.left());
+            expected.setRight(geometryBefore.right());
+        }
+        break;
+    case 3:
+        // Decorated: the released axes return to the restore, clamped to the decorated minimum of
+        // 150 on each axis around the restore's centre.
+        expected = QRectF(0, 0, std::max(original.width(), 150.0), std::max(original.height(), 150.0));
+        expected.moveCenter(original.center());
+        break;
+    case 6:
+        // Capture skipped under the requested quick tile: the restore kept the original extents,
+        // the horizontal axis returns to it and the vertical axis keeps the tile's extents.
+        expected = QRectF(window->geometryRestore().x(), geometryBefore.y(), window->geometryRestore().width(), geometryBefore.height());
+        QCOMPARE(restoreChanged.count(), 0);
+        break;
+    case 7:
+        // An invalid restore: the client chooses its size from the maximize area's origin.
+        expected = QRectF(area.x(), area.y(), 0, 0);
+        break;
+    case 8:
+    case 19:
+        // Only the vertical axis, not maximized before, was refreshed from the old geometry.
+        expectedRestore = QRectF(original.x(), 50, original.width(), 300);
+        expected = expectedRestore;
+        break;
+    }
+    QCOMPARE(QRectF(window->geometryRestore()), expectedRestore);
+    QCOMPARE(QRectF(window->moveResizeGeometry()), expected);
+    if (scenario != 6) {
+        QCOMPARE(restoreChanged.count(), expectedRestore == restoreBefore ? 0 : 1);
+    }
+    // The mode write was published.
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    QVERIFY(!(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Maximized));
+    if (scenario == 7) {
+        QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), QSize(0, 0));
+    }
+    if (scenario == 20) {
+        // Both constraints must hold: the incoming one lapsing invalidates the receipt on its own.
+        incoming = false;
+        QVERIFY(result.checkpoint->isCurrentFor(*window));
+        QVERIFY(!window->assignmentResultIsCurrent(result));
+        incoming = true;
+        QVERIFY(window->assignmentResultIsCurrent(result));
+    }
+    // A later requested-mode change invalidates the receipt while the fence stays current.
+    xdg->m_requestedMaximizeMode = MaximizeFull;
+    ++xdg->m_requestedMaximizeRevision;
+    QVERIFY(result.checkpoint->isCurrentFor(*window));
+    QVERIFY(!window->assignmentResultIsCurrent(result));
+    xdg->m_requestedMaximizeMode = MaximizeRestore;
+}
+
+void TestXdgShellWindow::testNormalizeMaximizeSupersession_data()
+{
+    QTest::addColumn<int>("boundary");
+    QTest::newRow("nested-unmaximize-at-about-to-change") << 0;
+    QTest::newRow("nested-manage-at-about-to-change") << 1;
+    QTest::newRow("close-at-about-to-change") << 2;
+    QTest::newRow("replace-restore-at-decoration-signal") << 3;
+    QTest::newRow("replace-restore-at-restore-signal") << 4;
+    QTest::newRow("away-and-back-restore-at-restore-signal") << 5;
+    QTest::newRow("equal-restore-write-at-restore-signal") << 6;
+    QTest::newRow("round-trip-at-requested-geometry") << 7;
+    QTest::newRow("close-at-requested-geometry") << 8;
+    QTest::newRow("membership-no-op-at-restore-signal") << 9;
+    QTest::newRow("mode-away-and-back-at-restore-signal") << 10;
+    QTest::newRow("minimum-raised-at-frame-about-to-change") << 11;
+    QTest::newRow("decoration-cleared-at-decoration-signal") << 12;
+    QTest::newRow("borderless-restored") << 13;
+    QTest::newRow("mode-written-at-decoration-policy-change") << 14;
+    QTest::newRow("fence-destroyed-at-about-to-change") << 15;
+    QTest::newRow("minimum-raised-at-about-to-change") << 16;
+    QTest::newRow("placement-exhausted-at-about-to-change") << 17;
+    QTest::newRow("borderless-reverted-at-decoration-policy-change") << 18;
+    QTest::newRow("minimum-raised-at-decoration-policy-change") << 19;
+}
+
+void TestXdgShellWindow::testNormalizeMaximizeSupersession()
+{
+    // After the mode write, a handler's newer intent ends the normalization where it stands: the
+    // written mode is published, nothing falls through, nothing is rolled back.
+    QFETCH(int, boundary);
+    using Outcome = Window::AssignmentStepOutcome;
+    const bool decorated = boundary == 3 || boundary == 12;
+    const bool borderless = boundary == 13 || boundary == 14 || boundary == 18 || boundary == 19;
+    if (borderless) {
+        options->setBorderlessMaximizedWindows(true);
+    }
+    const auto optionsReset = qScopeGuard([borderless]() {
+        if (borderless) {
+            options->setBorderlessMaximizedWindows(false);
+        }
+    });
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), (decorated || borderless) ? Test::CreationSetup::CreateOnly : Test::CreationSetup::CreateAndConfigure));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+    shell->set_app_id(QStringLiteral("org.example.normalize"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    if (decorated || borderless) {
+        decoration = Test::createXdgToplevelDecorationV1(shell.get());
+        decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+        surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        QVERIFY(configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    }
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(configure.count() >= ((decorated || borderless) ? 2 : 1) || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>().isEmpty() ? QSize(200, 100) : toplevelConfigure.last().at(0).value<QSize>(), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const auto xdg = static_cast<XdgToplevelWindow *>(window);
+    const QRectF original = window->frameGeometry();
+    const QRectF area = workspace()->clientArea(MaximizeArea, window, window->moveResizeOutput());
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+    };
+    // The restore-signal rows need a capture that changes the restore: a fully maximized window
+    // refreshes no axis, so those rows start horizontally maximized and vertically moved.
+    const bool partial = boundary == 4 || boundary == 5 || boundary == 6 || boundary == 9 || boundary == 10;
+    configure.clear();
+    window->maximize(partial ? MaximizeHorizontal : MaximizeFull);
+    QCOMPARE(window->requestedMaximizeMode(), partial ? MaximizeHorizontal : MaximizeFull);
+    ack(Qt::green);
+    QCOMPARE(window->maximizeMode(), partial ? MaximizeHorizontal : MaximizeFull);
+    if (borderless) {
+        QVERIFY(window->noBorder());
+    }
+    if (partial) {
+        configure.clear();
+        window->moveResize(RectF(area.x(), 50, area.width(), 300));
+        ack(Qt::cyan);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(area.x(), 50, area.width(), 300));
+    }
+    const QRectF captured(original.x(), 50, original.width(), 300);
+    const QRectF geometryBefore = window->moveResizeGeometry();
+    auto *const quickTile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+    QVERIFY(quickTile);
+    const RectF replaced(30, 30, 200, 100);
+    QPointer<Window> guard(window);
+    KDecoration3::DecoratedWindow *decoratedWindow = decorated ? window->nextDecoration()->window() : nullptr;
+    const auto revisionBefore = xdg->m_requestedMaximizeRevision;
+    QSignalSpy aboutToChange(window, &Window::maximizedAboutToChange);
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    // The later decoration signals must stay suppressed once a decoration boundary ends the step.
+    std::unique_ptr<QSignalSpy> horizontalSignals;
+    std::unique_ptr<QSignalSpy> fullSignals;
+    if (decoratedWindow) {
+        horizontalSignals = std::make_unique<QSignalSpy>(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedHorizontallyChanged);
+        fullSignals = std::make_unique<QSignalSpy>(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedChanged);
+    }
+    // The caller's fence, owned here so a handler can destroy it under the step.
+    std::unique_ptr<TileAssignmentFence> ownedFence;
+    QObject context;
+    bool intervened = false;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (boundary) {
+        case 0:
+            window->maximize(MaximizeRestore);
+            break;
+        case 1:
+            QVERIFY(quickTile->manage(window));
+            break;
+        case 2:
+        case 8:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        case 3:
+        case 4:
+            window->setGeometryRestore(replaced);
+            break;
+        case 5:
+            window->setGeometryRestore(replaced);
+            window->setGeometryRestore(captured);
+            break;
+        case 6:
+            window->setGeometryRestore(window->geometryRestore());
+            break;
+        case 7:
+            window->maximize(MaximizeFull);
+            window->maximize(MaximizeRestore);
+            break;
+        case 9:
+            // A public membership no-op: only the membership revision observes it.
+            QVERIFY(!quickTile->unmanage(window));
+            break;
+        case 10:
+        case 14:
+            // Property-only: the requested mode away and back, no fenced change.
+            xdg->m_requestedMaximizeMode = MaximizeFull;
+            ++xdg->m_requestedMaximizeRevision;
+            xdg->m_requestedMaximizeMode = MaximizeRestore;
+            ++xdg->m_requestedMaximizeRevision;
+            break;
+        case 11:
+        case 16:
+        case 19:
+            xdg->m_minimumSize = QSizeF(original.width() + 100, 0);
+            QVERIFY(window->minSize().width() > original.width());
+            break;
+        case 12:
+        case 18:
+            window->setNoBorder(true);
+            break;
+        case 15:
+            ownedFence.reset();
+            break;
+        case 17:
+            window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - 3;
+            break;
+        }
+    };
+    if (boundary <= 2 || (boundary >= 15 && boundary <= 17)) {
+        connect(window, &Window::maximizedAboutToChange, &context, intervene);
+    } else if (boundary == 3 || boundary == 12) {
+        connect(decoratedWindow, &KDecoration3::DecoratedWindow::maximizedVerticallyChanged, &context, intervene);
+    } else if (boundary >= 4 && boundary <= 6 || boundary == 9 || boundary == 10) {
+        connect(window, &Window::maximizeGeometryRestoreChanged, &context, intervene);
+    } else if (boundary == 7 || boundary == 8) {
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    } else if (boundary == 11) {
+        connect(window, &Window::frameGeometryAboutToChange, &context, intervene);
+    } else if (boundary == 14 || boundary == 18 || boundary == 19) {
+        connect(window, &Window::decorationPolicyChanged, &context, intervene);
+    }
+    configure.clear();
+    toplevelConfigure.clear();
+    ownedFence = window->makeTileAssignmentCheckpoint();
+    const auto result = window->normalizeMaximizeForAssignment(*ownedFence);
+    QCOMPARE(intervened, boundary != 13);
+    if (boundary == 2 || boundary == 8) {
+        // The step stopped at the close. The caller's fence still holds a reference to the
+        // logically deleted window, so it is released before the deletion can be observed.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(guard && guard->isDeleted());
+        ownedFence.reset();
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    QVERIFY(guard);
+    switch (boundary) {
+    case 0:
+        // The nested public unmaximize holds the newer intent; the outer wrote nothing.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(aboutToChange.count(), 2);
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        break;
+    case 1:
+        // The nested management (legacy unmaximize and tiling) holds the newer intent.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(window->requestedTile(), quickTile);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(quickTile->windowGeometry()));
+        break;
+    case 3:
+    case 4:
+    case 5:
+    case 9:
+    case 10:
+    case 14:
+        // Superseded after the mode write: published, no geometry requested, nothing rolled back.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        {
+            QRectF expectedRestore = partial ? captured : original;
+            int expectedWrites = 1;
+            if (boundary == 3 || boundary == 4) {
+                expectedRestore = QRectF(replaced);
+                expectedWrites = boundary == 3 ? 1 : 2;
+            } else if (boundary == 5) {
+                expectedWrites = 3;
+            } else if (boundary == 14) {
+                expectedWrites = 0;
+            }
+            QCOMPARE(QRectF(window->geometryRestore()), expectedRestore);
+            QCOMPARE(restoreChanged.count(), expectedWrites);
+        }
+        if (boundary == 10 || boundary == 14) {
+            QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore + 3);
+        }
+        break;
+    case 6:
+        // An equal write is a no-op: the normalization completed with the captured restore.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(QRectF(window->geometryRestore()), captured);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), captured);
+        QCOMPARE(restoreChanged.count(), 1);
+        break;
+    case 7:
+        // The nested public round trip holds the newer intent.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 3);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        break;
+    case 11:
+        // The frozen size limits no longer hold at the dispatch boundary: the request stops before
+        // staging anything; the mode is published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        // Since 6.8 the published state's configure carries moveResizeGeometry() as its bounds, asserted above; no separate position staging.
+        break;
+    case 12:
+        // The decoration was cleared by the handler: its identity no longer holds.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QVERIFY(window->noBorder());
+        window->setNoBorder(false);
+        break;
+    case 13: {
+        // Borderless maximizing: the border returns as the operation's own transition, the receipt
+        // is established against the decorated minimum of 150 on each axis, and the normalization
+        // completes with the restore clamped to it around its centre.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->noBorder());
+        QCOMPARE(requestedGeometry.count(), 1);
+        QRectF expected(0, 0, std::max(original.width(), 150.0), std::max(original.height(), 150.0));
+        expected.moveCenter(original.center());
+        QCOMPARE(QRectF(window->moveResizeGeometry()), expected);
+        break;
+    }
+    case 15:
+        // Destroying the caller's fence is not a state change: the step reads its own snapshot.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        break;
+    case 18:
+    case 19:
+        // The operation's own decoration transition was crossed by a foreign change (the policy it
+        // set reverted, or the client's limits raised): the receipt is not established, nothing is
+        // captured or requested, and the written mode is published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        QCOMPARE(window->noBorder(), boundary == 18);
+        QCOMPARE(restoreChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        break;
+    case 16:
+    case 17:
+        // A limit change or a placement shortage introduced at the about-to-change boundary ends
+        // the step before the mode write: nothing written, nothing published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QCOMPARE(xdg->m_requestedMaximizeRevision, revisionBefore);
+        QCOMPARE(aboutToChange.count(), 1);
+        QCOMPARE(restoreChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        break;
+    }
+    if (horizontalSignals) {
+        QCOMPARE(horizontalSignals->count(), 0);
+        QCOMPARE(fullSignals->count(), 0);
+    }
+    if (boundary == 10 || boundary == 14) {
+        // The handler's property-only writes made the step's mode write stale, so its publication
+        // obligation is not discharged: the next states still carry the earlier maximize until a
+        // current write publishes them (a decoration change may send them as they are).
+        QVERIFY(xdg->m_nextStates & XdgToplevelInterface::State::MaximizedHorizontal);
+        return;
+    }
+    // Whatever was published reflects the final requested mode.
+    if (configure.isEmpty()) {
+        configure.wait(200);
+    }
+    if (!toplevelConfigure.isEmpty()) {
+        const auto states = toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>();
+        QCOMPARE(bool(states & Test::XdgToplevel::State::Maximized), window->requestedMaximizeMode() == MaximizeFull);
+    } else {
+        QCOMPARE(window->requestedMaximizeMode(), (boundary == 16 || boundary == 17) ? MaximizeFull : MaximizeRestore);
+    }
 }
 
 void TestXdgShellWindow::testTransientRequestPendingStates_data()
