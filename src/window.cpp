@@ -5072,30 +5072,59 @@ bool Window::activateTransientOwnership(quint64 generation)
 
 Window::TransientRequestReceipt Window::applyTransientOwnership(quint64 generation)
 {
+    return applyTransientOwnershipGuarded(generation).receipt;
+}
+
+Window::TransientApplication Window::applyTransientOwnershipGuarded(quint64 generation, std::function<bool()> admissionConstraint)
+{
+    TransientApplication application;
     if (isDeleted() || !m_transientOwnership || m_transientOwnership->generation != generation
         || m_transientOwnership->phase != TransientOwnershipPhase::Owned || m_transientOwnership->executing
         || !m_transientOwnership->request) {
-        return {};
+        // Nothing started: the continuation stays Refused, without a checkpoint.
+        return application;
     }
+    const auto conclude = [&application]() {
+        // An attempt that ended without a current application; its checkpoint and provenance are
+        // not evidence of anything, and nothing is refreshed.
+        application.continuation.outcome = AssignmentStepOutcome::Superseded;
+        application.continuation.checkpoint.reset();
+        application.continuation.owned = {};
+    };
     if (!m_transientOwnership->writer
         || !m_transientOwnership->writer->isProviderCurrent(m_transientOwnership->provider, m_transientOwnership->providerRevision)
         || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(generation))) {
         revokeTransientOwnership(generation);
-        return {};
+        conclude();
+        return application;
     }
     ref();
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
     m_transientOwnership->executing = true;
-    const auto receipt = requestTransientTile(std::move(m_transientOwnership->request));
-    // Revocation during the call retains the record until its authoritative progress returns.
+    application.receipt = requestTransientTile(std::move(m_transientOwnership->request), &application.continuation, admissionConstraint);
+    // The request is destroyed with that call's argument, before the execution ends: its
+    // destructor runs while the owner is still executing, and the terminal validation below sees
+    // whatever it changed. Revocation during the call retains the record until its authoritative
+    // progress returns.
     m_transientOwnership->executing = false;
-    m_transientOwnership->progress = receipt.progress;
-    if (receipt.outcome != TransientRequestOutcome::Applied || m_transientOwnership->phase != TransientOwnershipPhase::Owned) {
+    m_transientOwnership->progress = application.receipt.progress;
+    if (application.receipt.outcome != TransientRequestOutcome::Applied || m_transientOwnership->phase != TransientOwnershipPhase::Owned) {
         revokeTransientOwnership(generation);
+        conclude();
+        return application;
     }
-    return receipt;
+    // The terminal validation, after the request's destruction and the end of the execution: the
+    // preserved checkpoint and the stable provenance against the record and the window as they
+    // are now. Current success is exported from here only; the ownership itself is left as the
+    // receipt describes it, the caller's continuation decides what follows.
+    if (assignmentResultIsCurrent(application.continuation)) {
+        application.continuation.outcome = AssignmentStepOutcome::AppliedCurrent;
+    } else {
+        conclude();
+    }
+    return application;
 }
 
 bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)
@@ -5345,6 +5374,12 @@ bool Window::transientGeometryRequestIsCurrent(quint64 generation) const
 
 Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<TransientTileRequest> request)
 {
+    return requestTransientTile(std::move(request), nullptr, {});
+}
+
+Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<TransientTileRequest> request, AssignmentStepResult *continuation,
+                                                             const std::function<bool()> &admissionConstraint)
+{
     if (!request) {
         return {};
     }
@@ -5425,7 +5460,8 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
     m_requestedTileChange = nextAssociationChange(m_requestedTileChange);
     request->m_associationInstalled = true;
     const TileAssignmentFence installed(*this);
-    const auto geometry = requestMoveResizeForAssignment(*request, installed);
+    // Not const: the continuation takes its checkpoint.
+    auto geometry = requestMoveResizeForAssignment(*request, installed);
     // The geometry result's checkpoint and borrowed request validate the rest of this attempt:
     // a notification handler that changes the restore field or any other fenced state, with the
     // request's authority intact, supersedes it as well.
@@ -5441,7 +5477,50 @@ Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<Tra
         return receipt(TransientRequestOutcome::Superseded);
     }
     applied = true;
+    if (continuation) {
+        // Validated through the borrowed request up to here; translated now, while it exists.
+        translateTransientContinuation(*request, geometry.result, admissionConstraint, *continuation);
+    }
     return receipt(TransientRequestOutcome::Applied);
+}
+
+void Window::translateTransientContinuation(const TransientTileRequest &request, AssignmentStepResult &validated,
+                                            const std::function<bool()> &admissionConstraint, AssignmentStepResult &continuation) const
+{
+    // The checkpoint the request validated itself against, preserved exactly: nothing is minted
+    // after the request's callbacks. The borrowed authority is replaced by what survives the
+    // request: the ownership generation's own currentness (an Owned record for exactly that
+    // generation, not executing or releasing, no active request, its writer, provider and
+    // reservation valid, its tile live with this window as member in the recorded context, the
+    // association unchanged), this attempt's native sequence and progress on that record, and the
+    // post-request clauses of the request's own currentness by value (its allocated request
+    // generation and its target, or the initial generation and the floating frame for an attempt
+    // that requested nothing). The initial readiness predicate is not reused: the association is
+    // installed on purpose. The caller's admission constraint is chained; the provenance exempts
+    // the owner from nothing it did not already have.
+    continuation.checkpoint = std::move(validated.checkpoint);
+    const quint64 sequence = request.m_sequence;
+    const TransientRequestProgress progress = request.m_progress;
+    const quint64 geometryGeneration = request.m_geometryGeneration;
+    const quint64 initialGeneration = request.m_initialGeometryGeneration;
+    const RectF target = request.m_target;
+    const RectF floating = request.m_floating;
+    std::function<bool()> attempt = [this, sequence, progress, geometryGeneration, initialGeneration, target, floating]() {
+        if (!m_transientOwnership || m_transientOwnership->nativeSequence != sequence || m_transientOwnership->progress != progress) {
+            return false;
+        }
+        if (progress == TransientRequestProgress::NoRequest) {
+            return m_geometryRequestGeneration == initialGeneration && exactFrameGeometry(moveResizeGeometry(), floating)
+                && exactFrameGeometry(frameGeometry(), floating);
+        }
+        return m_geometryRequestGeneration == geometryGeneration && exactFrameGeometry(moveResizeGeometry(), target);
+    };
+    continuation.owned = OwnedProvenance::forOwnership(request.m_ownerGeneration, std::move(attempt));
+    if (admissionConstraint) {
+        continuation.owned = continuation.owned.withConstraint(admissionConstraint);
+    }
+    // Provisional: the terminal validation after the request's destruction promotes it.
+    continuation.outcome = AssignmentStepOutcome::Superseded;
 }
 
 void Window::doSetQuickTileMode()
