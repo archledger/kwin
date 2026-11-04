@@ -12,6 +12,7 @@
 #include "core/rect.h"
 #include "effect/globals.h"
 #include "virtualdesktops.h"
+#include "window.h"
 #include <kwin_export.h>
 
 #include <QObject>
@@ -194,6 +195,32 @@ protected:
     qreal m_padding = 4.0;
 
 private:
+    friend class TilesTest;
+    // Guarded membership steps for an ordinary ingress: refusals (the backend first, a transient
+    // tile, an unresizable or applet window, a window not on this desktop, a destination that is
+    // not live, the follow-up association step's read-only preflight, membership headroom) before
+    // any mutation; an existing member or a miss as an operation-owned no-op without a stamp; the
+    // evacuation over a worklist collected without callbacks, with the Window retained and the
+    // destination's context frozen and validated after every notification; each membership write
+    // sealed by its own checkpoint; then the association step chaining the last checkpoint. After
+    // the first mutation every stop is Superseded; nothing is rolled back and nothing falls
+    // through. A destroyed destination is never read as explicit null.
+    [[nodiscard]] Window::AssignmentStepResult manageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
+    [[nodiscard]] Window::AssignmentStepResult unmanageForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
+    [[nodiscard]] Window::AssignmentStepResult forgetForAssignment(Window *window, const TileAssignmentFence &before, Window::OwnedProvenance owned = {});
+    Window::AssignmentStepResult membershipNoOp(Window *window, Window::OwnedProvenance owned) const;
+    // The destination's frozen context as a predicate captured by value: this tile, its manager,
+    // desktop and parent by guarded identity, its liveness, the active decision, the target
+    // geometry, and the window's desktop list; composed into every continuation of a management
+    // and into the provenance handed to the association step.
+    std::function<bool()> assignmentContext(Window *window) const;
+    void removeForAssignment(Window *window, std::unique_ptr<TileAssignmentFence> &checkpoint, const std::function<bool()> &current);
+    bool destinationIsLive() const;
+    // The public bodies after their rejections, verbatim: selected by the public entry points when
+    // the guarded step refused without effect, or at the exhaustion edge.
+    bool manageLegacy(Window *window);
+    bool unmanageLegacy(Window *window);
+    void forgetLegacy(Window *window);
     const Type m_type;
 };
 

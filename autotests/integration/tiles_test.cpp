@@ -193,6 +193,12 @@ private Q_SLOTS:
     void forgetTileForAssignment();
     void publicRequestTileBoundary_data();
     void publicRequestTileBoundary();
+    void manageForAssignment_data();
+    void manageForAssignment();
+    void unmanageForAssignment_data();
+    void unmanageForAssignment();
+    void publicTileEntryPoints_data();
+    void publicTileEntryPoints();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -528,6 +534,7 @@ void TilesTest::compatibilityPreviousTileDestruction()
     QPointer<Tile> target(m_rootTile->childTile(1));
     QVERIFY(previous && target);
     QVERIFY(previous->manage(window));
+    const RectF requestedBefore = window->moveResizeGeometry();
     QSignalSpy added(target, &Tile::windowAdded);
     QObject context;
     bool destroyedAfterEvacuation = false;
@@ -549,11 +556,19 @@ void TilesTest::compatibilityPreviousTileDestruction()
     QVERIFY(!previous);
     QVERIFY(target);
     QCOMPARE(added.count(), 1);
-    QCOMPARE(window->requestedTile(), target.data());
     QCOMPARE(target->windows(), QList<Window *>{window});
-    QCOMPARE(window->moveResizeGeometry(), target->windowGeometry());
     if (x11) {
+        // The legacy path publishes the destination over the vanished association.
+        QCOMPARE(window->requestedTile(), target.data());
+        QCOMPARE(window->moveResizeGeometry(), target->windowGeometry());
         QCOMPARE(window->tile(), target.data());
+    } else {
+        // The guarded ingress is superseded: the window's requested tile was destroyed after its
+        // evacuation, so the association vanished without a stamp (the fence observes its
+        // presence). The membership stands, no association is published over it, the geometry is
+        // untouched, and the setter treats the refused destination as not releasing anything.
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->moveResizeGeometry(), requestedBefore);
     }
 }
 
@@ -769,10 +784,13 @@ void TilesTest::membershipRevision()
         QVERIFY(staleInsideCallbacks);
     }
     if (scenario == 0 || scenario == 1 || scenario == 3 || scenario == 4 || scenario == 5 || scenario == 6 || scenario >= 11) {
-        // The membership revision alone changed (or nothing did): the other counters are untouched.
+        // The membership revision alone changed (or nothing did): the other counters are untouched,
+        // except that a new membership through the public entry point carries that operation's
+        // own stamp (the qualified cancellation) even on an inactive desktop; the existing-member,
+        // miss, refusal and null paths stamp membership only.
         QCOMPARE(window->m_requestedTileChange, requested);
         QCOMPARE(window->m_committedTileChange, committed);
-        QCOMPARE(window->m_placementContinuationRevision, placement);
+        QCOMPARE(window->m_placementContinuationRevision, scenario == 0 ? placement + 1 : placement);
         QCOMPARE(window->m_geometryRequestGeneration, geometry);
     }
     if (scenario == 9 || scenario == 10) {
@@ -1788,6 +1806,837 @@ void TilesTest::publicRequestTileBoundary()
         QCOMPARE(requestedTileChanged.count(), 1);
         QVERIFY(window->m_placementContinuationRevision > placementBefore);
         break;
+    }
+}
+
+void TilesTest::manageForAssignment_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("x11-refused") << 0;
+    QTest::newRow("transient-destination-refused") << 1;
+    QTest::newRow("unresizable-refused") << 2;
+    QTest::newRow("off-desktop-refused") << 3;
+    QTest::newRow("existing-member-no-op") << 4;
+    QTest::newRow("applied-active-evacuating") << 5;
+    QTest::newRow("applied-active-floating") << 6;
+    QTest::newRow("applied-inactive-evacuating") << 7;
+    QTest::newRow("applied-inactive-no-evacuation") << 8;
+    QTest::newRow("destination-destroyed-at-window-removed") << 9;
+    QTest::newRow("destination-destroyed-at-window-added") << 10;
+    QTest::newRow("unrelated-tile-destroyed-at-window-removed") << 11;
+    QTest::newRow("holding-source-destroyed-at-window-removed") << 12;
+    QTest::newRow("desktop-switched-at-window-removed") << 13;
+    QTest::newRow("window-desktops-changed-at-window-added") << 14;
+    QTest::newRow("geometry-changed-at-window-added") << 15;
+    QTest::newRow("nested-manage-at-window-added") << 16;
+    QTest::newRow("association-refused-after-mutation") << 17;
+    QTest::newRow("membership-headroom-refused") << 18;
+    QTest::newRow("stale-fence") << 19;
+    QTest::newRow("x11-inactive-refused") << 20;
+    QTest::newRow("interactive-refused-at-entry") << 21;
+    QTest::newRow("desktop-switched-at-requested-geometry") << 22;
+    QTest::newRow("geometry-changed-at-requested-tile-changed") << 23;
+    QTest::newRow("provenance-lapsed-at-window-removed") << 24;
+}
+
+void TilesTest::manageForAssignment()
+{
+    // The guarded membership ingress: refusals before any mutation, operation-owned no-ops, the
+    // evacuation over a worklist with the destination's context frozen and validated after every
+    // notification, the addition sealed by its own checkpoint, then the association step.
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second && first->isActive());
+    auto inactiveDesktop = VirtualDesktopManager::self()->desktops().constLast();
+    QVERIFY(inactiveDesktop != VirtualDesktopManager::self()->currentDesktop(m_output));
+    Tile *inactiveLeft = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Left);
+    Tile *inactiveRight = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Right);
+    QVERIFY(inactiveLeft && inactiveRight && !inactiveLeft->isActive());
+    if (scenario == 0 || scenario == 20) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        // An inactive destination without evacuation needs no association step: the backend is
+        // refused unconditionally, before any membership mutation.
+        Tile *destination = first;
+        if (scenario == 20) {
+            window->setOnAllDesktops(true);
+            destination = inactiveLeft;
+        }
+        const auto membership = window->m_tileMembershipChange;
+        auto fence = window->makeTileAssignmentFence();
+        const auto result = destination->manageForAssignment(window, fence);
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!destination->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_tileMembershipChange, membership);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.membership"));
+    QVERIFY(window);
+    auto *const xdg = static_cast<XdgToplevelWindow *>(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const auto ack = [&](const QColor &color) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), color);
+        QVERIFY(Test::waylandSync());
+        configure.clear();
+    };
+    TransientTileController controller;
+    Tile *destination = first;
+    Tile *leaf = nullptr;
+    Tile *childA = nullptr;
+    Tile *childB = nullptr;
+    const auto allDesktops = scenario == 7 || scenario == 8;
+    if (allDesktops) {
+        window->setOnAllDesktops(true);
+        QVERIFY(window->isOnDesktop(inactiveDesktop));
+    }
+    switch (scenario) {
+    case 1: {
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        QVERIFY(leaf && leaf->isTransient());
+        destination = leaf;
+        break;
+    }
+    case 2:
+        shell->set_min_size(430, 310);
+        shell->set_max_size(430, 310);
+        surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(!window->isResizable());
+        break;
+    case 3:
+        window->setDesktops({inactiveDesktop});
+        QVERIFY(!window->isOnDesktop(first->desktop()));
+        break;
+    case 4:
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        ack(Qt::cyan);
+        break;
+    case 5:
+    case 9:
+    case 13:
+    case 14:
+    case 15:
+    case 24:
+        QVERIFY(second->manage(window));
+        QCOMPARE(window->requestedTile(), second);
+        ack(Qt::cyan);
+        break;
+    case 21:
+        workspace()->activateWindow(window);
+        workspace()->slotWindowMove();
+        QVERIFY(window->isInteractiveMove());
+        break;
+    case 7:
+        // A membership on the inactive desktop without an association.
+        QVERIFY(inactiveRight->manage(window));
+        QVERIFY(inactiveRight->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        destination = inactiveLeft;
+        break;
+    case 8:
+        destination = inactiveLeft;
+        break;
+    case 11:
+    case 12: {
+        // Two children under the second root child (a split across the root's direction makes
+        // children, along it a sibling): the window held property-only by the first of them
+        // (row 11) or by both (row 12); the other child is destroyed during the first one's
+        // removal notification. Row 12 keeps the window's centre inside the first child, so the
+        // destructor's legacy re-homing of its evacuated member picks that child deterministically.
+        static_cast<CustomTile *>(second)->split(CustomTile::LayoutDirection::Vertical);
+        QCOMPARE(second->childCount(), 2);
+        childA = second->childTile(0);
+        childB = second->childTile(1);
+        QVERIFY(childA && childB);
+        childA->m_windows.append(window);
+        window->noteTileMembershipChanged();
+        if (scenario == 12) {
+            childB->m_windows.append(window);
+            window->noteTileMembershipChanged();
+            const QPointF centre = childA->absoluteGeometry().center();
+            window->moveResize(RectF(centre.x() - 215, centre.y() - 155, 430, 310));
+            QVERIFY(childA->absoluteGeometry().contains(window->moveResizeGeometry().center()));
+            QVERIFY(!first->absoluteGeometry().contains(window->moveResizeGeometry().center()));
+        }
+        break;
+    }
+    case 18:
+        window->m_tileMembershipChange = maximum - 1;
+        break;
+    }
+    const QPointer<Tile> destinationGuard(destination);
+    const QPointer<Tile> childBGuard(childB);
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto associationBefore = window->m_requestedTileChange;
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QSignalSpy firstAdded(first, &Tile::windowAdded);
+    QSignalSpy firstChanged(first, &Tile::windowsChanged);
+    QSignalSpy secondRemoved(second, &Tile::windowRemoved);
+    QSignalSpy secondChanged(second, &Tile::windowsChanged);
+    QObject context;
+    bool intervened = false;
+    bool incoming = true;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (scenario) {
+        case 9:
+        case 10:
+            m_rootTile->destroyChild(first);
+            break;
+        case 11:
+        case 12:
+            second->destroyChild(childB);
+            break;
+        case 13:
+            VirtualDesktopManager::self()->setCurrent(2);
+            break;
+        case 14:
+            window->setDesktops({inactiveDesktop});
+            break;
+        case 15:
+            static_cast<CustomTile *>(first)->setRelativeGeometry(RectF(0, 0, 0.3, 1));
+            break;
+        case 16:
+            QVERIFY(second->manage(window));
+            break;
+        case 17:
+            workspace()->activateWindow(window);
+            workspace()->slotWindowMove();
+            QVERIFY(window->isInteractiveMove());
+            break;
+        case 22:
+            VirtualDesktopManager::self()->setCurrent(2);
+            break;
+        case 23:
+            static_cast<CustomTile *>(first)->setRelativeGeometry(RectF(0, 0, 0.3, 1));
+            break;
+        case 24:
+            incoming = false;
+            break;
+        }
+    };
+    if (scenario == 9 || scenario == 13 || scenario == 14 || scenario == 15 || scenario == 24) {
+        // Before the window is a member of the destination: the context alone must catch these.
+        connect(second, &Tile::windowRemoved, &context, intervene);
+    } else if (scenario == 11 || scenario == 12) {
+        connect(childA, &Tile::windowRemoved, &context, intervene);
+    } else if (scenario == 10 || scenario == 16 || scenario == 17) {
+        connect(first, &Tile::windowAdded, &context, intervene);
+    } else if (scenario == 22) {
+        // Inside the association step's own callbacks: the chained context must hold there too.
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    } else if (scenario == 23) {
+        connect(window, &Window::requestedTileChanged, &context, intervene);
+    }
+    QSignalSpy childAChanged(childA ? childA : second, &Tile::windowsChanged);
+    const auto cleanup = qScopeGuard([&]() {
+        if (scenario == 13 || scenario == 22) {
+            VirtualDesktopManager::self()->setCurrent(1);
+        }
+        if ((scenario == 17 || scenario == 21) && window->isInteractiveMove()) {
+            window->keyPressEvent(Qt::Key_Escape);
+        }
+    });
+    std::unique_ptr<TileAssignmentFence> fencePtr = window->makeTileAssignmentCheckpoint();
+    const TileAssignmentFence &fence = *fencePtr;
+    if (scenario == 19) {
+        window->moveResize(RectF(10, 10, 300, 200));
+        QVERIFY(!fence.isCurrentFor(*window));
+    }
+    configure.clear();
+    // The window's own preflight refuses a transient destination and an interactive operation;
+    // resizability and the desktop are the tile step's rejections.
+    QCOMPARE(window->canRequestTileForAssignment(destination), scenario != 1 && scenario != 21);
+    Window::OwnedProvenance provenance;
+    if (scenario == 24) {
+        provenance = provenance.withConstraint([&incoming]() {
+            return incoming;
+        });
+    }
+    const auto result = destination->manageForAssignment(window, fence, provenance);
+    QCOMPARE(intervened, (scenario >= 9 && scenario <= 17) || scenario >= 22);
+    const auto tiled = xdg->m_nextStates & allTiledStates;
+    switch (scenario) {
+    case 1:
+    case 2:
+    case 3:
+    case 18:
+    case 21:
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!destination->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 4:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(firstAdded.count(), 0);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 5:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!second->windows().contains(window));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 2);
+        QCOMPARE(secondRemoved.count(), 1);
+        QCOMPARE(secondChanged.count(), 1);
+        QCOMPARE(firstAdded.count(), 1);
+        QCOMPARE(firstChanged.count(), 1);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(first->windowGeometry()));
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        break;
+    case 6:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tiled, tiledStates(first->anchors()));
+        break;
+    case 7:
+        // Inactive desktop, evacuated: the null association is an operation-owned no-op.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!inactiveRight->windows().contains(window));
+        QVERIFY(inactiveLeft->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 2);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 8:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(inactiveLeft->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        break;
+    case 9:
+        // The destination destroyed inside the evacuation: the removal stands, nothing is added,
+        // no explicit null is published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!destinationGuard);
+        QVERIFY(!second->windows().contains(window));
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 10:
+        // The destination destroyed inside its own addition notification: its destructor re-homes
+        // the evacuated member through the public management of the nearest leaf (the newer
+        // intent); the outer step publishes nothing over it and ends stale, never an explicit null.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!destinationGuard);
+        QCOMPARE(firstAdded.count(), 1);
+        QCOMPARE(window->requestedTile(), second);
+        QVERIFY(second->windows().contains(window));
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 11:
+        // An unrelated tile deleted while the checkpoint still validates: benign.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!childBGuard);
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        break;
+    case 12:
+        // A not-yet-processed source holding the window was destroyed: its membership changed, the
+        // operation ends without adding to the destination. The destructor's re-homing of its
+        // evacuated member (the processed source, nearest to the window) is the newer intent; the
+        // outer removal's second notification was not published over it, so the single one on
+        // that source is the nested addition's.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!childBGuard);
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(firstAdded.count(), 0);
+        QCOMPARE(window->requestedTile(), childA);
+        QVERIFY(childA->windows().contains(window));
+        QCOMPARE(childAChanged.count(), 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 13:
+        // The planned active decision no longer holds.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 14:
+    case 15:
+        // The window's desktop list or the destination's geometry changed between the removal and
+        // the addition: nothing is added, no association follows.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(firstAdded.count(), 0);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 16:
+        // The nested public management holds the newer intent; the addition's second
+        // notification was not published over it (the nested evacuation published its own).
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(firstAdded.count(), 1);
+        QCOMPARE(firstChanged.count(), 1);
+        break;
+    case 17:
+        // The association step refused after this step's mutations: a supersession, no fallback.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 19:
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!first->windows().contains(window));
+        break;
+    case 22:
+    case 23:
+        // The frozen context is held through the association step's own callbacks: the membership
+        // and the association stand (published as the association's obligation), the result is
+        // stale.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 24:
+        // The incoming provenance lapsed at the first removal notification: no further mutation,
+        // and the removal's second notification was not published over the lapse.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(!second->windows().contains(window));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(secondRemoved.count(), 1);
+        QCOMPARE(secondChanged.count(), 0);
+        QCOMPARE(firstAdded.count(), 0);
+        break;
+    }
+}
+
+void TilesTest::unmanageForAssignment_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("applied-clears-association") << 0;
+    QTest::newRow("applied-membership-only") << 1;
+    QTest::newRow("miss-no-op") << 2;
+    QTest::newRow("x11-refused") << 3;
+    QTest::newRow("nested-manage-at-window-removed") << 4;
+    QTest::newRow("stale-fence") << 5;
+    QTest::newRow("headroom-refused") << 6;
+    QTest::newRow("forget-applied") << 7;
+    QTest::newRow("forget-miss-no-op") << 8;
+    QTest::newRow("forget-x11-refused") << 9;
+    QTest::newRow("clears-preflight-refused") << 10;
+    QTest::newRow("forget-preflight-refused") << 11;
+    QTest::newRow("x11-membership-only-refused") << 12;
+}
+
+void TilesTest::unmanageForAssignment()
+{
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second);
+    const bool forget = scenario >= 7 && scenario <= 9 || scenario == 11;
+    if (scenario == 3 || scenario == 9 || scenario == 12) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        Tile *source = first;
+        if (scenario == 12) {
+            // A membership without an association: the removal would clear nothing, so only the
+            // unconditional backend refusal keeps the membership untouched.
+            window->setOnAllDesktops(true);
+            auto inactiveDesktop = VirtualDesktopManager::self()->desktops().constLast();
+            source = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Left);
+            QVERIFY(source && !source->isActive());
+            QVERIFY(source->manage(window));
+            QVERIFY(!window->requestedTile());
+        } else {
+            QVERIFY(first->manage(window));
+            QCOMPARE(window->requestedTile(), first);
+        }
+        const auto membership = window->m_tileMembershipChange;
+        auto fence = window->makeTileAssignmentFence();
+        const auto result = forget ? source->forgetForAssignment(window, fence) : source->unmanageForAssignment(window, fence);
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(source->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membership);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell);
+    QVERIFY(window);
+    auto *const xdg = static_cast<XdgToplevelWindow *>(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    auto inactiveDesktop = VirtualDesktopManager::self()->desktops().constLast();
+    Tile *inactiveLeft = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Left);
+    QVERIFY(inactiveLeft && !inactiveLeft->isActive());
+    Tile *tile = first;
+    if (scenario == 1) {
+        window->setOnAllDesktops(true);
+        QVERIFY(inactiveLeft->manage(window));
+        QVERIFY(inactiveLeft->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        tile = inactiveLeft;
+    } else {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+    }
+    if (scenario == 2 || scenario == 8) {
+        tile = second;
+    } else if (scenario == 6) {
+        window->m_tileMembershipChange = maximum - 1;
+    } else if (scenario == 10 || scenario == 11) {
+        window->m_requestedTransientTileGeneration = 5;
+    }
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto associationBefore = window->m_requestedTileChange;
+    const QRectF geometryBefore = window->moveResizeGeometry();
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QSignalSpy requestedGeometry(window, &Window::requestedGeometryChanged);
+    QObject context;
+    bool intervened = false;
+    if (scenario == 4) {
+        connect(first, &Tile::windowRemoved, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                QVERIFY(second->manage(window));
+            }
+        });
+    }
+    auto fence = window->makeTileAssignmentFence();
+    if (scenario == 5) {
+        window->moveResize(RectF(10, 10, 300, 200));
+        QVERIFY(!fence.isCurrentFor(*window));
+    }
+    const auto result = forget ? tile->forgetForAssignment(window, fence) : tile->unmanageForAssignment(window, fence);
+    const auto tiled = xdg->m_nextStates & allTiledStates;
+    switch (scenario) {
+    case 0:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(requestedGeometry.count(), 1);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    case 1:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!inactiveLeft->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        QCOMPARE(requestedGeometry.count(), 0);
+        break;
+    case 2:
+    case 8:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 4:
+        QVERIFY(intervened);
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        break;
+    case 5:
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(first->windows().contains(window));
+        break;
+    case 6:
+    case 10:
+    case 11:
+        // Refused before the removal: the membership and the association untouched.
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        break;
+    case 7:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(requestedGeometry.count(), 0);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), geometryBefore);
+        QCOMPARE(tiled, XdgToplevelInterface::States());
+        break;
+    }
+}
+
+void TilesTest::publicTileEntryPoints_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("x11-legacy-manage") << 0;
+    QTest::newRow("manage-superseded-returns-false") << 1;
+    QTest::newRow("manage-owner-revoked-first") << 2;
+    QTest::newRow("unmanage-superseded-returns-false") << 3;
+    QTest::newRow("unmanage-miss-stamp-only") << 4;
+    QTest::newRow("forget-miss-stamp-only") << 5;
+    QTest::newRow("quick-tile-stops-on-superseded-preparation") << 6;
+    QTest::newRow("quick-tile-applied") << 7;
+    QTest::newRow("destination-destroyed-during-cancellation") << 8;
+    QTest::newRow("context-changed-during-cancellation") << 9;
+    QTest::newRow("closed-member-released") << 10;
+}
+
+void TilesTest::publicTileEntryPoints()
+{
+    // The public entry points establish their own operation after the mutation-free rejections:
+    // the qualified cancellation, the guarded step, the legacy remainder on a refusal without
+    // effect, a stop on supersession; misses keep their membership-only stamps.
+    QFETCH(int, scenario);
+    using Result = TransientPlacementWriter::Result;
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second);
+    if (scenario == 0) {
+#if KWIN_BUILD_X11
+        Test::XcbConnectionPtr connection = Test::createX11Connection();
+        QVERIFY(!xcb_connection_has_error(connection.get()));
+        X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
+        QVERIFY(window);
+        QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+        QVERIFY(first->manage(window));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        xcb_destroy_window(connection.get(), window->window());
+        xcb_flush(connection.get());
+        QSignalSpy closed(window, &Window::closed);
+        QVERIFY(closed.wait());
+        return;
+#else
+        QSKIP("X11 support is not built");
+#endif
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface;
+    std::unique_ptr<Test::XdgToplevel> shell;
+    Window *window = showSettledXdgWindow(surface, shell, QStringLiteral("org.example.entry"));
+    QVERIFY(window);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    const QRectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    const bool owner = scenario == 1 || scenario == 2 || scenario == 6 || scenario == 8 || scenario == 9;
+    if (owner) {
+        const auto token = writer.registerProvider(&provider);
+        const auto key = QStringLiteral("org.example.entry");
+        QVERIFY(writer.trackWindow(window->internalId(), key));
+        QCOMPARE(writer.record(token, 1, {window->internalId(), original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+        QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        const auto state = writer.snapshot();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(window->ownedTransientPlacementGeneration());
+        QCOMPARE(window->requestedTile(), leaf);
+    }
+    if (scenario == 3 || scenario == 10) {
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+    }
+    const QPointer<Tile> firstGuard(first);
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto placementBefore = window->m_placementContinuationRevision;
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QStringList order;
+    QObject context;
+    bool intervened = false;
+    if (leaf) {
+        connect(leaf, &Tile::windowRemoved, &context, [&]() {
+            order.append(QStringLiteral("leaf-removed"));
+            if (intervened) {
+                return;
+            }
+            intervened = true;
+            if (scenario == 1 || scenario == 6) {
+                // A membership-only no-op inside the release: the preparation is stale.
+                QVERIFY(!second->unmanage(window));
+            } else if (scenario == 8) {
+                m_rootTile->destroyChild(first);
+            } else if (scenario == 9) {
+                // The destination's geometry changed inside the release without touching the
+                // window's counters: the public operation's context is stale.
+                static_cast<CustomTile *>(first)->setRelativeGeometry(RectF(0, 0, 0.3, 1));
+            }
+        });
+    }
+    connect(first, &Tile::windowAdded, &context, [&]() {
+        order.append(QStringLiteral("first-added"));
+    });
+    if (scenario == 3) {
+        connect(first, &Tile::windowRemoved, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                QVERIFY(!second->unmanage(window));
+            }
+        });
+    }
+    auto *const quickLeft = m_tileManager->quickTile(QuickTileFlag::Left);
+    QVERIFY(quickLeft);
+    switch (scenario) {
+    case 1:
+        QVERIFY(!first->manage(window));
+        QVERIFY(intervened);
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        break;
+    case 2:
+        // The automatic owner is revoked before the manual membership is published; the owner
+        // that remains (its restoration cannot finalize) sends the step to the legacy remainder.
+        QVERIFY(first->manage(window));
+        QVERIFY(first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(order, (QStringList{QStringLiteral("leaf-removed"), QStringLiteral("first-added")}));
+        break;
+    case 3:
+        QVERIFY(!first->unmanage(window));
+        QVERIFY(intervened);
+        QVERIFY(!first->windows().contains(window));
+        QCOMPARE(window->requestedTile(), first);
+        break;
+    case 4:
+        QVERIFY(!second->unmanage(window));
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        break;
+    case 5:
+        second->forget(window);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        break;
+    case 6:
+        window->setQuickTileMode(QuickTileFlag::Left, QPointF(640, 512));
+        QVERIFY(intervened);
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!quickLeft->windows().contains(window));
+        break;
+    case 7:
+        window->setQuickTileMode(QuickTileFlag::Left, QPointF(640, 512));
+        QCOMPARE(window->requestedTile(), quickLeft);
+        QVERIFY(quickLeft->windows().contains(window));
+        break;
+    case 8:
+        QVERIFY(!first->manage(window));
+        QVERIFY(intervened);
+        QVERIFY(!firstGuard);
+        QVERIFY(!window->requestedTile());
+        break;
+    case 9:
+        QVERIFY(!first->manage(window));
+        QVERIFY(intervened);
+        QVERIFY(!first->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        break;
+    case 10: {
+        // The window closes while a member: the workspace's removal notification releases the
+        // membership through the legacy membership-only removal (nothing can continue from a
+        // deleted window, whose qualified cancellation is stale by design), and a deleted window
+        // is never added.
+        QSignalSpy firstRemoved(first, &Tile::windowRemoved);
+        connect(window, &Window::closed, &context, [&]() {
+            QVERIFY(window->isDeleted());
+            // Not even the existing-member fast path reports a deleted window as managed, and
+            // nothing is stamped; a non-member destination adds nothing.
+            const auto membership = window->m_tileMembershipChange;
+            QVERIFY(first->windows().contains(window));
+            QVERIFY(!first->manage(window));
+            QCOMPARE(window->m_tileMembershipChange, membership);
+            QVERIFY(!second->manage(window));
+            QVERIFY(!second->windows().contains(window));
+        });
+        shell.reset();
+        surface.reset();
+        QVERIFY(Test::waitForWindowClosed(window));
+        QCOMPARE(firstRemoved.count(), 1);
+        QVERIFY(first->windows().isEmpty());
+        QVERIFY(second->windows().isEmpty());
+        break;
+    }
     }
 }
 

@@ -3706,6 +3706,14 @@ Window::AssignmentStepResult Window::requestTileForAssignment(Tile *tile, const 
     return result;
 }
 
+bool Window::canForgetTileForAssignment() const
+{
+    // Mutation-free refusals, including the backend whose protocol state commits immediately, and
+    // the headroom of the one association change the forget step makes.
+    return !isDeleted() && supportsAssignmentGeometryRequest() && !m_transientOwnership && !m_activeTransientRequest
+        && m_requestedTransientTileGeneration == 0 && m_requestedTileChange < std::numeric_limits<quint64>::max() - 1;
+}
+
 Window::AssignmentStepResult Window::forgetTileForAssignment(Tile *tile, const TileAssignmentFence &before, OwnedProvenance owned)
 {
     ref();
@@ -3717,10 +3725,7 @@ Window::AssignmentStepResult Window::forgetTileForAssignment(Tile *tile, const T
         result.outcome = AssignmentStepOutcome::Superseded;
         return result;
     }
-    // Mutation-free refusals, including the backend whose protocol state commits immediately, and
-    // the headroom of the one association change this step makes.
-    if (isDeleted() || !supportsAssignmentGeometryRequest() || m_transientOwnership || m_activeTransientRequest
-        || m_requestedTransientTileGeneration != 0 || m_requestedTileChange >= std::numeric_limits<quint64>::max() - 1) {
+    if (!canForgetTileForAssignment()) {
         return result;
     }
     if (m_requestedTile != tile) {
@@ -4284,14 +4289,29 @@ void Window::setQuickTileMode(QuickTileMode mode, const QPointF &tileAtPoint)
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
-    const auto generation = geometryRequestGeneration();
-    cancelTransientRequest();
-    if (!geometryRequestIsCurrent(generation)) {
+    // The outer quick-tile boundary: the qualified cancellation, whose continuation must still be
+    // current when the public management below establishes its own operation (two stamps, with
+    // currentness verified between them); at the exhaustion edge the legacy cancellation and its
+    // geometry-generation check keep today's behaviour.
+    auto preparation = cancelTransientRequestForAssignment();
+    if (preparation.outcome == AssignmentStepOutcome::Superseded) {
         return;
     }
-    workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
-    if (!geometryRequestIsCurrent(generation) || (!tile && mode != QuickTileMode(QuickTileFlag::None))) {
-        return;
+    if (preparation.outcome == AssignmentStepOutcome::Refused) {
+        const auto generation = geometryRequestGeneration();
+        cancelTransientRequest();
+        if (!geometryRequestIsCurrent(generation)) {
+            return;
+        }
+        workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
+        if (!geometryRequestIsCurrent(generation) || (!tile && mode != QuickTileMode(QuickTileFlag::None))) {
+            return;
+        }
+    } else {
+        workspace()->updateFocusMousePosition(Cursors::self()->mouse()->pos()); // may cause leave event
+        if (!assignmentResultIsCurrent(preparation) || (!tile && mode != QuickTileMode(QuickTileFlag::None))) {
+            return;
+        }
     }
 
     if (m_requestedTile != tile) {
