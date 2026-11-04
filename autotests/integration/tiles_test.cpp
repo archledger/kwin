@@ -21,6 +21,7 @@
 #include "xdgshellwindow.h"
 
 #if KWIN_BUILD_X11
+#include "utils/xcbutils.h"
 #include "x11window.h"
 #include <netwm.h>
 #include <xcb/xcb_icccm.h>
@@ -201,6 +202,8 @@ private Q_SLOTS:
     void publicTileEntryPoints();
     void setTileCompatibility_data();
     void setTileCompatibility();
+    void x11GuardedAssignment_data();
+    void x11GuardedAssignment();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -559,18 +562,15 @@ void TilesTest::compatibilityPreviousTileDestruction()
     QVERIFY(target);
     QCOMPARE(added.count(), 1);
     QCOMPARE(target->windows(), QList<Window *>{window});
+    // The guarded ingress is superseded on both backends: the window's requested tile was
+    // destroyed after its evacuation, so the association vanished without a stamp (the fence
+    // observes its presence). The membership stands, no association is published over it, the
+    // geometry is untouched, and the setter treats the refused destination as not releasing
+    // anything.
+    QVERIFY(!window->requestedTile());
+    QCOMPARE(window->moveResizeGeometry(), requestedBefore);
     if (x11) {
-        // The legacy path publishes the destination over the vanished association.
-        QCOMPARE(window->requestedTile(), target.data());
-        QCOMPARE(window->moveResizeGeometry(), target->windowGeometry());
-        QCOMPARE(window->tile(), target.data());
-    } else {
-        // The guarded ingress is superseded: the window's requested tile was destroyed after its
-        // evacuation, so the association vanished without a stamp (the fence observes its
-        // presence). The membership stands, no association is published over it, the geometry is
-        // untouched, and the setter treats the refused destination as not releasing anything.
-        QVERIFY(!window->requestedTile());
-        QCOMPARE(window->moveResizeGeometry(), requestedBefore);
+        QVERIFY(!window->tile());
     }
 }
 
@@ -1001,7 +1001,7 @@ constexpr XdgToplevelInterface::States allTiledStates = XdgToplevelInterface::St
 void TilesTest::requestTileForAssignment_data()
 {
     QTest::addColumn<int>("scenario");
-    QTest::newRow("x11-refused") << 0;
+    QTest::newRow("x11-applied") << 0;
     QTest::newRow("transient-tile-refused") << 1;
     QTest::newRow("owner-refused") << 2;
     QTest::newRow("interactive-refused") << 3;
@@ -1047,16 +1047,24 @@ void TilesTest::requestTileForAssignment()
         QVERIFY(!xcb_connection_has_error(connection.get()));
         X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
         QVERIFY(window);
-        const auto placement = window->m_placementContinuationRevision;
-        const auto association = window->m_requestedTileChange;
-        QVERIFY(!window->canRequestTileForAssignment(first));
+        // The guarded request publishes the geometry synchronously and the association write's
+        // obligation commits the tile as the step's own publication: applied, current, committed.
+        QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+        QSignalSpy tileChanged(window, &Window::tileChanged);
+        const auto committed = window->m_committedTileChange;
+        const auto publication = window->m_geometryUpdateGeneration;
+        QVERIFY(window->canRequestTileForAssignment(first));
         auto fence = window->makeTileAssignmentFence();
         const auto result = window->requestTileForAssignment(first, fence);
-        QCOMPARE(result.outcome, Outcome::Refused);
-        QVERIFY(!result.checkpoint);
-        QVERIFY(!window->requestedTile());
-        QCOMPARE(window->m_placementContinuationRevision, placement);
-        QCOMPARE(window->m_requestedTileChange, association);
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(window->m_committedTileChange, committed + 1);
+        QCOMPARE(window->m_geometryUpdateGeneration, publication + 1);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tileChanged.count(), 1);
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
         QSignalSpy closed(window, &Window::closed);
@@ -1483,7 +1491,7 @@ void TilesTest::forgetTileForAssignment_data()
     QTest::addColumn<int>("scenario");
     QTest::newRow("applied") << 0;
     QTest::newRow("no-op-other-tile") << 1;
-    QTest::newRow("x11-refused") << 2;
+    QTest::newRow("x11-applied") << 2;
     QTest::newRow("owner-refused") << 3;
     QTest::newRow("marker-refused") << 4;
     QTest::newRow("headroom-refused") << 5;
@@ -1509,13 +1517,19 @@ void TilesTest::forgetTileForAssignment()
         QVERIFY(window);
         QVERIFY(first->manage(window));
         QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+        QSignalSpy tileChanged(window, &Window::tileChanged);
         const auto association = window->m_requestedTileChange;
         auto fence = window->makeTileAssignmentFence();
         const auto result = window->forgetTileForAssignment(first, fence);
-        QCOMPARE(result.outcome, Outcome::Refused);
-        QVERIFY(!result.checkpoint);
-        QCOMPARE(window->requestedTile(), first);
-        QCOMPARE(window->m_requestedTileChange, association);
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        QCOMPARE(window->m_requestedTileChange, association + 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tileChanged.count(), 1);
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
         QSignalSpy closed(window, &Window::closed);
@@ -1641,7 +1655,7 @@ void TilesTest::forgetTileForAssignment()
 void TilesTest::publicRequestTileBoundary_data()
 {
     QTest::addColumn<int>("scenario");
-    QTest::newRow("x11-legacy") << 0;
+    QTest::newRow("x11-guarded") << 0;
     QTest::newRow("interactive-legacy") << 1;
     QTest::newRow("exhaustion-edge-legacy") << 2;
     QTest::newRow("reentrancy-closed") << 3;
@@ -1670,11 +1684,11 @@ void TilesTest::publicRequestTileBoundary()
         QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
         const auto placement = window->m_placementContinuationRevision;
         window->requestTile(first);
-        // The legacy sequence: the association, the immediate commit, one notification.
+        // The guarded sequence: the qualified cancellation, the association, the immediate commit
+        // as the step's own publication, one notification.
         QCOMPARE(window->requestedTile(), first);
         QCOMPARE(window->tile(), first);
         QCOMPARE(requestedTileChanged.count(), 1);
-        // The legacy body's own moveResize cancels again: the stamp count is not its invariant.
         QVERIFY(window->m_placementContinuationRevision > placement);
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
@@ -1814,7 +1828,7 @@ void TilesTest::publicRequestTileBoundary()
 void TilesTest::manageForAssignment_data()
 {
     QTest::addColumn<int>("scenario");
-    QTest::newRow("x11-refused") << 0;
+    QTest::newRow("x11-applied") << 0;
     QTest::newRow("transient-destination-refused") << 1;
     QTest::newRow("unresizable-refused") << 2;
     QTest::newRow("off-desktop-refused") << 3;
@@ -1834,7 +1848,7 @@ void TilesTest::manageForAssignment_data()
     QTest::newRow("association-refused-after-mutation") << 17;
     QTest::newRow("membership-headroom-refused") << 18;
     QTest::newRow("stale-fence") << 19;
-    QTest::newRow("x11-inactive-refused") << 20;
+    QTest::newRow("x11-inactive-applied") << 20;
     QTest::newRow("interactive-refused-at-entry") << 21;
     QTest::newRow("desktop-switched-at-requested-geometry") << 22;
     QTest::newRow("geometry-changed-at-requested-tile-changed") << 23;
@@ -1863,8 +1877,9 @@ void TilesTest::manageForAssignment()
         QVERIFY(!xcb_connection_has_error(connection.get()));
         X11Window *window = createWindow(connection.get(), Rect(0, 0, 100, 50));
         QVERIFY(window);
-        // An inactive destination without evacuation needs no association step: the backend is
-        // refused unconditionally, before any membership mutation.
+        // The X11 backend takes the guarded ingress: an active destination's association is
+        // committed immediately as the step's own publication; an inactive one without evacuation
+        // adds the membership alone.
         Tile *destination = first;
         if (scenario == 20) {
             window->setOnAllDesktops(true);
@@ -1873,11 +1888,17 @@ void TilesTest::manageForAssignment()
         const auto membership = window->m_tileMembershipChange;
         auto fence = window->makeTileAssignmentFence();
         const auto result = destination->manageForAssignment(window, fence);
-        QCOMPARE(result.outcome, Outcome::Refused);
-        QVERIFY(!result.checkpoint);
-        QVERIFY(!destination->windows().contains(window));
-        QVERIFY(!window->requestedTile());
-        QCOMPARE(window->m_tileMembershipChange, membership);
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(destination->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membership + 1);
+        if (scenario == 0) {
+            QCOMPARE(window->requestedTile(), first);
+            QCOMPARE(window->tile(), first);
+        } else {
+            QVERIFY(!window->requestedTile());
+            QVERIFY(!window->tile());
+        }
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
         QSignalSpy closed(window, &Window::closed);
@@ -2266,16 +2287,16 @@ void TilesTest::unmanageForAssignment_data()
     QTest::newRow("applied-clears-association") << 0;
     QTest::newRow("applied-membership-only") << 1;
     QTest::newRow("miss-no-op") << 2;
-    QTest::newRow("x11-refused") << 3;
+    QTest::newRow("x11-applied") << 3;
     QTest::newRow("nested-manage-at-window-removed") << 4;
     QTest::newRow("stale-fence") << 5;
     QTest::newRow("headroom-refused") << 6;
     QTest::newRow("forget-applied") << 7;
     QTest::newRow("forget-miss-no-op") << 8;
-    QTest::newRow("forget-x11-refused") << 9;
+    QTest::newRow("forget-x11-applied") << 9;
     QTest::newRow("clears-preflight-refused") << 10;
     QTest::newRow("forget-preflight-refused") << 11;
-    QTest::newRow("x11-membership-only-refused") << 12;
+    QTest::newRow("x11-membership-only-applied") << 12;
 }
 
 void TilesTest::unmanageForAssignment()
@@ -2295,8 +2316,8 @@ void TilesTest::unmanageForAssignment()
         QVERIFY(window);
         Tile *source = first;
         if (scenario == 12) {
-            // A membership without an association: the removal would clear nothing, so only the
-            // unconditional backend refusal keeps the membership untouched.
+            // A membership without an association on an inactive desktop: the removal clears
+            // nothing and publishes nothing.
             window->setOnAllDesktops(true);
             auto inactiveDesktop = VirtualDesktopManager::self()->desktops().constLast();
             source = m_tileManager->quickRootTile(inactiveDesktop)->tileForMode(QuickTileFlag::Left);
@@ -2308,12 +2329,16 @@ void TilesTest::unmanageForAssignment()
             QCOMPARE(window->requestedTile(), first);
         }
         const auto membership = window->m_tileMembershipChange;
+        QSignalSpy tileChanged(window, &Window::tileChanged);
         auto fence = window->makeTileAssignmentFence();
         const auto result = forget ? source->forgetForAssignment(window, fence) : source->unmanageForAssignment(window, fence);
-        QCOMPARE(result.outcome, Outcome::Refused);
-        QVERIFY(!result.checkpoint);
-        QVERIFY(source->windows().contains(window));
-        QCOMPARE(window->m_tileMembershipChange, membership);
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!source->windows().contains(window));
+        QCOMPARE(window->m_tileMembershipChange, membership + 1);
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        QCOMPARE(tileChanged.count(), scenario == 12 ? 0 : 1);
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
         QSignalSpy closed(window, &Window::closed);
@@ -2442,7 +2467,7 @@ void TilesTest::unmanageForAssignment()
 void TilesTest::publicTileEntryPoints_data()
 {
     QTest::addColumn<int>("scenario");
-    QTest::newRow("x11-legacy-manage") << 0;
+    QTest::newRow("x11-guarded-manage") << 0;
     QTest::newRow("manage-superseded-returns-false") << 1;
     QTest::newRow("manage-owner-revoked-first") << 2;
     QTest::newRow("unmanage-superseded-returns-false") << 3;
@@ -2661,7 +2686,7 @@ void TilesTest::setTileCompatibility_data()
         {"cleanup-headroom-refused-legacy", 7},
         {"original-readded-at-windows-changed", 8},
         {"cleanup-notification-installs-another", 9},
-        {"x11-legacy", 10},
+        {"x11-guarded", 10},
         {"interactive-refused-legacy-remainder", 11},
         {"exhaustion-edge-legacy", 12},
         {"superseded-preparation-stops", 13},
@@ -2709,14 +2734,14 @@ void TilesTest::setTileCompatibility()
         QVERIFY(first->manage(window));
         QCOMPARE(window->requestedTile(), first);
         const auto membership = window->m_tileMembershipChange;
-        // The legacy sequence, selected before any guarded mutation: the evacuation, the addition
-        // and the committed association, then the legacy cleanup's public miss stamp.
+        // The guarded path for X11 too: the evacuation, the addition, the association committed
+        // immediately as the step's own publication, the cleanup an unstamped no-op.
         assign(window, second);
         QCOMPARE(window->requestedTile(), second);
         QCOMPARE(window->tile(), second);
         QVERIFY(second->windows().contains(window));
         QVERIFY(!first->windows().contains(window));
-        QCOMPARE(window->m_tileMembershipChange, membership + 3);
+        QCOMPARE(window->m_tileMembershipChange, membership + 2);
         xcb_destroy_window(connection.get(), window->window());
         xcb_flush(connection.get());
         QSignalSpy closed(window, &Window::closed);
@@ -3000,6 +3025,353 @@ void TilesTest::setTileCompatibility()
         QCOMPARE(window->requestedTile(), first);
         break;
     }
+}
+
+void TilesTest::x11GuardedAssignment_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("blocked-refused") << 0;
+    QTest::newRow("unmanaged-refused") << 1;
+    QTest::newRow("unchanged-geometry-published") << 2;
+    QTest::newRow("unchanged-tile-commit") << 3;
+    QTest::newRow("blocked-at-boundary-superseded") << 4;
+    QTest::newRow("provenance-lapsed-at-tile-changed") << 5;
+    QTest::newRow("geometry-superseded-publication-required") << 6;
+    QTest::newRow("nested-request-at-tile-changed") << 7;
+    QTest::newRow("committed-headroom-refused") << 8;
+    QTest::newRow("placement-publication-headroom-refused") << 9;
+    QTest::newRow("forget-committed-headroom-refused") << 10;
+    QTest::newRow("maximized-refused-legacy") << 11;
+    QTest::newRow("fractional-scale-rounding") << 12;
+    QTest::newRow("nested-geometry-at-buffer-notification") << 13;
+    QTest::newRow("closed-at-buffer-notification") << 14;
+    QTest::newRow("forget-nested-request-at-requested-tile-changed") << 15;
+    QTest::newRow("unchanged-reentry-then-unchanged-guarded") << 16;
+}
+
+void TilesTest::x11GuardedAssignment()
+{
+    // The X11 specialization: the guarded request publishes synchronously as its own write, the
+    // association write's obligation commits the tile as the step's own publication through a
+    // carrier, both committed changes are budgeted before any mutation, and an operation
+    // superseded during the request still publishes its still-current association without being
+    // resurrected.
+#if KWIN_BUILD_X11
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Tile *first = m_rootTile->childTile(0);
+    Tile *second = m_rootTile->childTile(1);
+    QVERIFY(first && second && first->isActive());
+    if (scenario == 12) {
+        kwinApp()->setXwaylandScale(1.25);
+    }
+    const auto scaleReset = qScopeGuard([&]() {
+        if (scenario == 12) {
+            kwinApp()->setXwaylandScale(1);
+        }
+    });
+    Test::XcbConnectionPtr connection = Test::createX11Connection();
+    QVERIFY(!xcb_connection_has_error(connection.get()));
+    X11Window *window = createWindow(connection.get(), Rect(10, 10, 100, 50), [&](xcb_window_t windowId) {
+        if (scenario == 1) {
+            quint32 value = 1;
+            xcb_change_window_attributes(connection.get(), windowId, XCB_CW_OVERRIDE_REDIRECT, &value);
+        }
+    });
+    QVERIFY(window);
+    QCOMPARE(window->isUnmanaged(), scenario == 1);
+    const xcb_window_t windowId = window->window();
+    const QPointer<Window> guard(window);
+    const auto closeWindow = qScopeGuard([&]() {
+        xcb_destroy_window(connection.get(), windowId);
+        xcb_flush(connection.get());
+        if (guard) {
+            QSignalSpy closed(guard.data(), &Window::closed);
+            closed.wait();
+        }
+    });
+    const auto blockReset = qScopeGuard([&]() {
+        if (guard && !window->isDeleted() && window->areGeometryUpdatesBlocked()) {
+            window->unblockGeometryUpdates();
+        }
+    });
+    switch (scenario) {
+    case 0:
+        window->blockGeometryUpdates();
+        break;
+    case 2:
+        // The legacy move leaves the frame already at the tile's geometry.
+        window->moveResize(first->windowGeometry());
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        break;
+    case 3:
+    case 10:
+        // An association without a committed tile, property-only: the forget step's publication
+        // finds the committed tile already null.
+        window->m_requestedTile = first;
+        window->m_requestedTileChange = window->m_requestedTileChange + 1;
+        QVERIFY(!window->tile());
+        break;
+    case 15:
+        QVERIFY(first->manage(window));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        break;
+    case 8:
+        window->m_committedTileChange = maximum - 1;
+        break;
+    case 9:
+        window->m_placementContinuationRevision = maximum - 2 * Window::assignmentPlacementBudget - 1;
+        break;
+    case 11:
+        window->maximize(MaximizeFull);
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        break;
+    }
+    if (scenario == 10) {
+        window->m_committedTileChange = maximum - 1;
+    }
+    const auto committedBefore = window->m_committedTileChange;
+    const auto publicationBefore = window->m_geometryUpdateGeneration;
+    const auto associationBefore = window->m_requestedTileChange;
+    const QRectF frameBefore = window->frameGeometry();
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    QSignalSpy tileChanged(window, &Window::tileChanged);
+    QSignalSpy quickTileModeChanged(window, &Window::quickTileModeChanged);
+    QSignalSpy bufferChanged(window, &Window::bufferGeometryChanged);
+    QSignalSpy clientChanged(window, &Window::clientGeometryChanged);
+    QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+    QObject context;
+    bool intervened = false;
+    bool incoming = true;
+    const auto once = [&](std::function<void()> action) {
+        return [&, action]() {
+            if (!intervened) {
+                intervened = true;
+                action();
+            }
+        };
+    };
+    const RectF nested(300, 300, 120, 60);
+    if (scenario == 4) {
+        connect(window, &Window::frameGeometryAboutToChange, &context, once([&]() {
+            window->blockGeometryUpdates();
+        }));
+    } else if (scenario == 13) {
+        // A newer committed update inside the first notification of this one.
+        connect(window, &Window::bufferGeometryChanged, &context, once([&]() {
+            window->moveResize(nested);
+        }));
+    } else if (scenario == 14) {
+        connect(window, &Window::bufferGeometryChanged, &context, once([&]() {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        }));
+    } else if (scenario == 15) {
+        connect(window, &Window::requestedTileChanged, &context, once([&]() {
+            window->requestTile(second);
+        }));
+    } else if (scenario == 16) {
+        // A foreign stamp and a legacy request of the unchanged rectangle inside the first
+        // notification: this frame is superseded with its client, frame and shape notifications
+        // pending, and the unchanged legacy request delivers nothing.
+        connect(window, &Window::bufferGeometryChanged, &context, once([&]() {
+            QVERIFY(!second->unmanage(window));
+            window->moveResize(window->frameGeometry());
+        }));
+    } else if (scenario == 5) {
+        connect(window, &Window::tileChanged, &context, once([&]() {
+            incoming = false;
+        }));
+    } else if (scenario == 6) {
+        connect(window, &Window::frameGeometryChanged, &context, once([&]() {
+            QVERIFY(!second->unmanage(window));
+        }));
+    } else if (scenario == 7) {
+        connect(window, &Window::tileChanged, &context, once([&]() {
+            window->requestTile(second);
+        }));
+    }
+    Window::OwnedProvenance provenance;
+    if (scenario == 5) {
+        provenance = provenance.withConstraint([&incoming]() {
+            return incoming;
+        });
+    }
+    const bool forget = scenario == 3 || scenario == 10 || scenario == 15;
+    const bool expectRefusal = scenario == 0 || scenario == 1 || scenario == 8 || scenario == 9 || scenario == 10 || scenario == 11;
+    if (forget) {
+        QCOMPARE(window->canForgetTileForAssignment(), !expectRefusal);
+    } else {
+        QCOMPARE(window->canRequestTileForAssignment(first), !expectRefusal);
+    }
+    // The caller's fence, owned here: the one reference the closure row releases before awaiting
+    // the destruction it observed logically.
+    std::unique_ptr<TileAssignmentFence> fencePtr = window->makeTileAssignmentCheckpoint();
+    const TileAssignmentFence &fence = *fencePtr;
+    const auto result = forget ? window->forgetTileForAssignment(first, fence) : window->requestTileForAssignment(first, fence, provenance);
+    QCOMPARE(intervened, (scenario >= 4 && scenario <= 7) || scenario >= 13);
+    if (scenario == 16) {
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(bufferChanged.count(), 1);
+        QCOMPARE(clientChanged.count(), 0);
+        QCOMPARE(frameChanged.count(), 0);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        // A fresh guarded request of the unchanged rectangle publishes what is pending under its
+        // own validated continuation, without a write.
+        const auto publicationBeforeDrain = window->m_geometryUpdateGeneration;
+        auto drainFence = window->makeTileAssignmentFence();
+        auto drain = window->requestMoveResizeGuarded(first->windowGeometry(), Window::MoveResizeMode::MoveResize, drainFence, Window::OwnedProvenance());
+        QCOMPARE(drain.result.outcome, Outcome::AppliedCurrent);
+        QCOMPARE(drain.dispatch, Window::AssignmentRequestDispatch::Published);
+        QCOMPARE(clientChanged.count(), 1);
+        QCOMPARE(frameChanged.count(), 1);
+        QCOMPARE(frameChanged.first().at(0).value<RectF>(), RectF(frameBefore));
+        QCOMPARE(window->m_geometryUpdateGeneration, publicationBeforeDrain + 1);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        // Nothing left pending: a further unchanged guarded request publishes nothing.
+        auto againFence = window->makeTileAssignmentFence();
+        auto again = window->requestMoveResizeGuarded(first->windowGeometry(), Window::MoveResizeMode::MoveResize, againFence, Window::OwnedProvenance());
+        QCOMPARE(again.result.outcome, Outcome::AppliedCurrent);
+        QCOMPARE(window->m_geometryUpdateGeneration, publicationBeforeDrain + 1);
+        QCOMPARE(frameChanged.count(), 1);
+        return;
+    }
+    if (scenario == 14) {
+        // Closed inside the first notification: the frame's announcements end there, nothing is
+        // published, the operation is superseded, and the window is released once the caller's
+        // own reference goes.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(guard && guard->isDeleted());
+        QCOMPARE(bufferChanged.count(), 1);
+        QCOMPARE(clientChanged.count(), 0);
+        QCOMPARE(frameChanged.count(), 0);
+        QCOMPARE(tileChanged.count(), 0);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        fencePtr.reset();
+        QTRY_VERIFY(!guard);
+        return;
+    }
+    if (expectRefusal) {
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(window->m_committedTileChange, committedBefore);
+        QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        if (scenario == 11) {
+            // Tiling a maximized X11 window stays legacy until the X11 normalization: the public
+            // path's remainder still tiles it.
+            window->requestTile(first);
+            QCOMPARE(window->requestedTile(), first);
+            QCOMPARE(window->tile(), first);
+        } else if (scenario == 0) {
+            window->unblockGeometryUpdates();
+            QVERIFY(window->canRequestTileForAssignment(first));
+        }
+        return;
+    }
+    switch (scenario) {
+    case 2:
+        // Published without a write: the request's own checkpoint stands, the commit follows.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->m_geometryUpdateGeneration, publicationBefore);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(window->m_committedTileChange, committedBefore + 1);
+        QCOMPARE(tileChanged.count(), 1);
+        break;
+    case 3:
+        // The committed tile already equals the publication's target: nothing committed, no fresh
+        // checkpoint minted, the step current.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        QCOMPARE(window->m_committedTileChange, committedBefore);
+        QCOMPARE(tileChanged.count(), 0);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 4:
+        // Blocked at the boundary by a callback: the dispatch supersedes instead of reporting a
+        // publication; the association stands and its obligation still commits the tile.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+        QCOMPARE(window->m_geometryUpdateGeneration, publicationBefore);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tileChanged.count(), 1);
+        break;
+    case 5:
+        // The incoming provenance lapsed inside the commit's own callback: committed, the
+        // obsolete secondary notification suppressed by the commit writer, the still-current
+        // association notified, the operation superseded.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(window->m_committedTileChange, committedBefore + 1);
+        QCOMPARE(quickTileModeChanged.count(), 0);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        break;
+    case 6:
+        // The synchronous publication's notification stamped a foreign membership change: the
+        // request is superseded, the association still publishes, the operation stays superseded.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tileChanged.count(), 1);
+        break;
+    case 7:
+        // A newer association installed inside the commit's callback: the older requested-tile
+        // notification is suppressed; only the nested one is published.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(window->tile(), second);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(tileChanged.count(), 2);
+        break;
+    case 12:
+        // The native rounding under a fractional Xwayland scale is the frame's, in both paths.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->tile(), first);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(first->windowGeometry()))));
+        break;
+    case 13:
+        // The nested update delivered this frame's pending client and frame transitions from their
+        // oldest unannounced values and this frame stopped: every transition announced once, the
+        // newer geometry final, the association still published, the operation superseded.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(bufferChanged.count(), 2);
+        QCOMPARE(clientChanged.count(), 1);
+        QCOMPARE(frameChanged.count(), 1);
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(Xcb::fromXNative(Xcb::toXNative(nested))));
+        QCOMPARE(window->requestedTile(), first);
+        QCOMPARE(window->tile(), first);
+        break;
+    case 15:
+        // The forget's publication promoted its carrier, then a newer association was installed
+        // inside its notification: superseded, never a success with an invalid checkpoint.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->requestedTile(), second);
+        QCOMPARE(window->tile(), second);
+        break;
+    }
+#else
+    QSKIP("X11 support is not built");
+#endif
 }
 
 void TilesTest::transientChildDestruction_data()
