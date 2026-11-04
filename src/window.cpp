@@ -3555,7 +3555,7 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
     // Refusals here have no effects. Only owned provenance, whose identity the predicate above
     // already checked, passes the ownership boundary; ordinary callers never inherit that
     // exemption. A backend without a guarded dispatcher could not report what it did.
-    const bool ordinary = owned.kind == OwnedProvenance::Kind::None;
+    const bool ordinary = owned.kind == OwnedProvenance::Kind::None || owned.kind == OwnedProvenance::Kind::Operation;
     if ((ordinary && (m_transientOwnership || m_activeTransientRequest)) || !supportsAssignmentGeometryRequest()) {
         return request;
     }
@@ -3643,11 +3643,25 @@ bool Window::ownedProvenanceIsCurrent(const OwnedProvenance &owned) const
     case OwnedProvenance::Kind::None:
         return true;
     case OwnedProvenance::Kind::Request:
-        return owned.request && transientRequestIsCurrent(*owned.request);
+        return owned.request && transientRequestIsCurrent(*owned.request) && (!owned.constraint || owned.constraint());
     case OwnedProvenance::Kind::Ownership:
         return transientOwnershipIsCurrent(owned.ownership) && (!owned.constraint || owned.constraint());
+    case OwnedProvenance::Kind::Operation:
+        return !owned.constraint || owned.constraint();
     }
     return false;
+}
+
+std::unique_ptr<TileAssignmentFence> Window::makeTileAssignmentCheckpoint()
+{
+    return std::unique_ptr<TileAssignmentFence>(new TileAssignmentFence(*this));
+}
+
+Window::AssignmentStepResult Window::normalizeMaximizeForAssignment(const TileAssignmentFence &, OwnedProvenance)
+{
+    // A backend without guarded requests cannot report what its normalization did: refused without
+    // effect, so an ingress selects its legacy path before any mutation.
+    return AssignmentStepResult();
 }
 
 bool Window::assignmentResultIsCurrent(const AssignmentStepResult &result) const
