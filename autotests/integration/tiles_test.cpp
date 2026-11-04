@@ -28,6 +28,7 @@
 #endif
 
 #include <KConfigGroup>
+#include <KDecoration3/Decoration>
 #include <KSharedConfig>
 #include <QAbstractItemModelTester>
 #include <QChildEvent>
@@ -206,6 +207,10 @@ private Q_SLOTS:
     void x11GuardedAssignment();
     void x11NormalizeMaximizeForAssignment_data();
     void x11NormalizeMaximizeForAssignment();
+    void workspacePositionDecision_data();
+    void workspacePositionDecision();
+    void decorationGeneration_data();
+    void decorationGeneration();
     void transientChildDestruction_data();
     void transientChildDestruction();
     void transientControllerGeometry();
@@ -3514,6 +3519,316 @@ void TilesTest::x11NormalizeMaximizeForAssignment()
         window->writeMaximizeMode(MaximizeRestore);
         QVERIFY(result.checkpoint->isCurrentFor(*window));
         QVERIFY(!window->assignmentResultIsCurrent(result));
+    }
+#else
+    QSKIP("X11 support is disabled");
+#endif
+}
+
+void TilesTest::workspacePositionDecision_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("edge-constrained-geometry") << 0;
+    QTest::newRow("invalid-old-geometry-explicit-output") << 1;
+    QTest::newRow("dock-no-op") << 2;
+    QTest::newRow("desktop-no-op") << 3;
+    QTest::newRow("special-state-move-then-restore") << 4;
+}
+
+void TilesTest::workspacePositionDecision()
+{
+    // The workspace-position decision is read-only and the wrapper keeps the legacy writes and
+    // their order: the off-screen rule gives a known rectangle, an invalid old geometry falls back to the
+    // current one, a dock or desktop window gets no request at all, an equal ordinary rectangle is
+    // still requested publicly, and the special-state branch moves first and moves the restore
+    // fields afterwards.
+#if KWIN_BUILD_X11
+    QFETCH(int, scenario);
+    using Kind = Window::WorkspacePositionDecision::Kind;
+    const auto outputs = workspace()->outputs();
+    QCOMPARE(outputs.size(), 2);
+    Test::XcbConnectionPtr connection = Test::createX11Connection();
+    QVERIFY(!xcb_connection_has_error(connection.get()));
+    X11Window *window = createWindow(connection.get(), Rect(10, 20, 100, 50), [&](xcb_window_t windowId) {
+        Test::applyMotifHints(connection.get(), windowId, Test::MotifHints{.flags = Test::MWM_HINTS_DECORATIONS, .decorations = 0});
+        if (scenario == 2 || scenario == 3) {
+            NETWinInfo info(connection.get(), windowId, rootWindow(), NET::WMWindowType, NET::Properties2());
+            info.setWindowType(scenario == 2 ? NET::Dock : NET::Desktop);
+        }
+    });
+    QVERIFY(window);
+    QVERIFY(!window->isDecorated());
+    const xcb_window_t windowId = window->window();
+    const QPointer<Window> guard(window);
+    const auto closeWindow = qScopeGuard([&]() {
+        xcb_destroy_window(connection.get(), windowId);
+        xcb_flush(connection.get());
+        if (guard) {
+            QSignalSpy closed(guard.data(), &Window::closed);
+            closed.wait();
+        }
+    });
+    QCOMPARE(window->isDock(), scenario == 2);
+    QCOMPARE(window->isDesktop(), scenario == 3);
+    const RectF screenArea = workspace()->clientArea(ScreenArea, window, outputs[0]);
+    const RectF otherArea = workspace()->clientArea(ScreenArea, window, outputs[1]);
+    RectF oldGeometry;
+    LogicalOutput *oldOutput = nullptr;
+    QRectF expectedFrame;
+    switch (scenario) {
+    case 0:
+        // Entirely above the screen: the off-screen rule brings its bottom edge back inside by its
+        // own height (less than a quarter of the screen). 6.8 removed the edge-snapping rules the
+        // 6.7 row exercised (upstream 2793b44003); the old geometry only selects the old area.
+        window->moveResize(RectF(10, -120, 100, 50));
+        oldGeometry = RectF(10, 0, 100, 50);
+        expectedFrame = QRectF(10, 0, 100, 50);
+        break;
+    case 1:
+        oldOutput = outputs[1];
+        expectedFrame = QRectF(window->frameGeometry());
+        break;
+    case 4:
+        window->maximize(MaximizeFull);
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        // The restore lives in the other output's area; the old geometry does too.
+        window->setGeometryRestore(RectF(1300, 100, 100, 50));
+        oldGeometry = RectF(1300, 100, 100, 50);
+        expectedFrame = QRectF(window->frameGeometry());
+        break;
+    default:
+        expectedFrame = QRectF(window->frameGeometry());
+        break;
+    }
+    const QRectF frameBefore = window->frameGeometry();
+    const QRectF restoreBefore = window->geometryRestore();
+    const auto requestBefore = window->m_geometryRequestGeneration;
+    const auto placementBefore = window->m_placementContinuationRevision;
+    const auto publicationBefore = window->m_geometryUpdateGeneration;
+    QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+    QSignalSpy restoreChanged(window, &Window::maximizeGeometryRestoreChanged);
+    // The decision, read-only.
+    const auto decision = window->workspacePositionDecision(oldGeometry, oldOutput, window->moveResizeGeometry());
+    QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+    QCOMPARE(QRectF(window->geometryRestore()), restoreBefore);
+    QCOMPARE(window->m_geometryRequestGeneration, requestBefore);
+    QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+    QCOMPARE(window->m_geometryUpdateGeneration, publicationBefore);
+    QCOMPARE(frameChanged.count(), 0);
+    QCOMPARE(restoreChanged.count(), 0);
+    if (scenario == 2 || scenario == 3) {
+        QCOMPARE(decision.kind, Kind::NoOp);
+    } else if (scenario == 4) {
+        QCOMPARE(decision.kind, Kind::LegacySpecial);
+        QCOMPARE(QRectF(decision.geometry), frameBefore);
+        QCOMPARE(QRectF(decision.oldScreenArea), QRectF(otherArea));
+        QCOMPARE(QRectF(decision.screenArea), QRectF(screenArea));
+    } else {
+        QCOMPARE(decision.kind, Kind::Geometry);
+        QCOMPARE(QRectF(decision.geometry), expectedFrame);
+        QCOMPARE(QRectF(decision.screenArea), QRectF(screenArea));
+    }
+    // The wrapper.
+    QObject context;
+    bool restoreObserved = false;
+    if (scenario == 4) {
+        connect(window, &Window::maximizeGeometryRestoreChanged, &context, [&]() {
+            // The special branch moved first: its public request is already recorded.
+            restoreObserved = true;
+            QCOMPARE(window->m_geometryRequestGeneration, requestBefore + 1);
+            QCOMPARE(QRectF(window->frameGeometry()), frameBefore);
+        });
+    }
+    window->checkWorkspacePosition(oldGeometry, oldOutput);
+    QCOMPARE(QRectF(window->frameGeometry()), expectedFrame);
+    if (scenario == 2 || scenario == 3) {
+        // No request at all: no intent recorded, nothing announced.
+        QCOMPARE(window->m_geometryRequestGeneration, requestBefore);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        QCOMPARE(frameChanged.count(), 0);
+        return;
+    }
+    // Every other outcome is a public request, an equal rectangle included.
+    QCOMPARE(window->m_geometryRequestGeneration, requestBefore + 1);
+    QCOMPARE(frameChanged.count(), expectedFrame == frameBefore ? 0 : 1);
+    if (scenario == 4) {
+        QVERIFY(restoreObserved);
+        QCOMPARE(restoreChanged.count(), 1);
+        // The same relative position in this output's area: the other area's offset removed.
+        QCOMPARE(QRectF(window->geometryRestore()), QRectF(1300 - otherArea.x() + screenArea.x(), 100, 100, 50));
+    } else {
+        QCOMPARE(QRectF(window->geometryRestore()), restoreBefore);
+    }
+#else
+    QSKIP("X11 support is disabled");
+#endif
+}
+
+void TilesTest::decorationGeneration_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("clear-ordering") << 0;
+    QTest::newRow("recreate-away-and-back") << 1;
+    QTest::newRow("no-op-writes") << 2;
+    QTest::newRow("saturation") << 3;
+    QTest::newRow("policy-ordering") << 4;
+    QTest::newRow("nested-replacement") << 5;
+    QTest::newRow("closure-inside-notification") << 6;
+    QTest::newRow("closure-inside-installation") << 7;
+    QTest::newRow("closure-inside-replacement") << 8;
+}
+
+void TilesTest::decorationGeneration()
+{
+    // The decoration generation versions every installation, removal and replacement, installed
+    // with the pointer before any observer runs; the X11 policy revision versions every policy
+    // change, installed with the value before the decoration update; both saturate, equal writes
+    // change nothing, and a nested replacement advances again without the outer call overwriting it.
+#if KWIN_BUILD_X11
+    QFETCH(int, scenario);
+    const auto maximum = std::numeric_limits<quint64>::max();
+    Test::XcbConnectionPtr connection = Test::createX11Connection();
+    QVERIFY(!xcb_connection_has_error(connection.get()));
+    X11Window *window = createWindow(connection.get(), Rect(10, 20, 100, 50));
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QCOMPARE(window->m_decorationPolicy, DecorationPolicy::ClientPreference);
+    const xcb_window_t windowId = window->window();
+    const QPointer<Window> guard(window);
+    const auto closeWindow = qScopeGuard([&]() {
+        xcb_destroy_window(connection.get(), windowId);
+        xcb_flush(connection.get());
+        if (guard) {
+            QSignalSpy closed(guard.data(), &Window::closed);
+            closed.wait();
+        }
+    });
+    if (scenario == 3) {
+        window->m_decorationGeneration = maximum - 1;
+        window->m_decorationPolicyRevision = maximum - 1;
+    }
+    if (scenario == 7) {
+        // Start cleared: the direct installation below is the non-null case.
+        window->setDecorationPolicy(DecorationPolicy::None);
+        QVERIFY(!window->isDecorated());
+    }
+    const auto generationBefore = window->m_decorationGeneration;
+    const auto revisionBefore = window->m_decorationPolicyRevision;
+    QSignalSpy decorationChanged(window, &Window::decorationChanged);
+    QSignalSpy policyChanged(window, &Window::decorationPolicyChanged);
+    QObject context;
+    bool nested = false;
+    int observed = 0;
+    if (scenario == 0 || scenario == 4) {
+        const auto observe = [&]() {
+            // Installed before the observers: the pointer gone, the generation and the policy
+            // revision advanced, the policy written.
+            ++observed;
+            QVERIFY(!window->decoration());
+            QCOMPARE(window->m_decorationGeneration, generationBefore + 1);
+            QCOMPARE(window->m_decorationPolicy, DecorationPolicy::None);
+            QCOMPARE(window->m_decorationPolicyRevision, revisionBefore + 1);
+        };
+        connect(window, &Window::decorationChanged, &context, observe);
+        connect(window, &Window::borderRadiusChanged, &context, observe);
+    } else if (scenario == 5) {
+        connect(window, &Window::decorationChanged, &context, [&]() {
+            if (!nested) {
+                nested = true;
+                window->setDecorationPolicy(DecorationPolicy::ClientPreference);
+            }
+        });
+    } else if (scenario == 6) {
+        // Closed inside the clear's notification with no reference held outside: the window
+        // outlives the installation and the displaced decoration it parents is released before the
+        // window is; the transition's remaining steps run on the live object. The Memcheck lane
+        // qualifies this row.
+        connect(window, &Window::decorationChanged, &context, [&]() {
+            if (!nested) {
+                nested = true;
+                window->setSkipCloseAnimation(true);
+                window->destroyWindow();
+            }
+        });
+    } else if (scenario == 7 || scenario == 8) {
+        // Closed inside an installation's notification, through the X11 helpers directly with no
+        // reference held outside: the installer's incoming ownership was moved into the member and
+        // the helpers hand their reference over, so the new decoration, which the window parents,
+        // is deleted once, by the window. Row 8 closes at the forced replacement's notification:
+        // since 6.8 a forced update replaces the decoration in one installation, with no removal
+        // first. The Memcheck lane qualifies both rows.
+        connect(window, &Window::decorationChanged, &context, [&]() {
+            if (!nested) {
+                nested = true;
+                window->setSkipCloseAnimation(true);
+                window->destroyWindow();
+            }
+        });
+    }
+    if (scenario == 2) {
+        window->setDecorationPolicy(DecorationPolicy::ClientPreference);
+        window->setDecoration(window->m_decoration.decoration);
+        QCOMPARE(window->m_decorationGeneration, generationBefore);
+        QCOMPARE(window->m_decorationPolicyRevision, revisionBefore);
+        QCOMPARE(decorationChanged.count(), 0);
+        QCOMPARE(policyChanged.count(), 0);
+        QVERIFY(window->isDecorated());
+        return;
+    }
+    if (scenario == 7) {
+        window->createDecoration(KDecoration3::Style::Titled, true);
+        QVERIFY(nested);
+        QVERIFY(!guard);
+        QCOMPARE(decorationChanged.count(), 1);
+        return;
+    }
+    if (scenario == 8) {
+        window->updateDecoration(true, true);
+        QVERIFY(nested);
+        QVERIFY(!guard);
+        QCOMPARE(decorationChanged.count(), 1);
+        return;
+    }
+    window->setDecorationPolicy(DecorationPolicy::None);
+    if (scenario == 6) {
+        QVERIFY(nested);
+        QVERIFY(!guard);
+        QCOMPARE(decorationChanged.count(), 1);
+        return;
+    }
+    if (scenario == 5) {
+        // The nested recreation advanced again; the outer call did not overwrite it.
+        QVERIFY(nested);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(window->m_decorationPolicy, DecorationPolicy::ClientPreference);
+        QCOMPARE(window->m_decorationGeneration, generationBefore + 2);
+        QCOMPARE(window->m_decorationPolicyRevision, revisionBefore + 2);
+        QCOMPARE(decorationChanged.count(), 2);
+        return;
+    }
+    QVERIFY(!window->isDecorated());
+    QCOMPARE(window->m_decorationPolicy, DecorationPolicy::None);
+    QCOMPARE(decorationChanged.count(), 1);
+    QCOMPARE(policyChanged.count(), 1);
+    if (scenario == 0 || scenario == 4) {
+        QVERIFY(observed >= 1);
+    }
+    if (scenario == 3) {
+        QCOMPARE(window->m_decorationGeneration, maximum);
+        QCOMPARE(window->m_decorationPolicyRevision, maximum);
+    } else {
+        QCOMPARE(window->m_decorationGeneration, generationBefore + 1);
+        QCOMPARE(window->m_decorationPolicyRevision, revisionBefore + 1);
+    }
+    if (scenario == 1 || scenario == 3) {
+        // Back again: a replacement advances once more (or stays saturated); the policy equal at
+        // the end does not hide the change.
+        window->setDecorationPolicy(DecorationPolicy::ClientPreference);
+        QVERIFY(window->isDecorated());
+        QCOMPARE(window->m_decorationPolicy, DecorationPolicy::ClientPreference);
+        QCOMPARE(decorationChanged.count(), 2);
+        QCOMPARE(window->m_decorationGeneration, scenario == 3 ? maximum : generationBefore + 2);
+        QCOMPARE(window->m_decorationPolicyRevision, scenario == 3 ? maximum : revisionBefore + 2);
     }
 #else
     QSKIP("X11 support is disabled");

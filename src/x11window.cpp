@@ -454,13 +454,13 @@ bool X11Window::manage(xcb_window_t w, bool isMapped)
     std::optional<SessionInfo> session = workspace()->sessionManager()->takeSessionInfo(this);
     if (session) {
         init_minimize = session->minimized;
-        m_decorationPolicy = session->decorationPolicy;
+        writeDecorationPolicy(session->decorationPolicy);
     }
 
     setShortcut(rules()->checkShortcut(session ? session->shortcut : QString(), true));
 
     init_minimize = rules()->checkMinimize(init_minimize, !isMapped);
-    m_decorationPolicy = rules()->checkDecorationPolicy(m_decorationPolicy, !isMapped);
+    writeDecorationPolicy(rules()->checkDecorationPolicy(m_decorationPolicy, !isMapped));
 
     readActivities(activitiesCookie);
 
@@ -904,10 +904,27 @@ void X11Window::setDecorationPolicy(DecorationPolicy policy)
     if (m_decorationPolicy == effectivePolicy) {
         return;
     }
-    m_decorationPolicy = effectivePolicy;
+    // The window outlives the whole transition: a handler of one of its notifications may close it
+    // and drop its last reference, and the steps after that still run on this object.
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    writeDecorationPolicy(effectivePolicy);
     updateDecoration(true, false);
     updateWindowRules(Rules::DecorationPolicy);
     Q_EMIT decorationPolicyChanged();
+}
+
+void X11Window::writeDecorationPolicy(DecorationPolicy policy)
+{
+    if (m_decorationPolicy == policy) {
+        return;
+    }
+    m_decorationPolicy = policy;
+    if (m_decorationPolicyRevision != std::numeric_limits<quint64>::max()) {
+        ++m_decorationPolicyRevision;
+    }
 }
 
 DecorationMode X11Window::preferredDecorationMode() const
@@ -1005,6 +1022,12 @@ static QPointF gravityReferencePoint(const QMarginsF &margins, xcb_gravity_t gra
 
 void X11Window::updateDecoration(bool check_workspace_pos, bool force)
 {
+    // The window outlives the update: its steps after a closure inside a notification still run
+    // on this object.
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     const RectF oldGeometry = moveResizeGeometry();
 
     const QMarginsF previousFrameMargins = frameMargins();
@@ -1051,6 +1074,13 @@ void X11Window::createDecoration(KDecoration3::Style style, bool force)
         return;
     }
 
+    // The window outlives the installation (a handler may close it and drop its last reference),
+    // and this function's own reference to the new decoration is handed over, never kept past
+    // that retention.
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     std::shared_ptr<KDecoration3::Decoration> decoration(Workspace::self()->decorationBridge()->createDecoration(this, style));
     if (decoration) {
         decoration->apply(decoration->nextState()->clone());
@@ -1071,7 +1101,7 @@ void X11Window::createDecoration(KDecoration3::Style style, bool force)
         });
     }
 
-    setDecoration(decoration);
+    setDecoration(std::move(decoration));
     updateShadow();
     updateFrameExtents();
 }
@@ -1082,6 +1112,10 @@ void X11Window::destroyDecoration()
         return;
     }
 
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
     setDecoration(nullptr);
     updateShadow();
     updateFrameExtents();
