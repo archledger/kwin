@@ -6,6 +6,7 @@
 #pragma once
 
 #include "core/rect.h"
+#include "window.h"
 #include <kwin_export.h>
 
 #include <QObject>
@@ -66,7 +67,9 @@ private:
     void resetTree();
     void nodeAboutToBeDestroyed(TransientTile *node);
     bool admissionCurrent(Window *window, quint64 generation) const;
-    bool releaseWindow(Window *window, quint64 generation);
+    // With a result, the release's own writes are inside a checkpoint taken before its
+    // notifications and validated once after its finalization; see Window::revokeTransientOwnership.
+    bool releaseWindow(Window *window, quint64 generation, Window::AssignmentStepResult *guarded = nullptr);
     void clearAdmission();
 
     QPointer<TransientTile> m_root;

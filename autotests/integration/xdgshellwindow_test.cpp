@@ -366,6 +366,8 @@ private Q_SLOTS:
     void testNormalizeMaximize();
     void testNormalizeMaximizeSupersession_data();
     void testNormalizeMaximizeSupersession();
+    void testCancellationPreparation_data();
+    void testCancellationPreparation();
     void testTransientNoRequestProofReplay();
     void testNoRequestFinalization_data();
     void testNoRequestFinalization();
@@ -8704,6 +8706,294 @@ void TestXdgShellWindow::testNormalizeMaximizeSupersession()
         QCOMPARE(bool(states & Test::XdgToplevel::State::Maximized), window->requestedMaximizeMode() == MaximizeFull);
     } else {
         QCOMPARE(window->requestedMaximizeMode(), (boundary == 16 || boundary == 17) ? MaximizeFull : MaximizeRestore);
+    }
+}
+
+void TestXdgShellWindow::testCancellationPreparation_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("no-owner") << 0;
+    QTest::newRow("prepared-owner-clean-release") << 1;
+    QTest::newRow("admitted-owner-release-cannot-finalize") << 2;
+    QTest::newRow("membership-stamp-at-window-removed") << 3;
+    QTest::newRow("nested-request-at-requested-tile-changed") << 4;
+    QTest::newRow("revision-bump-at-requested-tile-changed") << 5;
+    QTest::newRow("close-at-window-removed") << 6;
+    QTest::newRow("reentrant-cancellation-during-release") << 7;
+    QTest::newRow("exhausted-placement-refused") << 8;
+    QTest::newRow("deleted-window") << 9;
+    QTest::newRow("legacy-helper-unchanged") << 10;
+    QTest::newRow("placement-boundary-applied") << 11;
+    QTest::newRow("active-request-without-owner") << 12;
+}
+
+void TestXdgShellWindow::testCancellationPreparation()
+{
+    // The public cancellation boundary as a qualified continuation: the stamp and the release's
+    // own writes are inside the checkpoint, the release's notifications are callback boundaries,
+    // and one terminal validation decides whether the caller may continue.
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    using Result = TransientPlacementWriter::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.cancellation"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.cancellation");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    const auto state = writer.snapshot();
+    const bool prepared = scenario == 1;
+    const bool admitted = scenario == 2 || (scenario >= 3 && scenario <= 8) || scenario == 10;
+    // A Prepared reservation releases through the window-only path and finalizes cleanly; an
+    // admitted owner releases through the controller and cannot finalize synchronously (its
+    // progress is Requested), so the owner stays for a consumer's entry refusal.
+    RequestTestTile requestTile(window);
+    QObject owner;
+    auto authority = std::make_shared<RequestAuthority>();
+    authority->owner = &owner;
+    quint64 generation = 0;
+    if (prepared) {
+        generation = window->prepareTransientOwnership(&writer, token, key, state.providerRevision, state.mapRevision,
+                                                       std::make_unique<RequestForTest>(window, &requestTile, authority, 0));
+        QVERIFY(generation);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Prepared);
+        QVERIFY(!window->m_transientOwnership->controller);
+        QVERIFY(writer.isReserved(id));
+    }
+    TransientTileController controller;
+    Tile *leaf = nullptr;
+    if (admitted) {
+        auto manager = workspace()->tileManager(window->moveResizeOutput());
+        auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+        QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        leaf = controller.tile();
+        QVERIFY(leaf);
+        configure.clear();
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        generation = window->ownedTransientPlacementGeneration();
+        QVERIFY(generation);
+        QCOMPARE(window->requestedTile(), leaf);
+        QVERIFY(leaf->windows().contains(window));
+        QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+    }
+    auto *const quickTile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
+    QVERIFY(quickTile);
+    QPointer<Window> guard(window);
+    std::unique_ptr<TileAssignmentFence> retained;
+    if (scenario == 6 || scenario == 9) {
+        // A caller-owned checkpoint retains the window across its close, so the logically deleted
+        // window can be observed after the call; it is released before the destruction is awaited.
+        retained = window->makeTileAssignmentCheckpoint();
+    }
+    if (scenario == 9) {
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QVERIFY(guard && guard->isDeleted());
+    }
+    if (scenario == 8) {
+        window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - 1;
+    } else if (scenario == 11) {
+        // The last usable value: the stamp lands below exhaustion and the checkpoint is current.
+        window->m_placementContinuationRevision = std::numeric_limits<quint64>::max() - 2;
+    }
+    const auto placementBefore = window->m_placementContinuationRevision;
+    const auto requestedBefore = window->m_requestedTileChange;
+    const auto committedBefore = window->m_committedTileChange;
+    const auto membershipBefore = window->m_tileMembershipChange;
+    QSignalSpy requestedTileChanged(window, &Window::requestedTileChanged);
+    std::unique_ptr<QSignalSpy> leafRemoved;
+    std::unique_ptr<QSignalSpy> leafChanged;
+    if (leaf) {
+        leafRemoved = std::make_unique<QSignalSpy>(leaf, &Tile::windowRemoved);
+        leafChanged = std::make_unique<QSignalSpy>(leaf, &Tile::windowsChanged);
+    }
+    QObject context;
+    bool intervened = false;
+    bool hadActiveRequest = false;
+    quint64 placementAtInner = 0;
+    quint64 placementAfterInner = 0;
+    std::optional<Window::AssignmentStepResult> inner;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (scenario) {
+        case 12:
+            // Inside an in-flight request without ownership: the stamp and the cancellation mark
+            // are the caller's own, no release runs, the continuation starts right there.
+            hadActiveRequest = window->m_activeTransientRequest != nullptr;
+            placementAtInner = window->m_placementContinuationRevision;
+            inner = window->cancelTransientRequestForAssignment();
+            placementAfterInner = window->m_placementContinuationRevision;
+            break;
+        case 3:
+            // A public membership no-op: only the membership revision observes it.
+            QVERIFY(!quickTile->unmanage(window));
+            break;
+        case 4:
+            // A nested public request: the release is already running, so its cancellation
+            // acquires nothing and the public path proceeds to tile.
+            window->requestTile(quickTile);
+            break;
+        case 5:
+            // Property-only: the requested-association revision alone.
+            window->m_requestedTileChange = window->m_requestedTileChange + 1;
+            break;
+        case 6:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        case 7:
+            inner = window->cancelTransientRequestForAssignment();
+            break;
+        }
+    };
+    if (scenario == 3 || scenario == 6 || scenario == 7) {
+        connect(leaf, &Tile::windowRemoved, &context, intervene);
+    } else if (scenario == 4 || scenario == 5) {
+        connect(window, &Window::requestedTileChanged, &context, intervene);
+    } else if (scenario == 12) {
+        connect(window, &Window::requestedGeometryChanged, &context, intervene);
+    }
+    if (scenario == 12) {
+        QVERIFY(window->canStartTransientTileRequest(requestTile.windowGeometry()));
+        const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &requestTile, authority));
+        QVERIFY(intervened);
+        QVERIFY(hadActiveRequest);
+        QVERIFY(inner.has_value());
+        QCOMPARE(inner->outcome, Outcome::AppliedCurrent);
+        QVERIFY(inner->checkpoint);
+        // The stamp is the inner call's only placement write; the request's own writes before
+        // and after the handler are its own continuation, not the cancellation's.
+        QCOMPARE(placementAfterInner, placementAtInner + 1);
+        QVERIFY(window->m_placementContinuationRevision > placementBefore);
+        // The cancelled request does not apply; what it clears afterwards is its own continuation.
+        QVERIFY(receipt.outcome != Window::TransientRequestOutcome::Applied);
+        QVERIFY(!window->m_transientOwnership);
+        return;
+    }
+    if (scenario == 10) {
+        // The legacy helper keeps its body and its bool: the release runs as before.
+        QVERIFY(window->cancelTransientRequest());
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        QCOMPARE(leafRemoved->count(), 1);
+        QVERIFY(!window->requestedTile());
+        QVERIFY(window->m_transientOwnership);
+        return;
+    }
+    const auto result = window->cancelTransientRequestForAssignment();
+    QCOMPARE(intervened, scenario >= 3 && scenario <= 7);
+    switch (scenario) {
+    case 11:
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->m_placementContinuationRevision, std::numeric_limits<quint64>::max() - 1);
+        break;
+    case 0:
+        // No owner: the stamp alone, inside the checkpoint.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(result.checkpoint && result.checkpoint->isCurrentFor(*window));
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        QCOMPARE(window->m_requestedTileChange, requestedBefore);
+        QCOMPARE(requestedTileChanged.count(), 0);
+        break;
+    case 1:
+        // The Prepared reservation is cancelled through the window-only path and finalized: the
+        // owner is gone, the reservation released, and only the stamp was written.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(!writer.isReserved(id));
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        QCOMPARE(window->m_requestedTileChange, requestedBefore);
+        QCOMPARE(window->m_committedTileChange, committedBefore);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        break;
+    case 2:
+        // The admitted owner's release runs its writes (the transient removal, the requested
+        // detachment) and notifications inside the checkpoint but cannot finalize: the owner
+        // stays, the continuation is current.
+        QCOMPARE(result.outcome, Outcome::AppliedCurrent);
+        QVERIFY(window->assignmentResultIsCurrent(result));
+        QVERIFY(window->m_transientOwnership && window->m_transientOwnership->generation == generation);
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!leaf->windows().contains(window));
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 1);
+        QCOMPARE(window->m_requestedTileChange, requestedBefore + 1);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore + 1);
+        QCOMPARE(requestedTileChanged.count(), 1);
+        QCOMPARE(leafRemoved->count(), 1);
+        QCOMPARE(leafChanged->count(), 1);
+        break;
+    case 3:
+    case 4:
+    case 5:
+        // A foreign change inside the release's notifications: the continuation is stale, the
+        // release itself completed its notifications regardless.
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(leafRemoved->count(), 1);
+        QCOMPARE(leafChanged->count(), 1);
+        if (scenario == 3) {
+            QCOMPARE(window->m_tileMembershipChange, membershipBefore + 2);
+        } else if (scenario == 4) {
+            // The handler's intent stands.
+            QCOMPARE(window->requestedTile(), quickTile);
+        } else {
+            QCOMPARE(window->m_requestedTileChange, requestedBefore + 2);
+        }
+        break;
+    case 6:
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QVERIFY(guard && guard->isDeleted());
+        break;
+    case 7:
+        // The reentrant cancellation acquired no release (one was running): its own writes are
+        // complete and no callback ran in its frame, so its continuation starts there; the outer
+        // continuation is stale because of it.
+        QVERIFY(inner.has_value());
+        QCOMPARE(inner->outcome, Outcome::AppliedCurrent);
+        QVERIFY(inner->checkpoint);
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore + 2);
+        QVERIFY(window->m_transientOwnership);
+        QVERIFY(window->assignmentResultIsCurrent(*inner));
+        break;
+    case 8:
+        // Exhaustion known before the stamp: refused without effect, no release ran.
+        QCOMPARE(result.outcome, Outcome::Refused);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        QCOMPARE(leafRemoved->count(), 0);
+        QCOMPARE(window->requestedTile(), leaf);
+        break;
+    case 9:
+        QCOMPARE(result.outcome, Outcome::Superseded);
+        QVERIFY(!result.checkpoint);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        break;
+    }
+    if (scenario == 6 || scenario == 9) {
+        retained.reset();
+        QTRY_VERIFY(!guard);
     }
 }
 

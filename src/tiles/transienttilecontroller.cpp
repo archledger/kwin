@@ -201,13 +201,14 @@ private:
 class TransientTileController::Release
 {
 public:
-    explicit Release(TransientTileController *controller, bool notifyLeaf = true)
+    explicit Release(TransientTileController *controller, bool notifyLeaf = true, Window::AssignmentStepResult *guarded = nullptr)
         : m_controller(controller)
         , m_window(controller->m_window)
         , m_tile(controller->m_tile)
         , m_generation(controller->m_ownershipGeneration)
         , m_treeGeneration(controller->m_generation)
         , m_notifyLeaf(notifyLeaf)
+        , m_guarded(guarded)
     {
         if (!m_window || !m_generation) {
             m_window.clear();
@@ -226,6 +227,11 @@ public:
             m_window->noteTileMembershipChanged();
         }
         m_changes = m_window->detachTransientAssociation(m_generation);
+        if (m_guarded) {
+            // After this release's own callback-free writes, before its notifications; never
+            // refreshed. The result pointer is stack-bounded by the releasing call.
+            m_guarded->checkpoint = m_window->makeTileAssignmentCheckpoint();
+        }
     }
 
     ~Release()
@@ -251,6 +257,11 @@ public:
             m_tile->publishRemoved(m_window, m_treeGeneration);
         }
         m_finalized = m_window->finishTransientRelease(m_generation);
+        if (m_guarded) {
+            // The caller's continuation, decided once after every notification and the
+            // finalization, before the releasing call returns.
+            m_window->qualifyReleaseContinuation(*m_guarded);
+        }
         return m_finalized;
     }
 
@@ -263,6 +274,7 @@ private:
     quint64 m_generation;
     quint64 m_treeGeneration;
     bool m_notifyLeaf;
+    Window::AssignmentStepResult *m_guarded = nullptr;
     bool m_active = false;
     bool m_finished = false;
     bool m_finalized = false;
@@ -663,18 +675,18 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
     return Result::Superseded;
 }
 
-bool TransientTileController::releaseWindow(Window *window, quint64 generation)
+bool TransientTileController::releaseWindow(Window *window, quint64 generation, Window::AssignmentStepResult *guarded)
 {
     if (m_window != window || m_ownershipGeneration != generation) {
         if (window && window->m_transientOwnership && window->m_transientOwnership->generation == generation
             && window->m_transientOwnership->controller == this) {
             window->m_transientOwnership->controller.clear();
-            return window->revokeTransientOwnership(generation);
+            return window->revokeTransientOwnership(generation, guarded);
         }
         return false;
     }
     Mutation mutation(this);
-    Release release(this);
+    Release release(this, true, guarded);
     return release.finish();
 }
 

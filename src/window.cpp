@@ -4553,6 +4553,45 @@ bool Window::cancelTransientRequest()
         && m_placementContinuationRevision == revision;
 }
 
+Window::AssignmentStepResult Window::cancelTransientRequestForAssignment()
+{
+    AssignmentStepResult result;
+    if (isDeleted()) {
+        // Nothing can continue from a deleted window: stale, not refused.
+        result.outcome = AssignmentStepOutcome::Superseded;
+        return result;
+    }
+    if (m_placementContinuationRevision >= std::numeric_limits<quint64>::max() - 1) {
+        // Exhaustion known before the stamp: refused without effect.
+        return result;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // The stamp and the cancellation mark are this caller's own writes; from here nothing is a
+    // refusal any more.
+    m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
+    if (m_activeTransientRequest) {
+        m_activeTransientRequest->m_cancelled = true;
+    }
+    if (m_transientOwnership) {
+        // The result enters as Refused and a release that runs always leaves its verdict; an
+        // untouched result means no release was acquired (one is already running in an outer
+        // frame, or the ownership is not its controller's to release): this frame's own writes are
+        // complete and no callback ran in it, so the continuation starts here. The owner stays
+        // for the consumer's entry refusal to decide.
+        revokeTransientOwnership(m_transientOwnership->generation, &result);
+        if (result.outcome == AssignmentStepOutcome::Refused) {
+            result.checkpoint = makeTileAssignmentCheckpoint();
+        }
+    } else {
+        result.checkpoint = makeTileAssignmentCheckpoint();
+    }
+    qualifyReleaseContinuation(result);
+    return result;
+}
+
 Window::TransientOwnership::TransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, quint64 providerRevision,
                                                quint64 generation, std::unique_ptr<TransientTileRequest> request)
     : writer(writer)
@@ -4662,13 +4701,13 @@ Window::TransientRequestReceipt Window::applyTransientOwnership(quint64 generati
     return receipt;
 }
 
-bool Window::revokeTransientOwnership(quint64 generation)
+bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)
 {
     if (!m_transientOwnership || m_transientOwnership->generation != generation) {
         return false;
     }
     if (const auto controller = m_transientOwnership->controller) {
-        return controller->releaseWindow(this, generation);
+        return controller->releaseWindow(this, generation, guarded);
     }
     ref();
     const auto lifetime = qScopeGuard([this]() {
@@ -4678,8 +4717,28 @@ bool Window::revokeTransientOwnership(quint64 generation)
         return false;
     }
     const auto changes = detachTransientAssociation(generation);
+    if (guarded) {
+        // After this release's own callback-free writes, before its notifications; never refreshed.
+        guarded->checkpoint = makeTileAssignmentCheckpoint();
+    }
     notifyTransientAssociation(generation, changes);
-    return finishTransientRelease(generation);
+    const bool finalized = finishTransientRelease(generation);
+    if (guarded) {
+        qualifyReleaseContinuation(*guarded);
+    }
+    return finalized;
+}
+
+void Window::qualifyReleaseContinuation(AssignmentStepResult &guarded) const
+{
+    // One terminal validation of the checkpoint taken after the release's writes: the ownership's
+    // deletion itself is not fenced and needs no replacement checkpoint.
+    if (!isDeleted() && guarded.checkpoint && guarded.checkpoint->isCurrentFor(*this)) {
+        guarded.outcome = AssignmentStepOutcome::AppliedCurrent;
+    } else {
+        guarded.outcome = AssignmentStepOutcome::Superseded;
+        guarded.checkpoint.reset();
+    }
 }
 
 bool Window::beginTransientRelease(quint64 generation)
