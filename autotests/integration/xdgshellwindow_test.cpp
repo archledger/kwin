@@ -433,6 +433,8 @@ private Q_SLOTS:
     void testTransientConfigureProvenance();
     void testTransientAssociationOrigin();
     void testControllerWindowAdmission();
+    void testTransientAdmissionReceipt_data();
+    void testTransientAdmissionReceipt();
     void testControllerAdmissionCallback_data();
     void testControllerAdmissionCallback();
     void testControllerDetachNotification_data();
@@ -446,7 +448,9 @@ private Q_SLOTS:
     void testControllerReleasePriority_data();
     void testControllerReleasePriority();
     void testAssociationCounterSaturation();
+    void testControllerForeignMembership_data();
     void testControllerForeignMembership();
+    void testControllerClearAfterWriterLoss_data();
     void testControllerClearAfterWriterLoss();
     void testPublicTransientRelease_data();
     void testPublicTransientRelease();
@@ -10609,6 +10613,254 @@ void TestXdgShellWindow::testControllerWindowAdmission()
     QVERIFY(!writer.isReserved(id));
 }
 
+void TestXdgShellWindow::testTransientAdmissionReceipt_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("accepted") << 0;
+    QTest::newRow("superseded-at-window-added-by-desktop") << 1;
+    QTest::newRow("superseded-at-windows-changed-by-commit") << 2;
+    QTest::newRow("superseded-at-window-added-by-provider") << 3;
+    QTest::newRow("superseded-at-last-request-notification") << 4;
+    QTest::newRow("refused-headroom-membership") << 5;
+    QTest::newRow("refused-headroom-association") << 6;
+    QTest::newRow("refused-headroom-placement") << 7;
+    QTest::newRow("ineligible-requested-association") << 8;
+    QTest::newRow("ineligible-unsettled-geometry") << 9;
+}
+
+void TestXdgShellWindow::testTransientAdmissionReceipt()
+{
+    // The admission as a transaction: a complete preflight refuses before any provisional state, the
+    // publication runs on a checkpoint sealed after the admission's own writes with the admission's
+    // currentness as provenance, the native request's continuation decides acceptance beyond the
+    // request's destruction, and any later failure releases this attempt's membership and
+    // association only.
+    QFETCH(int, scenario);
+    using Result = TransientTileController::Result;
+    auto desktops = VirtualDesktopManager::self();
+    const auto oldCount = desktops->count();
+    const auto restoreDesktops = qScopeGuard([desktops, oldCount]() {
+        desktops->setCount(oldCount);
+    });
+    desktops->setCount(std::max(oldCount, uint(2)));
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.admission"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    const auto key = QStringLiteral("org.example.admission");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto current = desktops->currentDesktop(window->moveResizeOutput());
+    auto other = desktops->desktops().first() == current ? desktops->desktops().last() : desktops->desktops().first();
+    QVERIFY(other != current);
+    TransientTileController controller;
+    QCOMPARE(controller.createTree(manager, current, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    const auto generation = controller.generation();
+    QPointer<Tile> leaf(controller.tile());
+    const auto target = leaf->windowGeometry();
+    Tile ordinary(manager);
+    QSignalSpy added(leaf, &Tile::windowAdded);
+    QSignalSpy removed(leaf, &Tile::windowRemoved);
+    QSignalSpy windowsChanged(leaf, &Tile::windowsChanged);
+    QSignalSpy geometry(window, &Window::requestedGeometryChanged);
+    QObject context;
+    // The publication's own second notification, apart from the one the release publishes with
+    // the removal.
+    int changedBeforeRemoval = 0;
+    connect(leaf, &Tile::windowsChanged, &context, [&]() {
+        if (removed.isEmpty()) {
+            ++changedBeforeRemoval;
+        }
+    });
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    const auto membershipOriginal = window->m_tileMembershipChange;
+    const auto associationOriginal = window->m_requestedTileChange;
+    const auto placementOriginal = window->m_placementContinuationRevision;
+    QMetaObject::Connection desktopChange;
+    switch (scenario) {
+    case 1:
+        // A counter-free context change inside the first notification: only the admission's
+        // currentness sees it, through the publication's provenance.
+        desktopChange = connect(leaf, &Tile::windowAdded, &context, [&]() {
+            window->setDesktops({other});
+        });
+        break;
+    case 2:
+        // A committed association installed inside the second notification: the checkpoint sees it,
+        // and the admission's cleanup leaves that manual placement in place.
+        connect(leaf, &Tile::windowsChanged, &context, [&]() {
+            window->commitTile(&ordinary);
+        });
+        break;
+    case 3:
+        // The provider retired inside the first notification: the writer's own release runs inside
+        // the publication, and the admission's currentness ends with the provider.
+        connect(leaf, &Tile::windowAdded, &context, [&]() {
+            provider.reset();
+        });
+        break;
+    case 4:
+        // The admission's context changed inside the request's last notification: the request's
+        // own authority ends it after the request was made, and the barrier is kept.
+        connect(window, &Window::requestedTileChanged, &context, [&]() {
+            window->setDesktops({other});
+        });
+        break;
+    case 5:
+        window->m_tileMembershipChange = exhausted - 2;
+        break;
+    case 6:
+        window->m_requestedTileChange = exhausted - 2;
+        break;
+    case 7:
+        window->m_placementContinuationRevision = exhausted - Window::assignmentPlacementBudget;
+        break;
+    case 8:
+        // A requested association without a membership, as a public request leaves it: ineligible
+        // before any reservation.
+        window->m_requestedTile = &ordinary;
+        break;
+    case 9:
+        // A compositor resize the client has not acknowledged: the native geometry is not settled.
+        window->moveResize(RectF(original.x(), original.y(), original.width() + 60, original.height() + 40));
+        QVERIFY(QRectF(window->moveResizeGeometry()) != QRectF(window->frameGeometry()));
+        break;
+    default:
+        break;
+    }
+    // The counters as the admission finds them (a public resize in the setup advances the
+    // placement continuation revision on its own).
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto associationBefore = window->m_requestedTileChange;
+    const auto placementBefore = window->m_placementContinuationRevision;
+    const auto state = writer.snapshot();
+    const auto result = controller.admit(generation, window, &writer, token, key, state.providerRevision, state.mapRevision);
+    if (scenario >= 5) {
+        // Refused for a known shortage, or ineligible: before any reservation, membership or
+        // association, and before any provisional admission state (a second admission is not
+        // Busy, it is refused the same way).
+        QCOMPARE(result, scenario <= 7 ? Result::Refused : Result::Ineligible);
+        QCOMPARE(controller.admit(generation, window, &writer, token, key, state.providerRevision, state.mapRevision), result);
+        if (scenario == 8) {
+            window->m_requestedTile = nullptr;
+        }
+        QCOMPARE(added.count(), 0);
+        QCOMPARE(windowsChanged.count(), 0);
+        QCOMPARE(geometry.count(), scenario == 9 ? 1 : 0);
+        QVERIFY(!writer.isReserved(id));
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(!leaf->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(window->m_requestedTileChange, associationBefore);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        if (scenario == 5) {
+            window->m_tileMembershipChange = membershipOriginal;
+        } else if (scenario == 6) {
+            window->m_requestedTileChange = associationOriginal;
+        } else if (scenario == 7) {
+            window->m_placementContinuationRevision = placementOriginal;
+        }
+        return;
+    }
+    if (scenario == 0) {
+        QCOMPARE(result, Result::Accepted);
+        QCOMPARE(added.count(), 1);
+        QCOMPARE(windowsChanged.count(), 1);
+        QVERIFY(leaf->windows().contains(window));
+        QCOMPARE(window->requestedTile(), leaf.data());
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+        QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+        QVERIFY(writer.ownsReservation(id, QString::number(window->m_transientOwnership->generation)));
+        QCOMPARE(window->moveResizeGeometry(), target);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), target.size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->tile(), leaf.data());
+        return;
+    }
+    QCOMPARE(result, Result::Superseded);
+    QCOMPARE(added.count(), 1);
+    // The release publishes the removal once, with its own notification.
+    QCOMPARE(removed.count(), 1);
+    QCOMPARE(windowsChanged.count(), changedBeforeRemoval + 1);
+    QVERIFY(!leaf->windows().contains(window));
+    QVERIFY(!window->requestedTile());
+    if (scenario == 4) {
+        // After the request: the record stays as the restoration's barrier with its progress, the
+        // reservation with it; the attempt's membership and association are released.
+        QCOMPARE(changedBeforeRemoval, 1);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(window->m_transientOwnership->progress, Window::TransientRequestProgress::Requested);
+        QVERIFY(writer.isReserved(id));
+        QCOMPARE(window->desktops(), (QList<VirtualDesktop *>{other}));
+        return;
+    }
+    // Before any request: no further publication after the superseding notification, nothing
+    // requested, the record finalized with its NoRequest proof, the reservation gone, the frame
+    // untouched.
+    QCOMPARE(changedBeforeRemoval, scenario == 2 ? 1 : 0);
+    QCOMPARE(geometry.count(), 0);
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(QRectF(window->frameGeometry()), original);
+    if (scenario == 2) {
+        // The manual placement a callback installed survives the admission's cleanup, and the
+        // admission holds no provisional state: a new admission is refused for that placement,
+        // not Busy.
+        QCOMPARE(window->tile(), &ordinary);
+        QCOMPARE(controller.admit(generation, window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Ineligible);
+        return;
+    }
+    if (scenario == 3) {
+        QVERIFY(controller.admit(generation, window, &writer, token, key, state.providerRevision, state.mapRevision) != Result::Busy);
+        return;
+    }
+    if (scenario == 1) {
+        // Released and readmitted: a new attempt with its own generation, the old one never revived.
+        const auto oldGeneration = window->m_lastTransientOwnershipGeneration;
+        QVERIFY(oldGeneration);
+        // Only the first attempt is superseded; the second must run without the injected move.
+        QVERIFY(disconnect(desktopChange));
+        window->setDesktops({current});
+        // The desktop changes scheduled configures for the activation state; the admission refuses
+        // pending native geometry, so the client settles them first. The first attempt's
+        // finalization advanced the writer, so the readmission freezes it anew.
+        for (int settled = 0; settled < 3 && !window->transientAdmissionEligible(target); ++settled) {
+            QVERIFY(!configure.isEmpty() || configure.wait());
+            shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+            configure.clear();
+            Test::render(surface.get(), QSize(200, 100), Qt::red);
+            QVERIFY(Test::waylandSync());
+        }
+        QVERIFY(window->transientAdmissionEligible(target));
+        const auto fresh = writer.snapshot();
+        QCOMPARE(controller.admit(generation, window, &writer, token, key, fresh.providerRevision, fresh.mapRevision), Result::Accepted);
+        QVERIFY(window->m_transientOwnership);
+        QVERIFY(window->m_transientOwnership->generation > oldGeneration);
+        QVERIFY(leaf->windows().contains(window));
+        QCOMPARE(window->moveResizeGeometry(), target);
+    }
+}
+
 void TestXdgShellWindow::testControllerAdmissionCallback_data()
 {
     QTest::addColumn<bool>("destroyController");
@@ -11076,8 +11328,19 @@ void TestXdgShellWindow::testAssociationCounterSaturation()
     QCOMPARE(modeChanged.count(), 0);
 }
 
+void TestXdgShellWindow::testControllerForeignMembership_data()
+{
+    QTest::addColumn<bool>("activeDesktop");
+    QTest::addColumn<bool>("otherOutput");
+    QTest::newRow("inactive-desktop") << false << false;
+    QTest::newRow("active-desktop") << true << false;
+    QTest::newRow("other-output-inactive-desktop") << false << true;
+}
+
 void TestXdgShellWindow::testControllerForeignMembership()
 {
+    QFETCH(bool, activeDesktop);
+    QFETCH(bool, otherOutput);
     using Result = TransientTileController::Result;
     auto desktops = VirtualDesktopManager::self();
     const auto oldCount = desktops->count();
@@ -11095,18 +11358,37 @@ void TestXdgShellWindow::testControllerForeignMembership()
     shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
     Test::render(surface.get(), QSize(200, 100), Qt::red);
     QVERIFY(Test::waylandSync());
+    // Only acknowledge a configure produced by the membership setup below, not the old activation.
+    configure.clear();
     auto manager = workspace()->tileManager(window->moveResizeOutput());
     auto current = desktops->currentDesktop(window->moveResizeOutput());
     auto other = desktops->desktops().first() == current ? desktops->desktops().last() : desktops->desktops().first();
     window->setOnAllDesktops(true);
-    auto foreign = manager->rootTile(other)->pick(window->moveResizeGeometry().center());
+    auto foreignManager = manager;
+    if (otherOutput) {
+        const auto outputs = workspace()->outputs();
+        auto output = outputs.first() == window->moveResizeOutput() ? outputs.last() : outputs.first();
+        QVERIFY(output != window->moveResizeOutput());
+        foreignManager = workspace()->tileManager(output);
+    }
+    auto foreign = foreignManager->rootTile(activeDesktop ? current : other)->pick(foreignManager->output()->geometryF().center());
     QVERIFY(foreign);
-    QVERIFY(!foreign->isActive());
+    QCOMPARE(foreign->isActive(), activeDesktop);
     QVERIFY(foreign->manage(window));
     window->setDesktops({current});
     QVERIFY(foreign->windows().contains(window));
-    QVERIFY(!window->requestedTile());
-    QVERIFY(!window->tile());
+    if (activeDesktop) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), foreign->windowGeometry().size().toSize(), Qt::red);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->requestedTile(), foreign);
+        QCOMPARE(window->tile(), foreign);
+    } else {
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        QCOMPARE(window->moveResizeOutput(), manager->output());
+    }
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
@@ -11119,9 +11401,23 @@ void TestXdgShellWindow::testControllerForeignMembership()
     QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
     TransientTileController controller;
     QCOMPARE(controller.createTree(manager, current, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QSignalSpy added(controller.tile(), &Tile::windowAdded);
+    QSignalSpy changed(controller.tile(), &Tile::windowsChanged);
+    QSignalSpy removed(foreign, &Tile::windowRemoved);
+    const auto requested = window->requestedTile();
+    const auto committed = window->tile();
+    const auto membership = window->m_tileMembershipChange;
+    const auto geometry = window->moveResizeGeometry();
     const auto state = writer.snapshot();
     QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Ineligible);
     QVERIFY(foreign->windows().contains(window));
+    QCOMPARE(added.count(), 0);
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(window->requestedTile(), requested);
+    QCOMPARE(window->tile(), committed);
+    QCOMPARE(window->m_tileMembershipChange, membership);
+    QCOMPARE(window->moveResizeGeometry(), geometry);
     QVERIFY(!writer.isReserved(id));
     QVERIFY(!window->m_transientOwnership);
     QVERIFY(foreign->unmanage(window));
@@ -11131,8 +11427,17 @@ void TestXdgShellWindow::testControllerForeignMembership()
     QTRY_VERIFY(!guard);
 }
 
+void TestXdgShellWindow::testControllerClearAfterWriterLoss_data()
+{
+    QTest::addColumn<int>("stage");
+    QTest::newRow("after-admission") << 0;
+    QTest::newRow("during-window-added") << 1;
+    QTest::newRow("during-windows-changed") << 2;
+}
+
 void TestXdgShellWindow::testControllerClearAfterWriterLoss()
 {
+    QFETCH(int, stage);
     using Result = TransientTileController::Result;
     std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
     std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
@@ -11159,15 +11464,43 @@ void TestXdgShellWindow::testControllerClearAfterWriterLoss()
     auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
     TransientTileController controller;
     QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    QSignalSpy added(controller.tile(), &Tile::windowAdded);
+    QSignalSpy removed(controller.tile(), &Tile::windowRemoved);
+    QSignalSpy changed(controller.tile(), &Tile::windowsChanged);
+    QSignalSpy geometry(window, &Window::requestedGeometryChanged);
+    QObject context;
+    const auto loseWriter = [&]() {
+        writer.reset();
+    };
+    if (stage == 1) {
+        connect(controller.tile(), &Tile::windowAdded, &context, loseWriter);
+    } else if (stage == 2) {
+        connect(controller.tile(), &Tile::windowsChanged, &context, loseWriter);
+    }
     const auto state = writer->snapshot();
-    QCOMPARE(controller.admit(controller.generation(), window, writer.get(), token, key, state.providerRevision, state.mapRevision), Result::Accepted);
-    writer.reset();
+    QCOMPARE(controller.admit(controller.generation(), window, writer.get(), token, key, state.providerRevision, state.mapRevision),
+             stage == 0 ? Result::Accepted : Result::Superseded);
+    QCOMPARE(added.count(), 1);
+    if (stage == 0) {
+        writer.reset();
+    } else {
+        QVERIFY(!writer);
+        QCOMPARE(removed.count(), 1);
+        QCOMPARE(changed.count(), stage == 1 ? 1 : 2);
+        QCOMPARE(geometry.count(), 0);
+        QVERIFY(controller.tile()->windows().isEmpty());
+        QCOMPARE(QRectF(window->frameGeometry()), original);
+    }
     QCOMPARE(controller.clearTree(controller.generation()), Result::Accepted);
     QVERIFY(!window->requestedTile());
     QVERIFY(!window->tile());
     QVERIFY(window->m_transientOwnership);
     QVERIFY(!window->m_transientOwnership->controller);
     QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(!window->m_transientOwnership->writer);
+    QVERIFY(!window->m_transientOwnership->releaseWriterReady);
+    QCOMPARE(window->m_transientOwnership->progress,
+             stage == 0 ? Window::TransientRequestProgress::Requested : Window::TransientRequestProgress::NoRequest);
     QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
     TransientPlacementWriter replacement(directory.filePath(QStringLiteral("placementrc")));
     const auto replacementToken = replacement.registerProvider(&provider);

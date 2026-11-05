@@ -208,6 +208,7 @@ private Q_SLOTS:
     void setTileCompatibility();
     void x11GuardedAssignment_data();
     void x11GuardedAssignment();
+    void x11TransientAdmissionRefused();
     void x11NormalizeMaximizeForAssignment_data();
     void x11NormalizeMaximizeForAssignment();
     void workspacePositionDecision_data();
@@ -827,9 +828,8 @@ void TilesTest::membershipDuringTransientAdmission_data()
 
 void TilesTest::membershipDuringTransientAdmission()
 {
-    // The transient membership is published before the admission takes any fence: a membership
-    // change or an otherwise-valid public no-op made by a publication callback is newer intent the
-    // admission must not absorb.
+    // Admission seals its checkpoint after adding the membership but before publishing it: a
+    // change or an otherwise-valid public no-op in a callback is newer intent it must not absorb.
     QFETCH(int, scenario);
     using Result = TransientTileController::Result;
     std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
@@ -863,7 +863,7 @@ void TilesTest::membershipDuringTransientAdmission()
     QVERIFY(window->canStartTransientTileRequest(leaf->windowGeometry()));
     const auto maximum = std::numeric_limits<quint64>::max();
     if (scenario == 4) {
-        // The transient add saturates the revision: every later fence of this window is exhausted.
+        // There is no headroom for the transient addition and its possible release.
         window->m_tileMembershipChange = maximum - 1;
     }
     QSignalSpy leafAdded(leaf, &Tile::windowAdded);
@@ -895,8 +895,27 @@ void TilesTest::membershipDuringTransientAdmission()
     }
     const auto state = writer.snapshot();
     const auto membership = window->m_tileMembershipChange;
+    const auto requested = window->m_requestedTileChange;
+    const auto committed = window->m_committedTileChange;
+    const auto placement = window->m_placementContinuationRevision;
     const auto admission = controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision);
     QCOMPARE(intervened, scenario >= 1 && scenario <= 3);
+    if (scenario == 4) {
+        QCOMPARE(admission, Result::Refused);
+        QCOMPARE(leafAdded.count(), 0);
+        QCOMPARE(leafRemoved.count(), 0);
+        QCOMPARE(leafChanged.count(), 0);
+        QCOMPARE(window->m_tileMembershipChange, membership);
+        QCOMPARE(window->m_requestedTileChange, requested);
+        QCOMPARE(window->m_committedTileChange, committed);
+        QCOMPARE(window->m_placementContinuationRevision, placement);
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(!writer.isReserved(id));
+        QVERIFY(!leaf->windows().contains(window));
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        return;
+    }
     QCOMPARE(leafAdded.count(), 1);
     if (scenario == 0) {
         QCOMPARE(admission, Result::Accepted);
@@ -914,14 +933,9 @@ void TilesTest::membershipDuringTransientAdmission()
     QVERIFY(!leaf->windows().contains(window));
     // The release publishes its removal once; a superseded admission publishes nothing further
     // after the boundary that superseded it (row 2 intervenes at the Owned-phase windowsChanged
-    // itself, row 4 is superseded only by its exhausted fences after a complete publication).
+    // itself).
     QCOMPARE(leafRemoved.count(), 1);
-    QCOMPARE(leafChanged.count(), scenario == 2 || scenario == 4 ? 2 : 1);
-    if (scenario == 4) {
-        QCOMPARE(window->m_tileMembershipChange, maximum);
-        QVERIFY(!window->requestedTile());
-        return;
-    }
+    QCOMPARE(leafChanged.count(), scenario == 2 ? 2 : 1);
     // The transient add, the handler's stamp and the release's transient removal.
     QCOMPARE(window->m_tileMembershipChange, membership + 3);
     if (scenario == 3) {
@@ -4160,6 +4174,58 @@ void TilesTest::decorationGeneration()
     }
 #else
     QSKIP("X11 support is disabled");
+#endif
+}
+
+void TilesTest::x11TransientAdmissionRefused()
+{
+    // An X11 window is refused by the admission's complete preflight, before any reservation,
+    // membership or association: the backend cannot start a transient request, and the guarded
+    // ordinary geometry support of the X11 normalization establishes no transient admission.
+#if !KWIN_BUILD_X11
+    QSKIP("X11 support is not built");
+#else
+    using Result = TransientTileController::Result;
+    Test::XcbConnectionPtr connection = Test::createX11Connection();
+    QVERIFY(!xcb_connection_has_error(connection.get()));
+    X11Window *window = createWindow(connection.get(), Rect(0, 0, 430, 310), [&](xcb_window_t windowId) {
+        xcb_icccm_set_wm_class(connection.get(), windowId, 31, "admission\0org.example.admission");
+    });
+    QVERIFY(window);
+    const auto key = window->resourceClass().toLower();
+    QVERIFY(!key.isEmpty());
+    QVERIFY(!window->canStartTransientTileRequest(RectF(window->frameGeometry())));
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(m_output);
+    QCOMPARE(controller.createTree(m_tileManager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    QVERIFY(leaf);
+    QSignalSpy added(leaf, &Tile::windowAdded);
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto associationBefore = window->m_requestedTileChange;
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Ineligible);
+    // No provisional state either: the same refusal again, not Busy.
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Ineligible);
+    QCOMPARE(added.count(), 0);
+    QVERIFY(!writer.isReserved(id));
+    QVERIFY(!window->m_transientOwnership);
+    QVERIFY(!leaf->windows().contains(window));
+    QVERIFY(!window->requestedTile());
+    QVERIFY(!window->tile());
+    QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+    QCOMPARE(window->m_requestedTileChange, associationBefore);
+    QCOMPARE(QRectF(window->frameGeometry()), original);
+    QCOMPARE(writer.snapshot().entries.value(key), original);
 #endif
 }
 
