@@ -45,6 +45,7 @@
 
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace KWin
 {
@@ -127,33 +128,75 @@ void XdgSurfaceWindow::handleCommit()
         return;
     }
 
-    if (m_lastAcknowledgedConfigureSerial.has_value()) {
-        const quint32 serial = m_lastAcknowledgedConfigureSerial.value();
-        while (!m_configureEvents.isEmpty()) {
-            if (serial < m_configureEvents.constFirst()->serial) {
-                break;
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (m_configureCommitGeneration >= exhausted - 1) {
+        m_configureCommitGeneration = exhausted;
+        return;
+    }
+    const auto generation = ++m_configureCommitGeneration;
+    const auto current = [&]() {
+        return !isDeleted() && m_configureCommitGeneration == generation;
+    };
+    // Consume this invocation's ACK before any destructor can invoke a nested commit.
+    const auto acknowledgedSerial = std::exchange(m_lastAcknowledgedConfigureSerial, std::nullopt);
+    std::vector<std::unique_ptr<XdgSurfaceConfigure>> retired;
+    retired.push_back(std::move(m_lastAcknowledgedConfigure));
+    if (acknowledgedSerial.has_value()) {
+        const quint32 serial = acknowledgedSerial.value();
+        // Serials are wrapping identifiers, not an ordering relation. Find the unique
+        // event first, then consume its chronological prefix without touching successors.
+        qsizetype matchedIndex = -1;
+        for (qsizetype i = 0; i < m_configureEvents.size(); ++i) {
+            if (m_configureEvents[i]->serial == serial) {
+                if (matchedIndex != -1) {
+                    matchedIndex = -1;
+                    break;
+                }
+                matchedIndex = i;
             }
-            m_lastAcknowledgedConfigure.reset(m_configureEvents.takeFirst());
         }
+        for (qsizetype i = 0; i <= matchedIndex; ++i) {
+            std::unique_ptr<XdgSurfaceConfigure> event(m_configureEvents.takeFirst());
+            if (i == matchedIndex) {
+                m_lastAcknowledgedConfigure = std::move(event);
+            } else {
+                retired.push_back(std::move(event));
+            }
+        }
+    }
+    // Detach the complete prefix first. Releasing an obsolete decoration can close the
+    // Window or dispatch another commit, either of which may replace the remaining queue.
+    const auto dispose = [&]() {
+        for (auto &event : retired) {
+            event.reset();
+        }
+        retired.clear();
+    };
+    dispose();
+    if (!current()) {
+        return;
     }
 
     if (const XdgSurfaceConfigure *configureEvent = lastAcknowledgedConfigure()) {
         setTargetScale(configureEvent->scale);
-        if (isDeleted()) {
+        if (!current()) {
             return;
         }
     }
 
     handleRoleCommit();
-    if (isDeleted()) {
+    if (!current()) {
         return;
     }
-    m_lastAcknowledgedConfigure.reset();
-    m_lastAcknowledgedConfigureSerial.reset();
+    retired.push_back(std::move(m_lastAcknowledgedConfigure));
+    dispose();
+    if (!current()) {
+        return;
+    }
 
     QPointer<XdgSurfaceWindow> guard(this);
     markAsMapped();
-    if (guard && !guard->isDeleted()) {
+    if (guard && current()) {
         guard->notifyRequestedGeometryChanged();
     }
 }
