@@ -324,6 +324,10 @@ private:
     QSizeF ruleCheckedMinimumSize() const;
     QSizeF ruleCheckedMaximumSize() const;
     void writeRequestedMaximizeMode(MaximizeMode mode);
+    TransientRestoreClaim claimTransientRestoreWithMaximizeNormalization(quint64 generation) override;
+    std::function<bool()> transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const override;
+    AssignmentStepResult normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence) override;
+    bool isTransientRestoreFrameFeasible(const RectF &target) const;
     // Advanced by every requested-fullscreen write, the state the client is told; the intent
     // revision is advanced by those writes and by every requested-output write as well, since the
     // owned geometry depends on both while the publication depends on the state alone.
