@@ -37,6 +37,7 @@
 #endif
 
 class QMouseEvent;
+class TestXdgShellWindow;
 
 namespace KDecoration3
 {
@@ -1733,6 +1734,9 @@ Q_SIGNALS:
     void borderRadiusChanged();
     void excludeFromCaptureChanged();
     void decorationPolicyChanged();
+
+private:
+    friend class ::TestXdgShellWindow;
 
 protected:
     Window();
