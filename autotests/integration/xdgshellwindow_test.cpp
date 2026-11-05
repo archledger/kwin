@@ -241,6 +241,8 @@ private Q_SLOTS:
     void testDecorationSettingsReentry_data();
     void testDecorationSettingsReentry();
     void testDecorationSettingsDestruction();
+    void testDecorationRecreationTraversal_data();
+    void testDecorationRecreationTraversal();
 
     void testMapUnmap();
     void testWindowOutputs();
@@ -846,6 +848,178 @@ void TestXdgShellWindow::testDecorationSettingsDestruction()
     const auto registered = QDBusConnection::sessionBus().interface()->isServiceRegistered(QStringLiteral("org.kde.kappmenuview"));
     QVERIFY(registered.isValid());
     QVERIFY(registered.value());
+}
+
+void TestXdgShellWindow::testDecorationRecreationTraversal_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("unchanged-order") << 0;
+    QTest::newRow("remove-later-member") << 1;
+    QTest::newRow("remove-earlier-member") << 2;
+    QTest::newRow("retained-deleted-member") << 3;
+    QTest::newRow("current-member-retained") << 4;
+    QTest::newRow("new-arrival-not-in-pass") << 5;
+    QTest::newRow("self-close-during-visit") << 6;
+}
+
+void TestXdgShellWindow::testDecorationRecreationTraversal()
+{
+    QFETCH(int, scenario);
+    struct Fixture
+    {
+        std::unique_ptr<KWayland::Client::Surface> surface;
+        std::unique_ptr<Test::XdgToplevel> shell;
+        std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+        QPointer<Window> window;
+        int initialReferences = 0;
+        int visits = 0;
+    };
+    std::array<Fixture, 4> fixtures;
+    const auto create = [&](int i) -> Window * {
+        auto &fixture = fixtures[i];
+        fixture.surface = Test::createSurface();
+        fixture.shell = Test::createXdgToplevelSurface(fixture.surface.get(), Test::CreationSetup::CreateOnly);
+        fixture.decoration = Test::createXdgToplevelDecorationV1(fixture.shell.get());
+        fixture.decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+        QSignalSpy configure(fixture.shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+        fixture.surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        if (!configure.wait()) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        configure.clear();
+        fixture.window = Test::renderAndWaitForShown(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!fixture.window || (configure.isEmpty() && !configure.wait())) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!Test::waylandSync()) {
+            return nullptr;
+        }
+        fixture.initialReferences = fixture.window->m_refCount;
+        return fixture.window;
+    };
+    for (int i = 0; i < 3; ++i) {
+        QVERIFY(create(i));
+        QVERIFY(fixtures[i].window->isDecorated());
+    }
+    const auto initialOrder = workspace()->windows();
+    QVERIFY(initialOrder.indexOf(fixtures[0].window) < initialOrder.indexOf(fixtures[1].window));
+    QVERIFY(initialOrder.indexOf(fixtures[1].window) < initialOrder.indexOf(fixtures[2].window));
+    QPointer<Window> retained;
+    if (scenario == 3) {
+        retained = fixtures[1].window;
+        retained->ref();
+    }
+    KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    const bool hadTheme = config.hasKey("theme");
+    const QString previousTheme = config.readEntry("theme", QString());
+    QList<int> visited;
+    bool callback = false;
+    // A window is visited when the recreated plugin decoration is parented to it. The trigger
+    // row's callback removes another member, removes the visited window itself, or adds one.
+    const int triggerIndex = (scenario == 1 || scenario == 3 || scenario == 5) ? 0 : ((scenario == 2 || scenario == 6) ? 1 : -1);
+    RegistryEventFilter filter(QEvent::ChildAdded, [&](QObject *object, QEvent *) {
+        for (int i = 0; i < 3; ++i) {
+            if (object != fixtures[i].window) {
+                continue;
+            }
+            ++fixtures[i].visits;
+            visited.append(i);
+            if (scenario == 4) {
+                QVERIFY(fixtures[i].window->m_refCount > fixtures[i].initialReferences);
+            }
+            if (callback || i != triggerIndex) {
+                return;
+            }
+            callback = true;
+            if (scenario == 5) {
+                QVERIFY(create(3));
+                // Installed only after the newcomer's own map-time decoration exists, so any
+                // visit counted on it can come only from the running recreation pass.
+                fixtures[3].window->installEventFilter(&filter);
+            } else {
+                auto victim = fixtures[scenario == 2 ? 0 : 1].window;
+                victim->setSkipCloseAnimation(true);
+                victim->destroyWindow();
+            }
+            return;
+        }
+        if (object == fixtures[3].window) {
+            ++fixtures[3].visits;
+        }
+    });
+    // Runs after a failed assertion too. Filters go first so the restoring recreation cannot
+    // reach this row's state; then the fixtures, the extra reference and the theme entry.
+    const auto teardown = qScopeGuard([&]() {
+        for (auto &fixture : fixtures) {
+            if (fixture.window) {
+                fixture.window->removeEventFilter(&filter);
+            }
+        }
+        for (auto &fixture : fixtures) {
+            if (fixture.window && !fixture.window->isDeleted()) {
+                fixture.window->setSkipCloseAnimation(true);
+                fixture.window->destroyWindow();
+            }
+        }
+        if (retained) {
+            retained->unref();
+            retained.clear();
+        }
+        if (hadTheme) {
+            config.writeEntry("theme", previousTheme);
+        } else {
+            config.deleteEntry("theme");
+        }
+        workspace()->decorationBridge()->reconfigure();
+    });
+    for (int i = 0; i < 3; ++i) {
+        fixtures[i].window->installEventFilter(&filter);
+    }
+    config.writeEntry("theme", previousTheme + QStringLiteral("-traversal-test"));
+    workspace()->decorationBridge()->reconfigure();
+    for (auto &fixture : fixtures) {
+        if (fixture.window) {
+            fixture.window->removeEventFilter(&filter);
+        }
+    }
+    if (scenario == 1 || scenario == 3) {
+        QCOMPARE(visited, QList<int>({0, 2}));
+    } else {
+        QCOMPARE(visited, QList<int>({0, 1, 2}));
+    }
+    QCOMPARE(callback, triggerIndex >= 0);
+    if (scenario == 3) {
+        QVERIFY(retained && retained->isDeleted());
+    }
+    if (scenario == 5) {
+        QVERIFY(fixtures[3].window);
+        QVERIFY(fixtures[3].window->isDecorated());
+        QCOMPARE(fixtures[3].visits, 0);
+    }
+    if (scenario == 6) {
+        // The visited list above shows the self-closing member completed its visit and the pass
+        // went on; the members after it keep their recreated decorations. Its deferred release
+        // is proved by the final guarded-pointer checks, not by this deleted-state sanity check.
+        QVERIFY(!fixtures[1].window || fixtures[1].window->isDeleted());
+        QVERIFY(fixtures[0].window && fixtures[0].window->isDecorated());
+        QVERIFY(fixtures[2].window && fixtures[2].window->isDecorated());
+    }
+    for (auto &fixture : fixtures) {
+        if (fixture.window && !fixture.window->isDeleted()) {
+            fixture.window->setSkipCloseAnimation(true);
+            fixture.window->destroyWindow();
+        }
+    }
+    if (retained) {
+        retained->unref();
+        retained.clear();
+    }
+    for (const auto &fixture : fixtures) {
+        QTRY_VERIFY(!fixture.window);
+    }
 }
 
 void TestXdgShellWindow::testMapUnmap()

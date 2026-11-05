@@ -29,6 +29,8 @@
 // Qt
 #include <QMetaProperty>
 #include <QPainter>
+#include <QPointer>
+#include <QScopeGuard>
 
 namespace KWin
 {
@@ -139,9 +141,25 @@ bool DecorationBridge::initPlugin(const QString &pluginId)
 
 static void recreateDecorations()
 {
-    Workspace::self()->forEachWindow([](Window *window) {
+    QList<QPointer<Window>> windows;
+    const auto snapshot = Workspace::self()->windows();
+    windows.reserve(snapshot.size());
+    for (Window *window : snapshot) {
+        windows.append(window);
+    }
+    // A plugin callback can remove any window or create another. Visit only surviving
+    // snapshot members, and keep the selected window alive until its callback returns.
+    for (const auto &guarded : windows) {
+        Window *window = guarded.data();
+        if (!window || window->isDeleted()) {
+            continue;
+        }
+        window->ref();
+        const auto release = qScopeGuard([window]() {
+            window->unref();
+        });
         window->invalidateDecoration();
-    });
+    }
 }
 
 void DecorationBridge::reconfigure()
