@@ -245,6 +245,7 @@ LogicalOutput *Window::output() const
 void Window::setOutput(LogicalOutput *output)
 {
     if (m_output != output) {
+        invalidateTransientRestoreAttempt();
         LogicalOutput *oldOutput = m_output;
         m_output = output;
         m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
@@ -539,6 +540,7 @@ bool Window::isDeleted() const
 void Window::markAsDeleted()
 {
     Q_ASSERT(!m_deleted);
+    invalidateTransientRestoreAttempt();
     m_deleted = true;
     workspace()->addDeleted(this);
 }
@@ -733,6 +735,7 @@ void Window::setDesktops(QList<VirtualDesktop *> desktops)
         return;
     }
 
+    invalidateTransientRestoreAttempt();
     m_desktops = desktops;
 
     if (windowManagementInterface()) {
@@ -3249,6 +3252,7 @@ void Window::setOnActivities(const QStringList &newActivitiesList)
     }
 
     if (m_activityList != effectiveActivities) {
+        invalidateTransientRestoreAttempt();
         m_activityList = effectiveActivities;
         doSetOnActivities(m_activityList);
         updateActivities(false);
@@ -3933,6 +3937,7 @@ void Window::setMoveResizeOutputInternal(LogicalOutput *output, AssignmentGeomet
     }
 
     if (m_moveResizeOutput != output) {
+        invalidateTransientRestoreAttempt();
         if (m_moveResizeOutput) {
             disconnect(m_moveResizeOutput, &LogicalOutput::scaleChanged, this, &Window::updateNextTargetScale);
             disconnect(m_moveResizeOutput, &LogicalOutput::transformChanged, this, &Window::updatePreferredBufferTransform);
@@ -4430,6 +4435,9 @@ void Window::commitTile(Tile *tile)
     if (tile && tile->isTransient()) {
         return;
     }
+    if (m_tile != tile) {
+        invalidateTransientRestoreAttempt();
+    }
     commitTileInternal(tile);
 }
 
@@ -4442,7 +4450,11 @@ quint64 Window::requestedTransientTileGeneration() const
 void Window::commitTileFromConfigure(Tile *tile, quint64 transientGeneration)
 {
     if (!transientGeneration) {
-        commitTile(tile);
+        // Native content is not a public placement intent. Keep the existing rejection of an
+        // untagged transient target without passing through the public cancellation boundary.
+        if (!tile || !tile->isTransient()) {
+            commitTileInternal(tile);
+        }
         return;
     }
     if (isDeleted() || !tile || !tile->isTransient() || !m_transientOwnership
@@ -4858,6 +4870,7 @@ bool Window::cancelTransientRequest()
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
+    invalidateTransientRestoreAttempt();
     m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
     const auto revision = m_placementContinuationRevision;
     if (m_activeTransientRequest) {
@@ -4889,6 +4902,7 @@ Window::AssignmentStepResult Window::cancelTransientRequestForAssignment()
     });
     // The stamp and the cancellation mark are this caller's own writes; from here nothing is a
     // refusal any more.
+    invalidateTransientRestoreAttempt();
     m_placementContinuationRevision = nextAssociationChange(m_placementContinuationRevision);
     if (m_activeTransientRequest) {
         m_activeTransientRequest->m_cancelled = true;
@@ -5046,6 +5060,83 @@ Window::TransientApplication Window::applyTransientOwnershipGuarded(quint64 gene
         conclude();
     }
     return application;
+}
+
+void Window::invalidateTransientRestoreAttempt()
+{
+    if (m_transientOwnership && m_transientOwnership->restoreAttempt) {
+        m_transientOwnership->restoreAttempt->cancelled = true;
+    }
+}
+
+bool Window::transientRestoreAttemptIsCurrent(quint64 generation, quint64 sequence) const
+{
+    if (isDeleted() || !generation || !sequence || !m_transientOwnership
+        || m_transientOwnership->generation != generation || !m_transientOwnership->restoreAttempt) {
+        return false;
+    }
+    const auto &ownership = *m_transientOwnership;
+    const auto &attempt = *ownership.restoreAttempt;
+    if (attempt.sequence != sequence || attempt.cancelled || ownership.phase != TransientOwnershipPhase::Restoring
+        || ownership.executing || ownership.releasing || ownership.request || m_activeTransientRequest
+        || ownership.progress != TransientRequestProgress::Requested || m_requestedTile || m_tile || m_requestedTransientTileGeneration) {
+        return false;
+    }
+    if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+        || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
+        return false;
+    }
+    // Bind this Window's membership, not global desktop/activity navigation. The detached tree
+    // and controller need not survive. R3 supplies the geometry request's additional constraints.
+    return ownership.output && ownership.desktop && workspace()->outputs().contains(ownership.output)
+        && VirtualDesktopManager::self()->desktops().contains(ownership.desktop)
+        && output() == ownership.output && moveResizeOutput() == ownership.output
+        && desktops() == QList<VirtualDesktop *>{ownership.desktop} && activities() == attempt.activities
+        && isTransientTileTargetFeasible(ownership.floating);
+}
+
+bool Window::transientRestoreClaimIsCurrent(const TransientRestoreClaim &claim) const
+{
+    return claim.windowId == internalId() && claim.continuation.outcome == AssignmentStepOutcome::AppliedCurrent
+        && transientRestoreAttemptIsCurrent(claim.ownershipGeneration, claim.sequence)
+        && assignmentResultIsCurrent(claim.continuation);
+}
+
+Window::TransientRestoreClaim Window::claimTransientRestore(quint64 generation)
+{
+    TransientRestoreClaim claim;
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (!transientOwnershipIsCurrent(generation) || m_transientOwnership->restoreAttempt
+        || m_transientOwnership->progress != TransientRequestProgress::Requested || m_transientOwnership->request
+        || output() != m_transientOwnership->output || activities().size() > 1
+        || !isTransientTileTargetFeasible(m_transientOwnership->floating)
+        || m_transientRestoreSequence >= exhausted - 1 || m_tileMembershipChange >= exhausted - 1
+        || m_requestedTileChange >= exhausted - 1 || m_committedTileChange >= exhausted - 1
+        || m_placementContinuationRevision == exhausted || m_geometryRequestGeneration == exhausted) {
+        return claim;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    claim.windowId = internalId();
+    claim.ownershipGeneration = generation;
+    claim.sequence = ++m_transientRestoreSequence;
+    m_transientOwnership->restoreAttempt.emplace(TransientRestoreAttempt{claim.sequence, activities()});
+    claim.continuation.outcome = AssignmentStepOutcome::Superseded;
+    // The claim is published before any detach notification. Do not retain a reference into the
+    // record across this call: callbacks can close the Window or invalidate its writer/context.
+    revokeTransientOwnership(generation, &claim.continuation);
+    if (claim.continuation.outcome != AssignmentStepOutcome::AppliedCurrent
+        || !transientRestoreAttemptIsCurrent(generation, claim.sequence) || !assignmentResultIsCurrent(claim.continuation)) {
+        if (m_transientOwnership && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+            && m_transientOwnership->restoreAttempt->sequence == claim.sequence) {
+            invalidateTransientRestoreAttempt();
+        }
+        claim.continuation.outcome = AssignmentStepOutcome::Superseded;
+        claim.continuation.checkpoint.reset();
+    }
+    return claim;
 }
 
 bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)

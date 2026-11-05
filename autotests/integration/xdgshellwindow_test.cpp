@@ -46,6 +46,9 @@
 
 #include <QChildEvent>
 #include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusMessage>
+#include <QDBusPendingReply>
 #include <QPointer>
 #include <QProcess>
 #include <QScopeGuard>
@@ -412,6 +415,8 @@ private Q_SLOTS:
     void testTransientOwnershipApplied();
     void testTransientReceiptLifetime_data();
     void testTransientReceiptLifetime();
+    void testTransientRestoreClaim_data();
+    void testTransientRestoreClaim();
     void testTransientConfigureProvenance_data();
     void testTransientConfigureProvenance();
     void testTransientAssociationOrigin();
@@ -639,6 +644,9 @@ void TestXdgShellWindow::initTestCase()
 
     QVERIFY(waylandServer()->init(qAppName()));
 
+    if (qEnvironmentVariableIsSet("KWIN_TEST_RESTORE_ACTIVITIES")) {
+        kwinApp()->setUseKActivities(true);
+    }
     kwinApp()->start();
 }
 
@@ -11073,6 +11081,365 @@ void TestXdgShellWindow::testPublicTransientReleaseRefusal()
     QTRY_VERIFY(!guard);
     other->setSkipCloseAnimation(true);
     other->destroyWindow();
+}
+
+void TestXdgShellWindow::testTransientRestoreClaim_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("pending") << 0;
+    QTest::newRow("committed") << 1;
+    QTest::newRow("no-owner") << 2;
+    QTest::newRow("stale-owner-generation") << 3;
+    QTest::newRow("generic-restoring") << 4;
+    QTest::newRow("duplicate-during-release") << 5;
+    QTest::newRow("cancel-during-release") << 6;
+    QTest::newRow("public-commit-during-release") << 7;
+    QTest::newRow("commit-roundtrip-during-release") << 8;
+    QTest::newRow("desktop-roundtrip-during-release") << 9;
+    QTest::newRow("close-during-release") << 10;
+    QTest::newRow("writer-lost-during-release") << 11;
+    QTest::newRow("provider-retired-during-release") << 12;
+    QTest::newRow("root-destroyed-during-release") << 13;
+    QTest::newRow("sequence-exhausted") << 14;
+    QTest::newRow("last-usable-sequence") << 15;
+    QTest::newRow("maximized-refused") << 16;
+    QTest::newRow("fullscreen-refused") << 17;
+    QTest::newRow("pre-request-refused") << 18;
+    QTest::newRow("native-commit-roundtrip") << 19;
+    QTest::newRow("native-transient-target-refused") << 20;
+    QTest::newRow("public-commit-after-claim") << 21;
+    QTest::newRow("cancel-after-claim") << 22;
+    QTest::newRow("desktop-roundtrip-after-claim") << 23;
+    QTest::newRow("requested-output-roundtrip") << 24;
+    QTest::newRow("committed-output-roundtrip") << 25;
+    QTest::newRow("token-bindings") << 26;
+    QTest::newRow("old-native-content") << 27;
+    QTest::newRow("provider-retired-after-claim") << 28;
+    QTest::newRow("writer-lost-after-claim") << 29;
+    QTest::newRow("reservation-lost-after-claim") << 32;
+    QTest::newRow("restore-field-during-release") << 33;
+    QTest::newRow("guarded-cancel-after-claim") << 34;
+    QTest::newRow("membership-headroom-refused") << 35;
+    QTest::newRow("requested-headroom-refused") << 36;
+    QTest::newRow("committed-headroom-refused") << 37;
+    QTest::newRow("placement-exhausted") << 38;
+#if KWIN_BUILD_ACTIVITIES
+    if (qEnvironmentVariableIsSet("KWIN_TEST_RESTORE_ACTIVITIES")) {
+        QTest::newRow("activity-membership-roundtrip") << 30;
+    }
+#endif
+}
+
+void TestXdgShellWindow::testTransientRestoreClaim()
+{
+    QFETCH(int, scenario);
+    using Outcome = Window::AssignmentStepOutcome;
+    auto desktops = VirtualDesktopManager::self();
+    const auto oldCount = desktops->count();
+    const auto restoreDesktops = qScopeGuard([desktops, oldCount]() {
+        desktops->setCount(oldCount);
+    });
+    desktops->setCount(std::max(oldCount, uint(2)));
+    QString firstActivity;
+    QString secondActivity;
+#if KWIN_BUILD_ACTIVITIES
+    if (scenario == 30) {
+        // Service activation must leave the compositor event loop running. A blocking proxy
+        // construction can otherwise wait for a client that is waiting for this compositor.
+        auto message = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
+                                                      QStringLiteral("org.freedesktop.DBus"), QStringLiteral("StartServiceByName"));
+        message.setArguments({QStringLiteral("org.kde.ActivityManager"), uint(0)});
+        QDBusPendingReply<uint> started = QDBusConnection::sessionBus().asyncCall(message, 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(started.isFinished(), 16000);
+        QVERIFY2(!started.isError(), qPrintable(started.error().message()));
+        QDBusInterface activityControl(QStringLiteral("org.kde.ActivityManager"), QStringLiteral("/ActivityManager/Activities"),
+                                       QStringLiteral("org.kde.ActivityManager.Activities"), QDBusConnection::sessionBus());
+        QVERIFY(activityControl.isValid());
+        QDBusPendingReply<QString> first = activityControl.asyncCall(QStringLiteral("AddActivity"), QStringLiteral("Restore claim first"));
+        QDBusPendingReply<QString> second = activityControl.asyncCall(QStringLiteral("AddActivity"), QStringLiteral("Restore claim second"));
+        QTRY_VERIFY_WITH_TIMEOUT(first.isFinished() && second.isFinished(), 10000);
+        QVERIFY(!first.isError() && !second.isError());
+        firstActivity = first.value();
+        secondActivity = second.value();
+        QVERIFY(!firstActivity.isEmpty() && !secondActivity.isEmpty() && firstActivity != secondActivity);
+        QDBusPendingReply<bool> selected = activityControl.asyncCall(QStringLiteral("SetCurrentActivity"), firstActivity);
+        QTRY_VERIFY_WITH_TIMEOUT(selected.isFinished(), 10000);
+        QVERIFY(!selected.isError() && selected.value());
+    }
+#endif
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.restore-claim"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    if (scenario == 30) {
+        const auto membershipReady = [&]() {
+            window->setOnActivities({firstActivity});
+            return window->activities() == QStringList{firstActivity} && window->isOnCurrentActivity();
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(membershipReady(), 10000);
+    }
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto writer = std::make_unique<TransientPlacementWriter>(directory.filePath(QStringLiteral("placementrc")));
+    auto provider = std::make_unique<QObject>();
+    const auto providerToken = writer->registerProvider(provider.get());
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.restore-claim");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer->trackWindow(id, key));
+    QCOMPARE(writer->record(providerToken, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = desktops->currentDesktop(window->moveResizeOutput());
+    auto otherDesktop = desktops->desktops().first() == desktop ? desktops->desktops().last() : desktops->desktops().first();
+    auto controller = std::make_unique<TransientTileController>();
+    QCOMPARE(controller->createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    QPointer<Tile> root(controller->rootTile());
+    QPointer<Tile> leaf(controller->tile());
+    for (int attempt = 0; attempt < 3 && !window->canStartTransientTileRequest(leaf->windowGeometry()); ++attempt) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        configure.clear();
+        Test::render(surface.get(), QSize(200, 100), Qt::red);
+        QVERIFY(Test::waylandSync());
+    }
+    QVERIFY(window->canStartTransientTileRequest(leaf->windowGeometry()));
+    std::optional<Window::TransientRestoreClaim> nested;
+    QObject callbacks;
+    QMetaObject::Connection beforeRequest;
+    if (scenario == 18) {
+        beforeRequest = connect(leaf, &Tile::windowAdded, &callbacks, [&]() {
+            nested = window->claimTransientRestore(window->ownedTransientPlacementGeneration());
+        });
+    }
+    quint64 generation = 0;
+    if (scenario != 2) {
+        const auto state = writer->snapshot();
+        QCOMPARE(controller->admit(controller->generation(), window, writer.get(), providerToken, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        generation = window->ownedTransientPlacementGeneration();
+        QVERIFY(generation);
+    }
+    if (scenario == 18) {
+        QVERIFY(nested);
+        QCOMPARE(nested->continuation.outcome, Outcome::Refused);
+        QCOMPARE(nested->sequence, 0u);
+        QCOMPARE(window->m_transientRestoreSequence, 0u);
+        QVERIFY(!window->m_transientOwnership->restoreAttempt);
+        disconnect(beforeRequest);
+    } else if (scenario == 1) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), leaf->windowGeometry().size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->tile(), leaf.data());
+    }
+    Tile ordinary(manager);
+    window->setGeometryRestore(RectF(11, 22, 333, 222));
+    if (scenario == 4) {
+        window->cancelTransientRequest();
+    } else if (scenario == 14 || scenario == 15) {
+        window->m_transientRestoreSequence = std::numeric_limits<quint64>::max() - (scenario == 14 ? 1 : 2);
+    } else if (scenario == 16) {
+        window->maximize(MaximizeFull);
+    } else if (scenario == 17) {
+        window->setFullScreen(true);
+    } else if (scenario == 35) {
+        window->m_tileMembershipChange = std::numeric_limits<quint64>::max() - 1;
+    } else if (scenario == 36) {
+        window->m_requestedTileChange = std::numeric_limits<quint64>::max() - 1;
+    } else if (scenario == 37) {
+        window->m_committedTileChange = std::numeric_limits<quint64>::max() - 1;
+    } else if (scenario == 38) {
+        window->m_placementContinuationRevision = std::numeric_limits<quint64>::max();
+    }
+    QPointer<Window> guard(window);
+    std::unique_ptr<TileAssignmentFence> retained;
+    if (scenario == 10) {
+        retained = window->makeTileAssignmentCheckpoint();
+    }
+    bool intervened = false;
+    const auto intervene = [&]() {
+        if (intervened) {
+            return;
+        }
+        intervened = true;
+        switch (scenario) {
+        case 5:
+            nested = window->claimTransientRestore(generation);
+            break;
+        case 6:
+            window->cancelTransientRequest();
+            break;
+        case 7:
+        case 8:
+            window->commitTile(&ordinary);
+            if (scenario == 8) {
+                window->commitTile(nullptr);
+            }
+            break;
+        case 9:
+            window->setDesktops({otherDesktop});
+            window->setDesktops({desktop});
+            break;
+        case 10:
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+            break;
+        case 11:
+            writer.reset();
+            break;
+        case 12:
+            provider.reset();
+            break;
+        case 13:
+            delete root.data();
+            break;
+        case 33:
+            window->setGeometryRestore(RectF(21, 32, 343, 232));
+            break;
+        }
+    };
+    if ((scenario >= 5 && scenario <= 13) || scenario == 33) {
+        if (scenario == 7 || scenario == 8) {
+            connect(window, &Window::requestedTileChanged, &callbacks, intervene);
+        } else {
+            connect(leaf, &Tile::windowRemoved, &callbacks, intervene);
+        }
+    }
+    const auto sequenceBefore = window->m_transientRestoreSequence;
+    const auto geometryBefore = window->geometryRequestGeneration();
+    const auto requestedBefore = window->requestedTile();
+    const auto committedBefore = window->tile();
+    const auto membershipBefore = window->m_tileMembershipChange;
+    const auto requestedChangeBefore = window->m_requestedTileChange;
+    const auto committedChangeBefore = window->m_committedTileChange;
+    const auto placementBefore = window->m_placementContinuationRevision;
+    const auto ownershipBefore = window->m_transientOwnership.get();
+    const bool reservedBefore = writer && writer->isReserved(id);
+    QSignalSpy geometry(window, &Window::requestedGeometryChanged);
+    auto claim = scenario == 18 ? Window::TransientRestoreClaim() : window->claimTransientRestore(scenario == 3 ? generation + 1 : generation);
+    if (scenario == 2 || scenario == 3 || scenario == 4 || scenario == 14 || scenario == 16 || scenario == 17 || scenario == 18 || scenario >= 35) {
+        QCOMPARE(claim.continuation.outcome, Outcome::Refused);
+        QCOMPARE(claim.sequence, 0u);
+        QCOMPARE(window->m_transientRestoreSequence, sequenceBefore);
+        QCOMPARE(window->requestedTile(), requestedBefore);
+        QCOMPARE(window->tile(), committedBefore);
+        QCOMPARE(window->m_tileMembershipChange, membershipBefore);
+        QCOMPARE(window->m_requestedTileChange, requestedChangeBefore);
+        QCOMPARE(window->m_committedTileChange, committedChangeBefore);
+        QCOMPARE(window->m_placementContinuationRevision, placementBefore);
+        QCOMPARE(window->m_transientOwnership.get(), ownershipBefore);
+        QCOMPARE(bool(writer && writer->isReserved(id)), reservedBefore);
+    } else {
+        const bool superseded = (scenario >= 6 && scenario <= 12) || scenario == 33;
+        QCOMPARE(claim.continuation.outcome, superseded ? Outcome::Superseded : Outcome::AppliedCurrent);
+        QCOMPARE(claim.windowId, id);
+        QCOMPARE(claim.ownershipGeneration, generation);
+        QCOMPARE(claim.sequence, sequenceBefore + 1);
+        QVERIFY(window->m_transientOwnership);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QCOMPARE(window->m_transientOwnership->restoreAttempt->sequence, claim.sequence);
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), original);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(!window->m_transientOwnership->controller);
+        QCOMPARE(window->transientRestoreClaimIsCurrent(claim), !superseded);
+        QCOMPARE(window->m_transientOwnership->restoreAttempt->cancelled, superseded);
+        if (scenario == 5) {
+            QVERIFY(nested);
+            QCOMPARE(nested->continuation.outcome, Outcome::Refused);
+            QCOMPARE(nested->sequence, 0u);
+        }
+        if (!superseded) {
+            const auto duplicate = window->claimTransientRestore(generation);
+            QCOMPARE(duplicate.continuation.outcome, Outcome::Refused);
+            QCOMPARE(window->m_transientRestoreSequence, claim.sequence);
+            if (scenario == 19) {
+                window->commitTileFromConfigure(&ordinary, 0);
+                window->commitTileFromConfigure(nullptr, 0);
+                QVERIFY(!window->m_transientOwnership->restoreAttempt->cancelled);
+                QVERIFY(window->transientRestoreAttemptIsCurrent(generation, claim.sequence));
+                QVERIFY(!window->assignmentResultIsCurrent(claim.continuation));
+            } else if (scenario == 20) {
+                window->commitTileFromConfigure(leaf, 0);
+                QVERIFY(!window->tile());
+                QVERIFY(!window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 21) {
+                window->commitTile(&ordinary);
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 22) {
+                window->cancelTransientRequest();
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 23) {
+                window->setDesktops({otherDesktop});
+                window->setDesktops({desktop});
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 24 || scenario == 25) {
+                const auto outputs = workspace()->outputs();
+                auto originalOutput = window->moveResizeOutput();
+                auto otherOutput = outputs.first() == originalOutput ? outputs.last() : outputs.first();
+                if (scenario == 24) {
+                    window->setMoveResizeOutput(otherOutput);
+                    window->setMoveResizeOutput(originalOutput);
+                } else {
+                    window->setOutput(otherOutput);
+                    window->setOutput(originalOutput);
+                }
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 26) {
+                claim.windowId = QUuid::createUuid();
+                QVERIFY(!window->transientRestoreClaimIsCurrent(claim));
+                claim.windowId = id;
+                ++claim.ownershipGeneration;
+                QVERIFY(!window->transientRestoreClaimIsCurrent(claim));
+                claim.ownershipGeneration = generation;
+                ++claim.sequence;
+                QVERIFY(!window->transientRestoreClaimIsCurrent(claim));
+                --claim.sequence;
+            } else if (scenario == 27) {
+                QVERIFY(!configure.isEmpty() || configure.wait());
+                shell->xdgSurface()->ack_configure(configure.first().at(0).value<quint32>());
+                Test::render(surface.get(), leaf->windowGeometry().size().toSize(), Qt::blue);
+                QVERIFY(Test::waylandSync());
+                QVERIFY(!window->m_transientOwnership->restoreAttempt->cancelled);
+                QVERIFY(window->transientRestoreAttemptIsCurrent(generation, claim.sequence));
+                QVERIFY(!window->assignmentResultIsCurrent(claim.continuation));
+            } else if (scenario == 28) {
+                provider.reset();
+            } else if (scenario == 29) {
+                writer.reset();
+            } else if (scenario == 30) {
+                window->setOnActivities({secondActivity});
+                QCOMPARE(window->activities(), QStringList{secondActivity});
+                window->setOnActivities({firstActivity});
+                QCOMPARE(window->activities(), QStringList{firstActivity});
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            } else if (scenario == 32) {
+                QCOMPARE(writer->completeRestore(id, QString::number(generation), 2), TransientPlacementWriter::Result::Accepted);
+            } else if (scenario == 34) {
+                const auto cancellation = window->cancelTransientRequestForAssignment();
+                QCOMPARE(cancellation.outcome, Outcome::AppliedCurrent);
+                QCOMPARE(window->m_transientRestoreSequence, claim.sequence);
+                QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            }
+            const bool staysCurrent = scenario < 19 || scenario == 20 || scenario == 26;
+            QCOMPARE(window->transientRestoreClaimIsCurrent(claim), staysCurrent);
+        }
+    }
+    QCOMPARE(window->geometryRequestGeneration(), geometryBefore);
+    QCOMPARE(geometry.count(), 0);
+    claim.continuation.checkpoint.reset();
+    retained.reset();
+    if (guard && !guard->isDeleted()) {
+        guard->setSkipCloseAnimation(true);
+        guard->destroyWindow();
+    }
+    QTRY_VERIFY(!guard);
 }
 
 void TestXdgShellWindow::testControllerReleaseOrdering_data()
