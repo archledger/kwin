@@ -3603,6 +3603,17 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
     if ((ordinary && (m_transientOwnership || m_activeTransientRequest)) || !supportsAssignmentGeometryRequest()) {
         return request;
     }
+    if (owned.kind == OwnedProvenance::Kind::Restoration) {
+        const auto &ownership = *m_transientOwnership;
+        const auto &attempt = *ownership.restoreAttempt;
+        // The provenance can remain current after dispatch; it is not permission to submit
+        // another request, a different target or an inherited Move-only operation.
+        if (!attempt.requesting || attempt.requestGeneration || mode != MoveResizeMode::MoveResize
+            || !exactFrameGeometry(desired, ownership.floating) || !canStartTransientRestoreRequest(desired)
+            || workspace()->outputAt(desired.center()) != ownership.output) {
+            return request;
+        }
+    }
     AssignmentGeometrySync sync;
     const quint64 writes = prepareAssignmentGeometrySync(desired, sync);
     const auto exhausted = std::numeric_limits<quint64>::max();
@@ -3637,6 +3648,10 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
             && m_transientOwnership->nativeSequence == adoption->m_sequence) {
             m_transientOwnership->progress = TransientRequestProgress::Requested;
         }
+    } else if (owned.kind == OwnedProvenance::Kind::Restoration) {
+        // No callback has run since validating the matching wrapper. Record this allocation
+        // before the first synchronized write or its notifications can reenter the Window.
+        m_transientOwnership->restoreAttempt->requestGeneration = generation;
     }
     // The allocation invalidated every earlier fence, so this request's own checkpoint starts here.
     sync.result.outcome = AssignmentStepOutcome::Superseded;
@@ -3700,6 +3715,8 @@ bool Window::ownedProvenanceIsCurrent(const OwnedProvenance &owned) const
         return owned.request && transientRequestIsCurrent(*owned.request) && (!owned.constraint || owned.constraint());
     case OwnedProvenance::Kind::Ownership:
         return transientOwnershipIsCurrent(owned.ownership) && (!owned.constraint || owned.constraint());
+    case OwnedProvenance::Kind::Restoration:
+        return transientRestoreRequestIsCurrent(owned.ownership, owned.restoreSequence) && (!owned.constraint || owned.constraint());
     case OwnedProvenance::Kind::Operation:
         return !owned.constraint || owned.constraint();
     }
@@ -5218,6 +5235,74 @@ Window::TransientRestoreClaim Window::claimTransientRestore(quint64 generation)
     return claim;
 }
 
+bool Window::transientRestoreRequestIsCurrent(quint64 generation, quint64 sequence) const
+{
+    if (!transientRestoreAttemptIsCurrent(generation, sequence)) {
+        return false;
+    }
+    const auto &ownership = *m_transientOwnership;
+    const auto &attempt = *ownership.restoreAttempt;
+    if (!attempt.requestConsumed || !canStartTransientRestoreRequest(ownership.floating)
+        || workspace()->outputAt(ownership.floating.center()) != ownership.output) {
+        return false;
+    }
+    if (!attempt.requestGeneration) {
+        return attempt.requesting;
+    }
+    return attempt.requestGeneration == m_geometryRequestGeneration
+        && exactFrameGeometry(moveResizeGeometry(), ownership.floating);
+}
+
+Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientRestoreClaim claim)
+{
+    AssignmentGeometryRequest request;
+    const auto generation = claim.ownershipGeneration;
+    const auto sequence = claim.sequence;
+    if (claim.windowId != internalId() || !m_transientOwnership || m_transientOwnership->generation != generation
+        || !m_transientOwnership->restoreAttempt || m_transientOwnership->restoreAttempt->sequence != sequence) {
+        request.result.outcome = AssignmentStepOutcome::Superseded;
+        return request;
+    }
+    if (m_transientOwnership->restoreAttempt->requestConsumed) {
+        return request;
+    }
+    if (!transientRestoreClaimIsCurrent(claim)) {
+        m_transientOwnership->restoreAttempt->requestConsumed = true;
+        invalidateTransientRestoreAttempt();
+        request.result.outcome = AssignmentStepOutcome::Superseded;
+        return request;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    const RectF target = m_transientOwnership->floating;
+    m_transientOwnership->restoreAttempt->requestConsumed = true;
+    m_transientOwnership->restoreAttempt->requesting = true;
+    {
+        const auto finish = qScopeGuard([this, generation, sequence]() {
+            if (m_transientOwnership && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+                && m_transientOwnership->restoreAttempt->sequence == sequence) {
+                m_transientOwnership->restoreAttempt->requesting = false;
+            }
+        });
+        request = requestMoveResizeGuarded(target, MoveResizeMode::MoveResize, *claim.continuation.checkpoint,
+                                           OwnedProvenance::forRestoration(generation, sequence));
+    }
+    // The input claim may be destroyed on return; only value-bound provenance survives it.
+    // A child refusal is now a consumed failed attempt, not a retryable mutation-free refusal.
+    if (request.result.outcome != AssignmentStepOutcome::AppliedCurrent || request.dispatch == AssignmentRequestDispatch::None
+        || !request.requestGeneration || !assignmentResultIsCurrent(request.result)) {
+        if (m_transientOwnership && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+            && m_transientOwnership->restoreAttempt->sequence == sequence) {
+            invalidateTransientRestoreAttempt();
+        }
+        request.result.outcome = AssignmentStepOutcome::Superseded;
+        request.result.checkpoint.reset();
+    }
+    return request;
+}
+
 bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)
 {
     if (!m_transientOwnership || m_transientOwnership->generation != generation) {
@@ -5400,6 +5485,11 @@ std::shared_ptr<const TransientNoRequestProof> Window::makeTransientNoRequestPro
 }
 
 bool Window::canStartTransientTileRequest(const RectF &target) const
+{
+    return false;
+}
+
+bool Window::canStartTransientRestoreRequest(const RectF &target) const
 {
     return false;
 }
