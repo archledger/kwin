@@ -12,6 +12,8 @@
 
 #include <QObject>
 
+#include <memory>
+
 class KConfigGroup;
 
 namespace KWin
@@ -48,6 +50,10 @@ public:
     }
 
 private:
+    struct SettingsUpdate
+    {
+    };
+    std::shared_ptr<const SettingsUpdate> m_update;
     void readSettings();
     QList<KDecoration3::DecorationButtonType> readDecorationButtons(const KConfigGroup &config,
                                                                     const char *key,
