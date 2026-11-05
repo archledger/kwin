@@ -206,6 +206,7 @@ protected:
     void doSetPreferredBufferTransform() override;
     void doSetPreferredColorDescription() override;
     bool canStartTransientTileRequest(const RectF &target) const override;
+    bool canStartTransientRestoreRequest(const RectF &target) const override;
     bool isTransientTileTargetFeasible(const RectF &target) const override;
     bool supportsAssignmentGeometryRequest() const override;
 

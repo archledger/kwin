@@ -805,6 +805,14 @@ bool XdgToplevelWindow::canStartTransientTileRequest(const RectF &target) const
     return !hasPendingNativeGeometry() && !requestedTile() && !tile() && isTransientTileTargetFeasible(target);
 }
 
+bool XdgToplevelWindow::canStartTransientRestoreRequest(const RectF &target) const
+{
+    // Pending admission geometry is allowed. Do not clear a pending configure gravity (one an
+    // interactive resize set, kept until its next configure) or silently use it to relocate the
+    // immutable floating target; unsupported backends remain refused.
+    return m_configureGravity == preferredConfigureGravity() && isTransientTileTargetFeasible(target);
+}
+
 bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
 {
     if (isDeleted() || !isNormalWindow() || !isMovable() || !isResizable() || isInteractiveMoveResize()
