@@ -91,7 +91,7 @@ XdgSurfaceConfigure *XdgSurfaceWindow::lastAcknowledgedConfigure() const
 bool XdgSurfaceWindow::hasPendingNativeGeometry() const
 {
     return m_configureTimer->isActive() || !m_configureEvents.isEmpty() || m_lastAcknowledgedConfigure
-        || m_lastAcknowledgedConfigureSerial.has_value();
+        || m_lastAcknowledgedConfigureSerial.has_value() || m_pendingContentState;
 }
 
 void XdgSurfaceWindow::scheduleConfigure()
@@ -103,7 +103,10 @@ void XdgSurfaceWindow::scheduleConfigure()
 
 void XdgSurfaceWindow::sendConfigure()
 {
-    m_configureEvents.append(sendRoleConfigure());
+    XdgSurfaceConfigure *configureEvent = sendRoleConfigure();
+    // The request that produced this configure's geometry, recorded before any callback runs.
+    configureEvent->origin = m_geometryRequestOrigin;
+    m_configureEvents.append(configureEvent);
 }
 
 void XdgSurfaceWindow::handleConfigureAcknowledged(quint32 serial)
@@ -140,6 +143,7 @@ void XdgSurfaceWindow::handleCommit()
     // Consume this invocation's ACK before any destructor can invoke a nested commit.
     const auto acknowledgedSerial = std::exchange(m_lastAcknowledgedConfigureSerial, std::nullopt);
     std::vector<std::unique_ptr<XdgSurfaceConfigure>> retired;
+    std::shared_ptr<const XdgSurfaceContent> retiredContent;
     retired.push_back(std::move(m_lastAcknowledgedConfigure));
     if (acknowledgedSerial.has_value()) {
         const quint32 serial = acknowledgedSerial.value();
@@ -163,6 +167,10 @@ void XdgSurfaceWindow::handleCommit()
                 retired.push_back(std::move(event));
             }
         }
+        m_lastContentOrigin = m_lastAcknowledgedConfigure ? m_lastAcknowledgedConfigure->origin : GeometryRequestOrigin{};
+        if (m_lastAcknowledgedConfigure) {
+            retiredContent = std::exchange(m_pendingContentState, std::make_shared<const XdgSurfaceContent>(m_lastAcknowledgedConfigure->contentState()));
+        }
     }
     // Detach the complete prefix first. Releasing an obsolete decoration can close the
     // Window or dispatch another commit, either of which may replace the remaining queue.
@@ -173,12 +181,14 @@ void XdgSurfaceWindow::handleCommit()
         retired.clear();
     };
     dispose();
+    retiredContent.reset();
     if (!current()) {
         return;
     }
 
-    if (const XdgSurfaceConfigure *configureEvent = lastAcknowledgedConfigure()) {
-        setTargetScale(configureEvent->scale);
+    // The content interpretation (acknowledged now, or carried into this commit unfinished).
+    if (const auto content = pendingContentState()) {
+        setTargetScale(content->scale);
         if (!current()) {
             return;
         }
@@ -188,8 +198,10 @@ void XdgSurfaceWindow::handleCommit()
     if (!current()) {
         return;
     }
+    auto completedContent = std::move(m_pendingContentState);
     retired.push_back(std::move(m_lastAcknowledgedConfigure));
     dispose();
+    completedContent.reset();
     if (!current()) {
         return;
     }
@@ -203,6 +215,37 @@ void XdgSurfaceWindow::handleCommit()
 
 void XdgSurfaceWindow::handleRoleCommit()
 {
+}
+
+quint64 XdgSurfaceWindow::configureCommitGeneration() const
+{
+    return m_configureCommitGeneration;
+}
+
+bool XdgSurfaceWindow::configureCommitIsCurrent(quint64 generation) const
+{
+    return !isDeleted() && generation == m_configureCommitGeneration;
+}
+
+std::shared_ptr<const XdgSurfaceContent> XdgSurfaceWindow::pendingContentState() const
+{
+    return m_pendingContentState;
+}
+
+bool XdgSurfaceWindow::synchronizeCommittedGeometry(const RectF &rect, const GeometryRequestOrigin &origin, quint64 generation)
+{
+    // While a configure is scheduled or unacknowledged the committed frame is not the requested
+    // geometry: synchronizing would roll it back to an older configure's state.
+    if (m_configureTimer->isActive() || !m_configureEvents.isEmpty()) {
+        return true;
+    }
+    if (configurePlacementPolicy(origin) != ConfigurePlacementPolicy::Synchronize) {
+        return true;
+    }
+    const auto result = synchronizeConfigureGeometry(rect, origin, [this, generation]() {
+        return configureCommitIsCurrent(generation);
+    });
+    return result.outcome == AssignmentStepOutcome::AppliedCurrent;
 }
 
 void XdgSurfaceWindow::moveResizeInternal(const RectF &rect, MoveResizeMode mode)
@@ -752,19 +795,25 @@ XdgSurfaceConfigure *XdgToplevelWindow::sendRoleConfigure()
 
 void XdgToplevelWindow::handleRoleCommit()
 {
-    if (auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure())) {
-        const auto nextDecoration = configureEvent->decoration;
-        const auto nextState = configureEvent->decorationState;
+    // The content is the acknowledged configure's interpretation, or the one carried into this
+    // commit unfinished; the placement authority is the content origin's policy, evaluated at each
+    // use (callbacks between the steps can change it), and only an acknowledged configure places.
+    const auto generation = configureCommitGeneration();
+    const auto origin = m_lastContentOrigin;
+    const auto content = pendingContentState();
+    if (content) {
+        const auto nextDecoration = content->decoration;
+        const auto nextState = content->decorationState;
         if (nextDecoration) {
             nextDecoration->apply(nextState);
-            if (isDeleted()) {
+            if (!configureCommitIsCurrent(generation)) {
                 return;
             }
         }
 
         if (decoration() != nextDecoration.get()) {
             setDecoration(nextDecoration);
-            if (isDeleted()) {
+            if (!configureCommitIsCurrent(generation)) {
                 return;
             }
             updateShadow();
@@ -775,26 +824,33 @@ void XdgToplevelWindow::handleRoleCommit()
     m_windowGeometry = snapToPixels(m_shellSurface->xdgSurface()->windowGeometry(), targetScale());
 
     bool fullscreen = isFullScreen();
-    if (const auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure())) {
-        fullscreen = configureEvent->states & XdgToplevelInterface::State::FullScreen;
+    if (content) {
+        fullscreen = content->states & XdgToplevelInterface::State::FullScreen;
     }
 
+    const XdgSurfaceConfigure *acknowledgedConfigure = lastAcknowledgedConfigure();
+    // An obsolete restoration's configure (ContentOnly) contributes its content, never its position.
+    const XdgSurfaceConfigure *placement = configurePlacementPolicy(origin) != ConfigurePlacementPolicy::ContentOnly ? acknowledgedConfigure : nullptr;
     RectF frameGeometry(pos(), clientSizeToFrameSize(m_windowGeometry.size()));
     if (fullscreen) {
-        if (const XdgSurfaceConfigure *configureEvent = lastAcknowledgedConfigure()) {
-            frameGeometry.moveTopLeft(configureEvent->bounds.topLeft());
+        if (placement) {
+            frameGeometry.moveTopLeft(placement->bounds.topLeft());
         }
     } else if (isInteractiveMove()) {
-        frameGeometry = nextInteractiveMoveGeometry(frameGeometry);
+        if (configurePlacementPolicy(origin) != ConfigurePlacementPolicy::ContentOnly) {
+            frameGeometry = nextInteractiveMoveGeometry(frameGeometry);
+        }
     } else {
-        if (const XdgSurfaceConfigure *configureEvent = lastAcknowledgedConfigure()) {
-            frameGeometry = configureEvent->gravity.apply(frameGeometry, configureEvent->bounds);
+        if (placement) {
+            frameGeometry = placement->gravity.apply(frameGeometry, placement->bounds);
             if (!m_isUnrestricted) {
                 if (const auto anchor = confineInteractiveMove(frameGeometry)) {
                     frameGeometry.moveTopLeft(*anchor);
                 }
             }
-        } else if (oldWindowGeometry != m_windowGeometry) {
+        } else if (!acknowledgedConfigure && oldWindowGeometry != m_windowGeometry
+                   && configurePlacementPolicy(origin) != ConfigurePlacementPolicy::ContentOnly) {
+            // The client's own resize; an obsolete lineage keeps the window where it is (below).
             frameGeometry = m_spontaneousGravity.apply(frameGeometry, m_frameGeometry);
             if (!m_isUnrestricted) {
                 if (const auto anchor = confineInteractiveMove(frameGeometry)) {
@@ -804,29 +860,34 @@ void XdgToplevelWindow::handleRoleCommit()
         }
     }
 
-    if (!m_configureTimer->isActive() && m_configureEvents.isEmpty()) {
-        setMoveResizeGeometry(frameGeometry);
-        if (isDeleted()) {
-            return;
-        }
+    const bool synchronized = synchronizeCommittedGeometry(frameGeometry, origin, generation);
+    if (!configureCommitIsCurrent(generation)) {
+        return;
+    }
+    // A refused synchronization, or an obsolete lineage, moves nothing: the content lands where the
+    // window is.
+    if (!synchronized || configurePlacementPolicy(origin) == ConfigurePlacementPolicy::ContentOnly) {
+        frameGeometry.moveTopLeft(pos());
     }
 
     updateGeometry(frameGeometry);
-    if (isDeleted()) {
+    if (!configureCommitIsCurrent(generation)) {
         return;
     }
 
-    auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure());
-    if (configureEvent) {
-        const auto states = configureEvent->states;
-        const QPointer<Tile> tile = configureEvent->tile;
-        const quint64 transientGeneration = configureEvent->transientOwnershipGeneration;
-        handleStatesAcknowledged(states);
-        if (isDeleted()) {
-            return;
-        }
-        commitTileFromConfigure(tile, transientGeneration);
+    if (!content) {
+        return;
     }
+    const auto configureEvent = static_cast<XdgToplevelConfigure *>(lastAcknowledgedConfigure());
+    const bool acknowledged = configureEvent != nullptr;
+    const QPointer<Tile> tile = configureEvent ? configureEvent->tile.data() : nullptr;
+    const quint64 transientGeneration = configureEvent ? configureEvent->transientOwnershipGeneration : 0;
+    const auto acknowledgedOrigin = configureEvent ? configureEvent->origin : GeometryRequestOrigin{};
+    handleStatesAcknowledged(content->states);
+    if (!configureCommitIsCurrent(generation) || !acknowledged || configurePlacementPolicy(acknowledgedOrigin) == ConfigurePlacementPolicy::ContentOnly) {
+        return;
+    }
+    commitTileFromConfigure(tile, transientGeneration);
 }
 
 bool XdgToplevelWindow::supportsAssignmentGeometryRequest() const
@@ -1118,24 +1179,25 @@ void XdgToplevelWindow::handleResizeRequested(SeatInterface *seat, Gravity gravi
 
 void XdgToplevelWindow::handleStatesAcknowledged(const XdgToplevelInterface::States &states)
 {
-    const XdgToplevelInterface::States delta = m_acknowledgedStates ^ states;
-
-    if (delta & XdgToplevelInterface::State::Maximized) {
-        MaximizeMode maximizeMode = MaximizeRestore;
-        if (states & XdgToplevelInterface::State::MaximizedHorizontal) {
-            maximizeMode = MaximizeMode(maximizeMode | MaximizeHorizontal);
-        }
-        if (states & XdgToplevelInterface::State::MaximizedVertical) {
-            maximizeMode = MaximizeMode(maximizeMode | MaximizeVertical);
-        }
+    const auto generation = configureCommitGeneration();
+    MaximizeMode maximizeMode = MaximizeRestore;
+    if (states & XdgToplevelInterface::State::MaximizedHorizontal) {
+        maximizeMode = MaximizeMode(maximizeMode | MaximizeHorizontal);
+    }
+    if (states & XdgToplevelInterface::State::MaximizedVertical) {
+        maximizeMode = MaximizeMode(maximizeMode | MaximizeVertical);
+    }
+    // A nested ACK can supersede partially applied content before acknowledgedStates is
+    // written. Compare the actual committed modes, not only that older aggregate snapshot.
+    if (this->maximizeMode() != maximizeMode) {
         updateMaximizeMode(maximizeMode);
-        if (isDeleted()) {
+        if (!configureCommitIsCurrent(generation)) {
             return;
         }
     }
-    if (delta & XdgToplevelInterface::State::FullScreen) {
+    if (isFullScreen() != states.testFlag(XdgToplevelInterface::State::FullScreen)) {
         updateFullScreenMode(states & XdgToplevelInterface::State::FullScreen);
-        if (isDeleted()) {
+        if (!configureCommitIsCurrent(generation)) {
             return;
         }
     }

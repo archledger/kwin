@@ -3631,6 +3631,21 @@ Window::AssignmentGeometryRequest Window::requestMoveResizeGuarded(RectF desired
     }
     const auto generation = ++m_geometryRequestGeneration;
     request.requestGeneration = generation;
+    switch (owned.kind) {
+    case OwnedProvenance::Kind::Request:
+        m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::OwnedGeometry, generation, owned.request->m_ownerGeneration, 0};
+        break;
+    case OwnedProvenance::Kind::Ownership:
+        m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::OwnedGeometry, generation, owned.ownership, 0};
+        break;
+    case OwnedProvenance::Kind::Restoration:
+        m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::Restoration, generation, owned.ownership, owned.restoreSequence};
+        break;
+    case OwnedProvenance::Kind::None:
+    case OwnedProvenance::Kind::Operation:
+        m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::Ordinary, generation, 0, 0};
+        break;
+    }
     m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
     const auto finish = qScopeGuard([this, generation]() {
         // An obsolete stack frame must not clear a newer request's pending submission.
@@ -4139,6 +4154,7 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
         mode = MoveResizeMode::MoveResize;
     }
     const auto generation = ++m_geometryRequestGeneration;
+    m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::Ordinary, generation, 0, 0};
     m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
     const auto finish = qScopeGuard([this, generation]() {
         // An obsolete stack frame must not clear a newer request's pending submission.
@@ -5233,6 +5249,69 @@ Window::TransientRestoreClaim Window::claimTransientRestore(quint64 generation)
         claim.continuation.checkpoint.reset();
     }
     return claim;
+}
+
+Window::ConfigurePlacementPolicy Window::configurePlacementPolicy(const GeometryRequestOrigin &origin) const
+{
+    if (isDeleted()) {
+        return ConfigurePlacementPolicy::ContentOnly;
+    }
+    if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {
+        // Preserve ordinary and owned behavior outside explicit restoration. A lost restore
+        // record must not turn its old request into ordinary placement authority.
+        return origin.kind == GeometryRequestOrigin::Kind::Restoration
+            ? ConfigurePlacementPolicy::ContentOnly
+            : ConfigurePlacementPolicy::Synchronize;
+    }
+    if (!origin.geometryGeneration || origin.geometryGeneration != m_geometryRequestGeneration || origin != m_geometryRequestOrigin) {
+        return ConfigurePlacementPolicy::ContentOnly;
+    }
+    if (origin.kind == GeometryRequestOrigin::Kind::Ordinary) {
+        return ConfigurePlacementPolicy::Synchronize;
+    }
+    if (origin.kind == GeometryRequestOrigin::Kind::Restoration
+        && transientRestoreRequestIsCurrent(origin.ownershipGeneration, origin.restoreSequence)) {
+        return ConfigurePlacementPolicy::PlacementOnly;
+    }
+    return ConfigurePlacementPolicy::ContentOnly;
+}
+
+Window::AssignmentStepResult Window::synchronizeConfigureGeometry(RectF desired, GeometryRequestOrigin origin, std::function<bool()> dispatchIsCurrent)
+{
+    AssignmentStepResult refused;
+    if (!dispatchIsCurrent || !dispatchIsCurrent() || configurePlacementPolicy(origin) != ConfigurePlacementPolicy::Synchronize) {
+        refused.outcome = AssignmentStepOutcome::Superseded;
+        return refused;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    AssignmentGeometrySync sync;
+    sync.owned = OwnedProvenance().withConstraint([this, origin, dispatchIsCurrent = std::move(dispatchIsCurrent)]() {
+        return dispatchIsCurrent() && configurePlacementPolicy(origin) == ConfigurePlacementPolicy::Synchronize;
+    });
+    sync.result.owned = sync.owned;
+    sync.result.outcome = AssignmentStepOutcome::Superseded;
+    sync.result.checkpoint.reset(new TileAssignmentFence(*this));
+    auto writes = prepareAssignmentGeometrySync(desired, sync);
+    if (sync.output == m_moveResizeOutput && !m_outputPropertiesPending) {
+        // Native content synchronization preserves the legacy same-output fast path. An
+        // intentional next scale is reconciled by a geometry request, not by this commit.
+        sync.synchronize = false;
+        writes = m_moveResizeGeometry != desired;
+    }
+    if (!assignmentGeometrySyncIsCurrent(sync)) {
+        return std::move(sync.result);
+    }
+    if (writes > std::numeric_limits<quint64>::max() - 1 - m_placementContinuationRevision) {
+        return refused;
+    }
+    setMoveResizeGeometryInternal(desired, &sync);
+    if (assignmentGeometrySyncIsCurrent(sync)) {
+        sync.result.outcome = AssignmentStepOutcome::AppliedCurrent;
+    }
+    return std::move(sync.result);
 }
 
 bool Window::transientRestoreRequestIsCurrent(quint64 generation, quint64 sequence) const

@@ -39,17 +39,32 @@ class XdgToplevelDecorationV1Interface;
 class LogicalOutput;
 class Tile;
 
+struct XdgSurfaceContent
+{
+    double scale = 1;
+    std::shared_ptr<KDecoration3::Decoration> decoration;
+    std::shared_ptr<KDecoration3::DecorationState> decorationState;
+    XdgToplevelInterface::States states;
+};
+
 class XdgSurfaceConfigure
 {
 public:
     virtual ~XdgSurfaceConfigure()
     {
     }
+    virtual XdgSurfaceContent contentState() const
+    {
+        XdgSurfaceContent content;
+        content.scale = scale;
+        return content;
+    }
 
     RectF bounds;
     Gravity gravity;
     quint32 serial;
     double scale;
+    Window::GeometryRequestOrigin origin;
 };
 
 class XdgSurfaceWindow : public WaylandWindow
@@ -76,6 +91,12 @@ protected:
     KWIN_EXPORT bool hasPendingNativeGeometry() const;
     void scheduleConfigure();
     void sendConfigure();
+    quint64 configureCommitGeneration() const;
+    bool configureCommitIsCurrent(quint64 generation) const;
+    std::shared_ptr<const XdgSurfaceContent> pendingContentState() const;
+    // The committed frame as the requested geometry, once nothing is pending (6.8's rule) and only
+    // under the Synchronize policy; false when that synchronization was refused or superseded.
+    bool synchronizeCommittedGeometry(const RectF &rect, const GeometryRequestOrigin &origin, quint64 generation);
 
     void handleConfigureAcknowledged(quint32 serial);
     void handleCommit();
@@ -95,6 +116,9 @@ protected:
     std::optional<quint32> m_lastAcknowledgedConfigureSerial;
     // Synchronous commit dispatch identity; configure destruction may reenter this Window.
     quint64 m_configureCommitGeneration = 0;
+    GeometryRequestOrigin m_lastContentOrigin;
+    // Unfinished content interpretation only: no serial, bounds, gravity or tile authority.
+    std::shared_ptr<const XdgSurfaceContent> m_pendingContentState;
     RectF m_windowGeometry;
 
 private:
@@ -107,6 +131,14 @@ private:
 class XdgToplevelConfigure final : public XdgSurfaceConfigure
 {
 public:
+    XdgSurfaceContent contentState() const override
+    {
+        XdgSurfaceContent content = XdgSurfaceConfigure::contentState();
+        content.decoration = decoration;
+        content.decorationState = decorationState;
+        content.states = states;
+        return content;
+    }
     std::shared_ptr<KDecoration3::Decoration> decoration;
     std::shared_ptr<KDecoration3::DecorationState> decorationState;
     XdgToplevelInterface::States states;
