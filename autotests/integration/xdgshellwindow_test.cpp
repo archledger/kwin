@@ -23,6 +23,7 @@
 #include "tiles/transientplacementwriter.h"
 #include "tiles/transienttilecontroller.h"
 #include "virtualdesktops.h"
+#include "wayland-xdg-shell-server-protocol.h"
 #include "wayland/clientconnection.h"
 #include "wayland/display.h"
 #include "wayland/surface.h"
@@ -436,6 +437,12 @@ private Q_SLOTS:
     void testTransientRestoreClaim();
     void testTransientRestoreRequest_data();
     void testTransientRestoreRequest();
+    void testConfigureSerialMatching_data();
+    void testConfigureSerialMatching();
+    void testConfigureDiscardReentry_data();
+    void testConfigureDiscardReentry();
+    void testConfigureCommitExhaustion_data();
+    void testConfigureCommitExhaustion();
     void testTransientConfigureProvenance_data();
     void testTransientConfigureProvenance();
     void testTransientAssociationOrigin();
@@ -11855,6 +11862,271 @@ void TestXdgShellWindow::testPublicTransientReleaseRefusal()
     QTRY_VERIFY(!guard);
     other->setSkipCloseAnimation(true);
     other->destroyWindow();
+}
+
+void TestXdgShellWindow::testConfigureDiscardReentry_data()
+{
+    QTest::addColumn<bool>("close");
+    QTest::addColumn<bool>("tail");
+    QTest::addColumn<bool>("exhaust");
+    QTest::newRow("obsolete-decoration-close") << true << false << false;
+    QTest::newRow("obsolete-decoration-nested-commit") << false << false << false;
+    QTest::newRow("nested-commit-exhaustion") << false << false << true;
+    QTest::newRow("selected-decoration-tail-close") << true << true << false;
+}
+
+void TestXdgShellWindow::testConfigureDiscardReentry()
+{
+    QFETCH(bool, close);
+    QFETCH(bool, tail);
+    QFETCH(bool, exhaust);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_client_side);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    configure.clear();
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!window->decoration());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto xdg = static_cast<XdgToplevelWindow *>(window);
+    QVERIFY(xdg->m_configureEvents.isEmpty());
+    configure.clear();
+    // The nested commit takes the buffer as the client's own resize, which since 6.8 keeps the frame's
+    // centre for an ordinary window. Pin the top-left anchor, as 6.7 had, so the position shows that the
+    // outer commit's selected configure is never applied.
+    xdg->m_spontaneousGravity = Gravity::BottomRight;
+
+    // This decoration is queued but never installed. Its last reference belongs to the
+    // first configure, so consuming a later prefix must handle its destruction callback.
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QVERIFY(configure.wait());
+    const quint32 decorated = configure.last().at(0).value<quint32>();
+    QPointer<KDecoration3::Decoration> obsolete = xdg->m_nextDecoration.get();
+    QVERIFY(obsolete);
+    QVERIFY(!window->decoration());
+    configure.clear();
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_client_side);
+    QVERIFY(configure.wait());
+    QVERIFY(!xdg->m_nextDecoration);
+    QVERIFY(obsolete);
+    configure.clear();
+    window->moveResize(RectF(80, 90, 300, 200));
+    QVERIFY(configure.wait());
+    const quint32 selected = tail ? decorated : configure.last().at(0).value<quint32>();
+    configure.clear();
+    const RectF newer(100, 110, 400, 300);
+    window->moveResize(newer);
+    QVERIFY(configure.wait());
+    const quint32 successor = configure.last().at(0).value<quint32>();
+    QCOMPARE(xdg->m_configureEvents.size(), 4);
+    QVERIFY(!static_cast<XdgToplevelConfigure *>(xdg->m_configureEvents.last())->decoration);
+    const QPointF origin = window->pos();
+    QPointer<Window> guard(window);
+    auto held = window->makeTileAssignmentCheckpoint();
+    QSignalSpy frameChanged(window, &Window::frameGeometryChanged);
+    bool destroyed = false;
+    bool nested = false;
+    QObject context;
+    if (tail) {
+        connect(window, &Window::frameGeometryChanged, &context, [&]() {
+            if (window->decoration() == obsolete) {
+                // The selected configure keeps the decoration alive until tail disposal.
+                window->setDecoration(nullptr);
+            }
+        });
+    }
+    if (exhaust) {
+        xdg->m_configureCommitGeneration = std::numeric_limits<quint64>::max() - 2;
+    }
+    connect(obsolete, &QObject::destroyed, &context, [&]() {
+        destroyed = true;
+        if (close) {
+            window->setSkipCloseAnimation(true);
+            window->destroyWindow();
+        } else {
+            // Explicit native signal reentry, not a second wire transaction. The outer ACK
+            // must already be consumed, and its tail must not clear a later pending ACK.
+            Q_EMIT window->surface()->committed();
+            nested = true;
+            Q_EMIT xdg->XdgSurfaceWindow::m_shellSurface->configureAcknowledged(successor);
+        }
+    });
+    shell->xdgSurface()->ack_configure(selected);
+    Test::render(surface.get(), QSize(300, 200), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(destroyed);
+    QVERIFY(!obsolete);
+    if (close) {
+        QVERIFY(window->isDeleted());
+        if (tail) {
+            QVERIFY(frameChanged.count() > 0);
+        } else {
+            QCOMPARE(frameChanged.count(), 0);
+        }
+    } else {
+        QVERIFY(nested);
+        QCOMPARE(window->pos(), origin);
+        QCOMPARE(window->frameGeometry().size().toSize(), exhaust ? QSize(200, 100) : QSize(300, 200));
+        if (exhaust) {
+            QCOMPARE(xdg->m_configureCommitGeneration, std::numeric_limits<quint64>::max());
+        }
+        QCOMPARE(window->moveResizeGeometry(), newer);
+        QCOMPARE(xdg->m_lastAcknowledgedConfigureSerial, std::optional<quint32>(successor));
+        QCOMPARE(xdg->m_configureEvents.size(), 1);
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+    }
+    held.reset();
+    QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testConfigureCommitExhaustion_data()
+{
+    QTest::addColumn<quint64>("generation");
+    QTest::addColumn<bool>("applied");
+    QTest::newRow("already-exhausted") << std::numeric_limits<quint64>::max() << false;
+    QTest::newRow("would-exhaust") << std::numeric_limits<quint64>::max() - 1 << false;
+    QTest::newRow("last-usable") << std::numeric_limits<quint64>::max() - 2 << true;
+}
+
+void TestXdgShellWindow::testConfigureCommitExhaustion()
+{
+    QFETCH(quint64, generation);
+    QFETCH(bool, applied);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    const RectF before = window->frameGeometry();
+    const RectF target(80, 90, 300, 200);
+    window->moveResize(target);
+    QVERIFY(configure.wait());
+    auto xdg = static_cast<XdgToplevelWindow *>(window);
+    xdg->m_configureCommitGeneration = generation;
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), target.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), applied ? target : before);
+    QCOMPARE(xdg->m_configureCommitGeneration, std::numeric_limits<quint64>::max() - quint64(applied));
+    QCOMPARE(xdg->m_configureEvents.size(), applied ? 0 : 1);
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testConfigureSerialMatching_data()
+{
+    QTest::addColumn<bool>("wrap");
+    QTest::addColumn<int>("selected");
+    QTest::newRow("ordinary-first") << false << 0;
+    QTest::newRow("ordinary-middle") << false << 1;
+    QTest::newRow("ordinary-last") << false << 2;
+    QTest::newRow("ordinary-unknown") << false << -1;
+    QTest::newRow("ordinary-interior-hole") << false << -3;
+    QTest::newRow("wrap-first-preserves-successors") << true << 0;
+    QTest::newRow("wrap-max-preserves-zero") << true << 1;
+    QTest::newRow("wrap-zero-consumes-prefix") << true << 2;
+    QTest::newRow("wrap-unknown") << true << -1;
+    QTest::newRow("wrap-ambiguous") << true << -2;
+}
+
+void TestXdgShellWindow::testConfigureSerialMatching()
+{
+    QFETCH(bool, wrap);
+    QFETCH(int, selected);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    auto xdg = static_cast<XdgToplevelWindow *>(window);
+    QVERIFY(xdg->m_configureEvents.isEmpty());
+    configure.clear();
+    // An unmatched commit is the client's own resize, which since 6.8 keeps the frame's centre for an
+    // ordinary window (preferredSpontaneousGravity). Pin the top-left anchor, as 6.7 had, so the position
+    // isolates the matcher: only a selected configure moves the frame, to that configure's bounds.
+    xdg->m_spontaneousGravity = Gravity::BottomRight;
+    QSignalSpy acknowledged(xdg->XdgSurfaceWindow::m_shellSurface, &XdgSurfaceInterface::configureAcknowledged);
+    const auto objectId = wl_proxy_get_id(reinterpret_cast<wl_proxy *>(shell->xdgSurface()->object()));
+    wl_resource *resource = wl_client_get_object(window->surface()->client()->client(), objectId);
+    QVERIFY(resource);
+    QCOMPARE(XdgSurfaceInterface::get(resource), xdg->XdgSurfaceWindow::m_shellSurface);
+    std::array<quint32, 3> serials;
+    std::array<RectF, 3> bounds;
+    quint32 hole = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (selected == -3 && i == 1) {
+            hole = waylandServer()->display()->nextSerial();
+        }
+        const auto count = configure.count();
+        bounds[i] = RectF(60 + 20 * i, 70 + 20 * i, 300 + 50 * i, 200 + 50 * i);
+        window->moveResize(bounds[i]);
+        QCOMPARE(window->moveResizeGeometry(), bounds[i]);
+        // The display flushes at aboutToBlock; enter an event loop rather than polling events.
+        QVERIFY(configure.count() > count || configure.wait());
+        QCOMPARE(configure.count(), count + 1);
+        QCOMPARE(xdg->m_configureEvents.size(), i + 1);
+        auto event = xdg->m_configureEvents.last();
+        serials[i] = event->serial;
+        if (wrap) {
+            // Reuse production snapshots, but deliver chosen uint32 boundary values over the
+            // actual wire. This exercises ACK/commit matching, not libwayland's serial counter.
+            serials[i] = std::numeric_limits<quint32>::max() - 1 + quint32(i);
+            if (selected == -2 && i == 2) {
+                serials[i] = serials[1];
+            }
+            event->serial = serials[i];
+            xdg_surface_send_configure(resource, serials[i]);
+        }
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(configure.last().at(0).value<quint32>(), serials[i]);
+    }
+    quint32 serial = wrap ? 17 : std::numeric_limits<quint32>::max();
+    if (selected >= 0) {
+        serial = serials[selected];
+    } else if (selected == -2) {
+        serial = serials[1];
+    } else if (selected == -3) {
+        QVERIFY(serials[0] < hole && hole < serials[1]);
+        serial = hole;
+    }
+    const QSize content = selected >= 0 ? bounds[selected].size().toSize() : QSize(240, 160);
+    const QPointF origin = window->pos();
+    shell->xdgSurface()->ack_configure(serial);
+    Test::render(surface.get(), content, Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(acknowledged.count(), 1);
+    QCOMPARE(acknowledged.last().at(0).value<quint32>(), serial);
+    QCOMPARE(xdg->m_configureEvents.size(), selected >= 0 ? 2 - selected : 3);
+    for (int i = selected >= 0 ? selected + 1 : 0; i < 3; ++i) {
+        QCOMPARE(quint32(xdg->m_configureEvents[i - (selected >= 0 ? selected + 1 : 0)]->serial), serials[i]);
+    }
+    QCOMPARE(window->frameGeometry().size().toSize(), content);
+    QCOMPARE(window->pos(), selected >= 0 ? bounds[selected].topLeft() : origin);
+    QCOMPARE(window->moveResizeGeometry(), bounds[2]);
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QTRY_VERIFY(!guard);
 }
 
 void TestXdgShellWindow::testTransientRestoreRequest_data()
