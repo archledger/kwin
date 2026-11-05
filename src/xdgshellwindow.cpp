@@ -50,6 +50,9 @@
 namespace KWin
 {
 
+static bool changeMaximizeRecursion = false;
+static bool isFiniteExtent(const RectF &rect);
+
 XdgSurfaceWindow::XdgSurfaceWindow(XdgSurfaceInterface *shellSurface)
     : WaylandWindow(shellSurface->surface())
     , m_shellSurface(shellSurface)
@@ -913,8 +916,16 @@ bool XdgToplevelWindow::canStartTransientRestoreRequest(const RectF &target) con
 {
     // Pending admission geometry is allowed. Do not clear a pending configure gravity (one an
     // interactive resize set, kept until its next configure) or silently use it to relocate the
-    // immutable floating target; unsupported backends remain refused.
-    return m_configureGravity == preferredConfigureGravity() && isTransientTileTargetFeasible(target);
+    // immutable floating target; unsupported backends remain refused. A pending gravity equal to
+    // the preferred one (a bottom-right resize) anchors the target's top-left like the default, so
+    // it relocates nothing and is not refused.
+    const bool noPendingGravity = m_configureGravity == preferredConfigureGravity();
+    if (m_transientOwnership && m_transientOwnership->restoreAttempt && m_transientOwnership->restoreAttempt->normalizeMaximize) {
+        return noPendingGravity && !isFullScreen() && !isRequestedFullScreen()
+            && requestedMaximizeMode() == MaximizeRestore && isNormalWindow() && isMovable() && isResizable()
+            && !isInteractiveMoveResize() && !isElectricBorderMaximizing() && isTransientRestoreFrameFeasible(target);
+    }
+    return noPendingGravity && isTransientTileTargetFeasible(target);
 }
 
 bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
@@ -923,6 +934,11 @@ bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
         || isFullScreen() || isRequestedFullScreen() || maximizeMode() != MaximizeRestore || requestedMaximizeMode() != MaximizeRestore) {
         return false;
     }
+    return isTransientRestoreFrameFeasible(target);
+}
+
+bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) const
+{
     for (qreal value : {target.x(), target.y(), target.width(), target.height()}) {
         if (!std::isfinite(value)) {
             return false;
@@ -944,6 +960,188 @@ bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
     const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(snappedClient, nextTargetScale()));
     return client.width() == snappedClient.width() && client.height() == snappedClient.height()
         && roundTrip.width() == target.width() && roundTrip.height() == target.height();
+}
+
+std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const
+{
+    const auto maximizeRevision = m_requestedMaximizeRevision;
+    const auto fullscreenRevision = m_requestedFullScreenRevision;
+    const auto intentRevision = m_fullScreenIntentRevision;
+    const auto mode = m_requestedMaximizeMode;
+    const QPointer<LogicalOutput> requestedOutput = m_fullScreenRequestedOutput;
+    const bool hadRequestedOutput = bool(requestedOutput);
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    const auto stateCurrent = [this, maximizeRevision, fullscreenRevision, intentRevision, mode, requestedOutput, hadRequestedOutput, exhausted]() {
+        return !isDeleted() && maximizeRevision != exhausted && fullscreenRevision != exhausted && intentRevision != exhausted
+            && m_requestedMaximizeRevision == maximizeRevision && m_requestedFullScreenRevision == fullscreenRevision
+            && m_fullScreenIntentRevision == intentRevision && m_requestedMaximizeMode == mode
+            && (hadRequestedOutput ? requestedOutput && m_fullScreenRequestedOutput == requestedOutput : m_fullScreenRequestedOutput.isNull());
+    };
+    if (!normalizeMaximize) {
+        return [this, target, stateCurrent]() {
+            return stateCurrent() && isTransientTileTargetFeasible(target);
+        };
+    }
+    const QPointer<KDecoration3::Decoration> decoration = m_nextDecoration.get();
+    const bool hadDecoration = bool(decoration);
+    if (hadDecoration && (!decoration->nextState() || !m_nextDecorationState)) {
+        return {};
+    }
+    const auto policy = decorationPolicy();
+    const auto minimumHint = m_minimumSize;
+    const auto maximumHint = m_maximumSize;
+    const auto ruleMinimum = ruleCheckedMinimumSize();
+    const auto ruleMaximum = ruleCheckedMaximumSize();
+    const auto minimum = minSize();
+    const auto maximum = maxSize();
+    const auto scale = nextTargetScale();
+    const QPointer<LogicalOutput> output = moveResizeOutput();
+    const auto outputScale = output ? output->scale() : 0;
+    const auto borders = decoration ? decoration->nextState()->borders() : QMarginsF();
+    return [this, target, stateCurrent, decoration, hadDecoration, policy, minimumHint, maximumHint, ruleMinimum, ruleMaximum,
+            minimum, maximum, scale, output, outputScale, borders, geometryReady]() {
+        if (!stateCurrent() || isFullScreen() || isRequestedFullScreen() || !isNormalWindow() || !isMovable() || !isResizable()
+            || isInteractiveMoveResize() || isElectricBorderMaximizing() || m_configureGravity != preferredConfigureGravity()
+            || options->borderlessMaximizedWindows() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
+            || decorationPolicy() != policy || rules()->checkDecorationPolicy(policy) != policy
+            || m_minimumSize != minimumHint || m_maximumSize != maximumHint
+            || ruleCheckedMinimumSize() != ruleMinimum || ruleCheckedMaximumSize() != ruleMaximum
+            || !output || moveResizeOutput() != output || nextTargetScale() != scale || output->scale() != outputScale || scale != outputScale
+            || (hadDecoration ? !decoration || m_nextDecoration.get() != decoration.data() : bool(m_nextDecoration))) {
+            return false;
+        }
+        if (!geometryReady) {
+            return true;
+        }
+        if (requestedMaximizeMode() != MaximizeRestore || minSize() != minimum || maxSize() != maximum) {
+            return false;
+        }
+        if (decoration) {
+            if (!decoration->nextState() || !m_nextDecorationState || decoration->nextState()->borders() != borders
+                || m_nextDecorationState->borders() != borders) {
+                return false;
+            }
+        } else if (m_nextDecorationState) {
+            return false;
+        }
+        return isTransientRestoreFrameFeasible(target);
+    };
+}
+
+Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
+{
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    if (!transientOwnershipIsCurrent(generation) || changeMaximizeRecursion
+        || (m_requestedMaximizeMode != MaximizeRestore && m_requestedMaximizeRevision >= exhausted - 1)
+        || m_geometryRequestGeneration >= exhausted - 1 || m_geometryUpdateGeneration >= exhausted - 1
+        || m_placementContinuationRevision >= exhausted - assignmentPlacementBudget
+        || decoration() != m_nextDecoration.get()) {
+        return {};
+    }
+    const RectF target = m_transientOwnership->floating;
+    auto state = transientRestoreStateConstraint(target, true, false);
+    if (!state || !state()) {
+        return {};
+    }
+    if (!m_nextDecoration || m_requestedMaximizeMode == MaximizeRestore) {
+        if (!isTransientRestoreFrameFeasible(target)) {
+            return {};
+        }
+    } else if (!isFiniteExtent(target) || target.width() < minSize().width() || target.height() < minSize().height()
+               || snapToPixels(target.size(), nextTargetScale()) != target.size()) {
+        // Maximized borders are not the borders that A will use. These are only necessary
+        // checks; exact frame/client feasibility follows the same-decoration response.
+        return {};
+    }
+    return claimTransientRestoreWithState(generation, true, std::move(state));
+}
+
+Window::AssignmentStepResult XdgToplevelWindow::normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence)
+{
+    if (continuation.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(continuation)
+        || !transientRestoreOperationIsCurrent(generation, sequence)
+        || (m_transientOwnership->restoreAttempt->normalizeMaximize && changeMaximizeRecursion)) {
+        continuation.outcome = AssignmentStepOutcome::Superseded;
+        continuation.checkpoint.reset();
+        return continuation;
+    }
+    if (!m_transientOwnership->restoreAttempt->normalizeMaximize) {
+        return Window::normalizeTransientRestore(std::move(continuation), generation, sequence);
+    }
+    const RectF target = m_transientOwnership->floating;
+    const MaximizeMode oldMode = m_requestedMaximizeMode;
+    const auto current = [&]() {
+        return assignmentResultIsCurrent(continuation) && transientRestoreOperationIsCurrent(generation, sequence);
+    };
+    const auto supersede = [&]() {
+        continuation.outcome = AssignmentStepOutcome::Superseded;
+        continuation.checkpoint.reset();
+    };
+    if (oldMode != MaximizeRestore) {
+        Q_EMIT maximizedAboutToChange(MaximizeRestore);
+        if (!current()) {
+            supersede();
+            return continuation;
+        }
+        writeRequestedMaximizeMode(MaximizeRestore);
+        const auto revision = m_requestedMaximizeRevision;
+        const auto publish = qScopeGuard([this, revision]() {
+            if (!isDeleted() && m_requestedMaximizeRevision == revision) {
+                doSetMaximized();
+            }
+        });
+        // This writer invokes no callbacks. Replace only its own expected revision before
+        // notifying the decoration; the original checkpoint and other bindings still apply.
+        m_transientOwnership->restoreAttempt->stateIsCurrent = transientRestoreStateConstraint(target, true, false);
+        if (!current()) {
+            supersede();
+            return continuation;
+        }
+        if (m_nextDecoration) {
+            const QPointer<KDecoration3::DecoratedWindow> decorated = m_nextDecoration->window();
+            changeMaximizeRecursion = true;
+            const auto recursion = qScopeGuard([this]() {
+                changeMaximizeRecursion = false;
+            });
+            const auto decorationCurrent = [&]() {
+                return current() && decorated && m_nextDecoration && m_nextDecoration->window() == decorated.data();
+            };
+            if (oldMode & MaximizeVertical) {
+                Q_EMIT decorated->maximizedVerticallyChanged(false);
+                if (!decorationCurrent()) {
+                    supersede();
+                    return continuation;
+                }
+            }
+            if (oldMode & MaximizeHorizontal) {
+                Q_EMIT decorated->maximizedHorizontallyChanged(false);
+                if (!decorationCurrent()) {
+                    supersede();
+                    return continuation;
+                }
+            }
+            if (oldMode == MaximizeFull) {
+                Q_EMIT decorated->maximizedChanged(false);
+                if (!decorationCurrent()) {
+                    supersede();
+                    return continuation;
+                }
+            }
+        }
+    }
+    // No plugin is created here. Seal actual, agreeing border values after the bounded
+    // same-decoration response, never a recaptured rectangle or stale callback's state.
+    if (!current()) {
+        supersede();
+        return continuation;
+    }
+    auto ready = transientRestoreStateConstraint(target, true, true);
+    if (!ready || !ready()) {
+        supersede();
+        return continuation;
+    }
+    m_transientOwnership->restoreAttempt->stateIsCurrent = std::move(ready);
+    return continuation;
 }
 
 void XdgToplevelWindow::doMinimize()
@@ -2267,7 +2465,6 @@ void XdgToplevelWindow::finishFullScreenLegacy(bool set)
     doSetFullScreen();
 }
 
-static bool changeMaximizeRecursion = false;
 void XdgToplevelWindow::maximize(MaximizeMode mode, const RectF &restore)
 {
     if (changeMaximizeRecursion) {
