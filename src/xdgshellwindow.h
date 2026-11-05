@@ -48,7 +48,7 @@ public:
 
     RectF bounds;
     Gravity gravity;
-    qreal serial;
+    quint32 serial;
     double scale;
 };
 
@@ -93,6 +93,8 @@ protected:
     QQueue<XdgSurfaceConfigure *> m_configureEvents;
     std::unique_ptr<XdgSurfaceConfigure> m_lastAcknowledgedConfigure;
     std::optional<quint32> m_lastAcknowledgedConfigureSerial;
+    // Synchronous commit dispatch identity; configure destruction may reenter this Window.
+    quint64 m_configureCommitGeneration = 0;
     RectF m_windowGeometry;
 
 private:
