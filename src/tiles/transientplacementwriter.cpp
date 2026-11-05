@@ -392,6 +392,17 @@ bool TransientPlacementWriter::ownsReservation(const QUuid &window, const QStrin
         && reservation->generation == generation && reservation->phase == Phase::Owned;
 }
 
+bool TransientPlacementWriter::ownsRestoringReservation(const QUuid &window, const QString &generation) const
+{
+    const auto tracked = m_windows.constFind(window);
+    if (tracked == m_windows.cend()) {
+        return false;
+    }
+    const auto reservation = m_reservations.constFind(tracked->key);
+    return reservation != m_reservations.cend() && reservation->owner == window
+        && reservation->generation == generation && reservation->phase == Phase::Restoring;
+}
+
 TransientPlacementWriter::Result TransientPlacementWriter::beginRestore(const QUuid &window, const QString &generation)
 {
     if (m_busy) {
