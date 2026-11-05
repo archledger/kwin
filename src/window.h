@@ -1623,16 +1623,16 @@ private:
         Superseded,
         AppliedCurrent,
     };
-    // Owned provenance of one native call. The alternatives are exclusive: the exact adoption
-    // request being executed, borrowed for the call, or the ownership generation of an owner acting
-    // on its own placement. Either can lapse without any Window counter changing, so every child
-    // step validates it next to its checkpoint; public callbacks never inherit it.
+    // Provenance of one native call: an exact borrowed adoption request, an owner acting on its
+    // placement, or an explicit restoration attempt. Each can lapse without a Window counter
+    // changing, so every child validates it beside its checkpoint; public callbacks inherit none.
     struct OwnedProvenance
     {
         enum class Kind {
             None,
             Request,
             Ownership,
+            Restoration,
             // An ordinary operation's own validity (for example a normalization's requested-mode
             // revision), evaluated like an ownership constraint but without any ownership
             // exemption: the request path treats it as ordinary provenance.
@@ -1644,6 +1644,7 @@ private:
             : kind(Kind::None)
             , request(nullptr)
             , ownership(0)
+            , restoreSequence(0)
         {
         }
         static OwnedProvenance forRequest(TransientTileRequest *request)
@@ -1662,6 +1663,14 @@ private:
             owned.kind = Kind::Ownership;
             owned.ownership = generation;
             owned.constraint = std::move(constraint);
+            return owned;
+        }
+        static OwnedProvenance forRestoration(quint64 generation, quint64 sequence)
+        {
+            OwnedProvenance owned;
+            owned.kind = Kind::Restoration;
+            owned.ownership = generation;
+            owned.restoreSequence = sequence;
             return owned;
         }
         // The incoming provenance with one more constraint chained onto it (both must hold); a
@@ -1687,6 +1696,7 @@ private:
         Kind kind;
         TransientTileRequest *request;
         quint64 ownership;
+        quint64 restoreSequence;
         std::function<bool()> constraint;
     };
     struct AssignmentStepResult
@@ -1866,6 +1876,10 @@ private:
         const quint64 sequence;
         const QStringList activities;
         bool cancelled = false;
+        bool requestConsumed = false;
+        bool requesting = false;
+        // Published before any callback from this attempt's geometry request; never reused.
+        quint64 requestGeneration = 0;
     };
     struct TransientRestoreClaim
     {
@@ -1940,6 +1954,10 @@ private:
     // the Window externally; the ownership record never stores its own lifetime checkpoint.
     // AppliedCurrent qualifies the claim/release continuation, not restoration completion.
     [[nodiscard]] TransientRestoreClaim claimTransientRestore(quint64 generation);
+    // Consumes the original claim continuation, not a newly sampled fence. A matching request
+    // is attempted at most once; a duplicate cannot cancel the original. No completion is implied.
+    [[nodiscard]] AssignmentGeometryRequest requestTransientRestore(TransientRestoreClaim claim);
+    bool transientRestoreRequestIsCurrent(quint64 generation, quint64 sequence) const;
     bool transientRestoreClaimIsCurrent(const TransientRestoreClaim &claim) const;
     // Identity/context validity only. A consumer must also validate its synchronous continuation;
     // this predicate is not a way to refresh a superseded claim or to authorize geometry by itself.
@@ -2105,6 +2123,7 @@ protected:
     quint64 requestedTransientTileGeneration() const;
     void commitTileFromConfigure(Tile *tile, quint64 transientGeneration);
     virtual bool canStartTransientTileRequest(const RectF &target) const;
+    virtual bool canStartTransientRestoreRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;
     // a dispatcher reports what it staged or published through the stack-bound request.
