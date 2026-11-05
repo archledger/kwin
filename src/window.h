@@ -2034,6 +2034,19 @@ private:
         Owned,
         Restoring,
     };
+    struct TransientRestoreAttempt
+    {
+        const quint64 sequence;
+        const QStringList activities;
+        bool cancelled = false;
+    };
+    struct TransientRestoreClaim
+    {
+        QUuid windowId;
+        quint64 ownershipGeneration = 0;
+        quint64 sequence = 0;
+        AssignmentStepResult continuation;
+    };
     struct TransientOwnership
     {
         TransientOwnership(TransientPlacementWriter *writer, const QUuid &provider, quint64 providerRevision,
@@ -2061,6 +2074,7 @@ private:
         QMetaObject::Connection closeCleanup;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
         std::unique_ptr<TransientTileRequest> request;
+        std::optional<TransientRestoreAttempt> restoreAttempt;
     };
 
     struct TransientAssociationChanges
@@ -2095,6 +2109,15 @@ private:
     // asynchronous commit's own headroom is separate.
     bool transientAdmissionEligible(const RectF &target) const;
     bool transientAdmissionHeadroom() const;
+    // Claim one explicit, normal-mode restore without requesting geometry. The result retains
+    // the Window externally; the ownership record never stores its own lifetime checkpoint.
+    // AppliedCurrent qualifies the claim/release continuation, not restoration completion.
+    [[nodiscard]] TransientRestoreClaim claimTransientRestore(quint64 generation);
+    bool transientRestoreClaimIsCurrent(const TransientRestoreClaim &claim) const;
+    // Identity/context validity only. A consumer must also validate its synchronous continuation;
+    // this predicate is not a way to refresh a superseded claim or to authorize geometry by itself.
+    bool transientRestoreAttemptIsCurrent(quint64 generation, quint64 sequence) const;
+    void invalidateTransientRestoreAttempt();
     // With a result, the release's own callback-free writes are inside a checkpoint taken before
     // its notifications and validated once after its finalization (never refreshed): the caller's
     // continuation is AppliedCurrent only if nothing foreign changed. Without one, unchanged.
@@ -2545,6 +2568,7 @@ protected:
     quint64 m_transientRequestSequence = 0;
     quint64 m_lastTransientOwnershipGeneration = 0;
     quint64 m_transientOwnershipGeneration = 0;
+    quint64 m_transientRestoreSequence = 0;
     std::unique_ptr<TransientOwnership> m_transientOwnership;
     RectF m_keyboardGeometryRestore;
     RectF m_maximizeGeometryRestore;
