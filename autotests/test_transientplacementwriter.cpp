@@ -55,6 +55,8 @@ private Q_SLOTS:
     void largeCoordinatesRemainExact();
     void preparedReservationCanBeCancelled();
     void ownedReservationCannotBeCancelled();
+    void restoringReservationMatchesExactly_data();
+    void restoringReservationMatchesExactly();
     void activationRevalidates_data();
     void activationRevalidates();
     void cancellationPreservesDeferredIntent_data();
@@ -591,6 +593,138 @@ void TransientPlacementWriterTest::ownedReservationCannotBeCancelled()
     QVERIFY(writer.isReserved(window));
     QVERIFY(!writer.ownsReservation(window, generation));
     QCOMPARE(writer.cancelReservation(window, generation), Result::Busy);
+}
+
+void TransientPlacementWriterTest::restoringReservationMatchesExactly_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("no-reservation") << 0;
+    QTest::newRow("prepared") << 1;
+    QTest::newRow("owned") << 2;
+    QTest::newRow("restoring") << 3;
+    QTest::newRow("wrong-generation") << 4;
+    QTest::newRow("competing-owner") << 5;
+    QTest::newRow("unknown-window") << 6;
+    QTest::newRow("empty-generation") << 7;
+    QTest::newRow("completed") << 8;
+    QTest::newRow("forgotten-window") << 9;
+    QTest::newRow("replacement-generation") << 10;
+    QTest::newRow("retired-provider") << 11;
+    QTest::newRow("dirty-unrelated-key") << 12;
+    QTest::newRow("null-window") << 13;
+    QTest::newRow("deferred-manual-intent") << 14;
+}
+
+void TransientPlacementWriterTest::restoringReservationMatchesExactly()
+{
+    QFETCH(int, scenario);
+    using Result = TransientPlacementWriter::Result;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const auto path = directory.filePath(QStringLiteral("placementrc"));
+    TransientPlacementWriter writer(path);
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
+    const auto owner = QUuid::createUuid();
+    const auto generation = QStringLiteral("generation-1");
+    const auto nextGeneration = QStringLiteral("generation-2");
+    const QRectF frame(73, 91, 430, 310);
+    const QRectF manual(200, 100, 600, 400);
+    QVERIFY(writer.trackWindow(owner, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {owner, frame, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    QVERIFY(writer.flush());
+    if (scenario != 0) {
+        QCOMPARE(writer.reserve(token, reservation(writer, owner, frame)), Result::Accepted);
+        if (scenario != 1) {
+            QCOMPARE(writer.activateReservation(token, owner, generation), Result::Accepted);
+            if (scenario != 2) {
+                QCOMPARE(writer.beginRestore(owner, generation), Result::Accepted);
+            }
+        }
+    }
+    auto queryOwner = owner;
+    auto queryGeneration = generation;
+    switch (scenario) {
+    case 4:
+        queryGeneration = QStringLiteral("stale");
+        break;
+    case 5:
+        queryOwner = QUuid::createUuid();
+        QVERIFY(writer.trackWindow(queryOwner, QStringLiteral("app")));
+        break;
+    case 6:
+        queryOwner = QUuid::createUuid();
+        break;
+    case 7:
+        queryGeneration.clear();
+        break;
+    case 8:
+        QCOMPARE(writer.completeRestore(owner, generation, 2), Result::Accepted);
+        break;
+    case 9:
+        QVERIFY(writer.forgetWindow(owner));
+        break;
+    case 10: {
+        QCOMPARE(writer.completeRestore(owner, generation, 2), Result::Accepted);
+        auto next = reservation(writer, owner, frame);
+        next.generation = nextGeneration;
+        QCOMPARE(writer.reserve(token, next), Result::Accepted);
+        QCOMPARE(writer.activateReservation(token, owner, nextGeneration), Result::Accepted);
+        QCOMPARE(writer.beginRestore(owner, nextGeneration), Result::Accepted);
+        break;
+    }
+    case 11:
+        provider.reset();
+        break;
+    case 12: {
+        const auto other = QUuid::createUuid();
+        QVERIFY(writer.trackWindow(other, QStringLiteral("other")));
+        QCOMPARE(writer.record(token, 2, {other, manual, 2, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+        QVERIFY(writer.snapshot().dirty);
+        break;
+    }
+    case 13:
+        queryOwner = QUuid();
+        break;
+    case 14: {
+        const auto sibling = QUuid::createUuid();
+        QVERIFY(writer.trackWindow(sibling, QStringLiteral("app")));
+        QCOMPARE(writer.record(token, 2, {sibling, manual, 2, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        break;
+    }
+    }
+    // Query through a const reference. Neither missing-key lookups nor successful queries may
+    // consume the reservation, flush unrelated dirty state or discard a deferred manual winner.
+    const TransientPlacementWriter &view = writer;
+    const auto before = view.snapshot();
+    const auto reservedBefore = view.isReserved(owner);
+    QCOMPARE(view.ownsReservation(owner, generation), scenario == 2);
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const auto bytes = file.readAll();
+    file.close();
+    const bool expected = scenario == 3 || scenario == 11 || scenario == 12 || scenario == 14;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        QCOMPARE(view.ownsRestoringReservation(queryOwner, queryGeneration), expected);
+    }
+    if (scenario == 10) {
+        QVERIFY(view.ownsRestoringReservation(owner, nextGeneration));
+    }
+    const auto after = view.snapshot();
+    QCOMPARE(after.entries, before.entries);
+    QCOMPARE(after.mapRevision, before.mapRevision);
+    QCOMPARE(after.persistedRevision, before.persistedRevision);
+    QCOMPARE(after.providerRevision, before.providerRevision);
+    QCOMPARE(after.dirty, before.dirty);
+    QCOMPARE(view.isReserved(owner), reservedBefore);
+    QCOMPARE(view.ownsReservation(owner, generation), scenario == 2);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), bytes);
+    if (scenario == 14) {
+        QCOMPARE(writer.completeRestore(owner, generation, 2), Result::Accepted);
+        QCOMPARE(view.snapshot().entries.value(QStringLiteral("app")), manual);
+        QVERIFY(!view.ownsRestoringReservation(owner, generation));
+    }
 }
 
 void TransientPlacementWriterTest::activationRevalidates_data()

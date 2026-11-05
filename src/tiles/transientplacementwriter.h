@@ -132,6 +132,9 @@ public:
     Result cancelReservation(const QUuid &window, const QString &generation);
     Result finalizeNoRequest(const std::shared_ptr<const TransientNoRequestProof> &proof);
     bool ownsReservation(const QUuid &window, const QString &generation) const;
+    // Read-only exact owner/generation/phase state, not readiness or permission to restore.
+    // It does not validate provider freshness or any native restore attempt.
+    bool ownsRestoringReservation(const QUuid &window, const QString &generation) const;
     Result beginRestore(const QUuid &window, const QString &generation);
     Result completeRestore(const QUuid &window, const QString &generation, quint64 eventSequence);
     bool isReserved(const QUuid &window) const;
