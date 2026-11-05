@@ -5293,6 +5293,23 @@ bool Window::transientGeometryRequestIsCurrent(quint64 generation) const
     return transientRequestIsCurrent(*m_activeTransientRequest);
 }
 
+bool Window::transientAdmissionEligible(const RectF &target) const
+{
+    return !isDeleted() && !m_transientOwnership && !m_activeTransientRequest && !m_requestedTile && !m_tile
+        && !m_requestedTransientTileGeneration && supportsAssignmentGeometryRequest() && canStartTransientTileRequest(target)
+        && exactFrameGeometry(frameGeometry(), moveResizeGeometry());
+}
+
+bool Window::transientAdmissionHeadroom() const
+{
+    const auto exhausted = std::numeric_limits<quint64>::max();
+    return m_tileMembershipChange < exhausted - 2 && m_requestedTileChange < exhausted - 2 && m_committedTileChange < exhausted - 1
+        && m_placementContinuationRevision < exhausted - assignmentPlacementBudget
+        && m_geometryRequestGeneration < exhausted - 1 && m_geometryUpdateGeneration < exhausted - 1
+        && std::max(m_transientOwnershipGeneration, m_lastTransientOwnershipGeneration) < exhausted
+        && m_transientRequestSequence < exhausted;
+}
+
 Window::TransientRequestReceipt Window::requestTransientTile(std::unique_ptr<TransientTileRequest> request)
 {
     return requestTransientTile(std::move(request), nullptr, {});

@@ -1811,8 +1811,9 @@ private:
     // after it (the admission's publication). The receipt is the one applyTransientOwnership
     // returns: this attempt's progress, identity and NoRequest proof, the restoration's evidence.
     // The continuation supplements it: AppliedCurrent only for an applied attempt whose checkpoint
-    // (the one the native request validated itself against, taken right after its association
-    // install and preserved exactly) and stable provenance (the ownership generation, with this
+    // (the final checkpoint of the native request's geometry result, which includes that request's
+    // own subsequent writes; validated by the request up to its last boundary and preserved
+    // exactly) and stable provenance (the ownership generation, with this
     // attempt's native sequence and progress, its allocated request generation and its target
     // bound by value, chained with the caller's admission constraint) still hold at the terminal
     // validation, after the request's destruction and the end of the execution. Superseded, with
@@ -1909,6 +1910,18 @@ private:
     // the window cannot observe), evaluated with the continuation at every later boundary; it must
     // own its state, never borrow the request's.
     TransientApplication applyTransientOwnershipGuarded(quint64 generation, std::function<bool()> admissionConstraint = {});
+    // The window-side part of a transient admission's complete preflight, mutation-free, reported
+    // apart so the admission can refuse a known shortage without calling the window ineligible.
+    // Eligible: no ownership, active request, requested or committed association or unresolved
+    // transient marker; a backend that can start the request and report what it did; the native
+    // geometry settled. Headroom: the whole synchronous admission and its structural failure
+    // cleanup (the membership addition and a possible removal, the association install and a
+    // possible detach, a committed detach, the restore capture with the guarded request's
+    // placement bound, the request and update generations, the ownership generation and the
+    // native sequence under their non-reuse rules), never only the successful prefix; the later
+    // asynchronous commit's own headroom is separate.
+    bool transientAdmissionEligible(const RectF &target) const;
+    bool transientAdmissionHeadroom() const;
     // With a result, the release's own callback-free writes are inside a checkpoint taken before
     // its notifications and validated once after its finalization (never refreshed): the caller's
     // continuation is AppliedCurrent only if nothing foreign changed. Without one, unchanged.
