@@ -39,11 +39,25 @@ class XdgToplevelDecorationV1Interface;
 class LogicalOutput;
 class Tile;
 
+struct XdgSurfaceContent
+{
+    double scale = 1;
+    std::shared_ptr<KDecoration3::Decoration> decoration;
+    std::shared_ptr<KDecoration3::DecorationState> decorationState;
+    XdgToplevelInterface::States states;
+};
+
 class XdgSurfaceConfigure
 {
 public:
     virtual ~XdgSurfaceConfigure()
     {
+    }
+    virtual XdgSurfaceContent contentState() const
+    {
+        XdgSurfaceContent content;
+        content.scale = scale;
+        return content;
     }
 
     enum ConfigureFlag {
@@ -56,6 +70,7 @@ public:
     quint32 serial;
     ConfigureFlags flags;
     double scale;
+    Window::GeometryRequestOrigin origin;
 };
 
 class XdgSurfaceWindow : public WaylandWindow
@@ -85,6 +100,9 @@ protected:
     KWIN_EXPORT bool hasPendingNativeGeometry() const;
     void scheduleConfigure();
     void sendConfigure();
+    quint64 configureCommitGeneration() const;
+    bool configureCommitIsCurrent(quint64 generation) const;
+    std::shared_ptr<const XdgSurfaceContent> pendingContentState() const;
 
     QPointer<PlasmaShellSurfaceInterface> m_plasmaShellSurface;
 
@@ -102,7 +120,7 @@ private:
     bool haveNextWindowGeometry() const;
     void setHaveNextWindowGeometry();
     void resetHaveNextWindowGeometry();
-    void maybeUpdateMoveResizeGeometry(const RectF &rect);
+    bool maybeUpdateMoveResizeGeometry(const RectF &rect, const GeometryRequestOrigin &origin, quint64 generation);
 
     XdgSurfaceInterface *m_shellSurface;
     QTimer *m_configureTimer;
@@ -112,6 +130,9 @@ private:
     std::optional<quint32> m_lastAcknowledgedConfigureSerial;
     // Synchronous commit dispatch identity; configure destruction may reenter this Window.
     quint64 m_configureCommitGeneration = 0;
+    GeometryRequestOrigin m_lastContentOrigin;
+    // Unfinished content interpretation only: no serial, bounds, gravity or tile authority.
+    std::shared_ptr<const XdgSurfaceContent> m_pendingContentState;
     RectF m_windowGeometry;
     bool m_haveNextWindowGeometry = false;
 };
@@ -119,6 +140,14 @@ private:
 class XdgToplevelConfigure final : public XdgSurfaceConfigure
 {
 public:
+    XdgSurfaceContent contentState() const override
+    {
+        XdgSurfaceContent content = XdgSurfaceConfigure::contentState();
+        content.decoration = decoration;
+        content.decorationState = decorationState;
+        content.states = states;
+        return content;
+    }
     std::shared_ptr<KDecoration3::Decoration> decoration;
     std::shared_ptr<KDecoration3::DecorationState> decorationState;
     XdgToplevelInterface::States states;

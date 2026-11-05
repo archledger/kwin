@@ -1610,6 +1610,7 @@ private:
     friend class WaylandWindow;
     friend class XdgSurfaceWindow;
     friend class XdgToplevelWindow;
+    friend class XdgSurfaceConfigure;
     friend class X11Window;
     friend class TransientTileController;
     friend class TilesTest;
@@ -1617,6 +1618,26 @@ private:
 
     TileAssignmentFence makeTileAssignmentFence();
     class TransientTileRequest;
+
+    struct GeometryRequestOrigin
+    {
+        enum class Kind {
+            Unclassified,
+            Ordinary,
+            OwnedGeometry,
+            Restoration,
+        };
+        Kind kind = Kind::Unclassified;
+        quint64 geometryGeneration = 0;
+        quint64 ownershipGeneration = 0;
+        quint64 restoreSequence = 0;
+        bool operator==(const GeometryRequestOrigin &) const = default;
+    };
+    enum class ConfigurePlacementPolicy {
+        ContentOnly,
+        PlacementOnly,
+        Synchronize,
+    };
 
     enum class AssignmentStepOutcome {
         Refused,
@@ -1797,6 +1818,8 @@ private:
         // The geometry-request generation this attempt allocated; zero while nothing was allocated.
         quint64 requestGeneration = 0;
     };
+    ConfigurePlacementPolicy configurePlacementPolicy(const GeometryRequestOrigin &origin) const;
+    [[nodiscard]] AssignmentStepResult synchronizeConfigureGeometry(RectF desired, GeometryRequestOrigin origin, std::function<bool()> dispatchIsCurrent);
 
     enum class TransientRequestOutcome {
         Rejected,
@@ -2407,6 +2430,7 @@ protected:
     LogicalOutput *m_moveResizeOutput = nullptr;
     RectF m_moveResizeGeometry;
     quint64 m_geometryRequestGeneration = 0;
+    GeometryRequestOrigin m_geometryRequestOrigin;
     bool m_geometryResizePending = false;
     bool m_outputPropertiesPending = false;
     TransientTileRequest *m_activeTransientRequest = nullptr;
