@@ -48,6 +48,7 @@
 
 #include <QChildEvent>
 #include <QDBusConnection>
+#include <QDBusConnectionInterface>
 #include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusPendingReply>
@@ -236,6 +237,10 @@ private Q_SLOTS:
     void initTestCase();
     void init();
     void cleanup();
+
+    void testDecorationSettingsReentry_data();
+    void testDecorationSettingsReentry();
+    void testDecorationSettingsDestruction();
 
     void testMapUnmap();
     void testWindowOutputs();
@@ -695,6 +700,152 @@ void TestXdgShellWindow::cleanup()
     if (!shutdownObservation || !shutdownObservation->armed) {
         Test::destroyWaylandConnection();
     }
+}
+
+void TestXdgShellWindow::testDecorationSettingsReentry_data()
+{
+    QTest::addColumn<int>("boundary");
+    QTest::newRow("left-buttons") << 0;
+    QTest::newRow("right-buttons") << 1;
+    QTest::newRow("close-on-double-click") << 2;
+    QTest::newRow("exclude-from-capture") << 3;
+    QTest::newRow("border-size") << 4;
+}
+
+void TestXdgShellWindow::testDecorationSettingsReentry()
+{
+    QFETCH(int, boundary);
+    const auto settings = workspace()->decorationBridge()->settings();
+    QVERIFY(settings);
+    KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    const QStringList keys = {QStringLiteral("ButtonsOnLeft"), QStringLiteral("ButtonsOnRight"),
+                              QStringLiteral("CloseOnDoubleClickOnMenu"), QStringLiteral("AlwaysShowExcludeFromCapture"),
+                              QStringLiteral("BorderSizeAuto"), QStringLiteral("BorderSize")};
+    const auto saved = config.entryMap();
+    QObject context;
+    const auto restore = qScopeGuard([&]() {
+        disconnect(settings.get(), nullptr, &context, nullptr);
+        for (const auto &key : keys) {
+            if (saved.contains(key)) {
+                config.writeEntry(key, saved.value(key));
+            } else {
+                config.deleteEntry(key);
+            }
+        }
+        Q_EMIT workspace()->configChanged();
+    });
+    const auto writeSettings = [&](bool outer) {
+        config.writeEntry("ButtonsOnLeft", outer ? "N" : "M");
+        config.writeEntry("ButtonsOnRight", outer ? "NX" : "X");
+        config.writeEntry("CloseOnDoubleClickOnMenu", outer);
+        config.writeEntry("AlwaysShowExcludeFromCapture", outer);
+        config.writeEntry("BorderSizeAuto", false);
+        config.writeEntry("BorderSize", outer ? "Large" : "Normal");
+    };
+    writeSettings(false);
+    Q_EMIT workspace()->configChanged();
+    QSignalSpy reconfigured(settings.get(), &KDecoration3::DecorationSettings::reconfigured);
+    bool interrupted = false;
+    const auto interrupt = [&]() {
+        if (interrupted) {
+            return;
+        }
+        interrupted = true;
+        writeSettings(false);
+        Q_EMIT workspace()->configChanged();
+    };
+    switch (boundary) {
+    case 0:
+        connect(settings.get(), &KDecoration3::DecorationSettings::decorationButtonsLeftChanged, &context, interrupt);
+        break;
+    case 1:
+        connect(settings.get(), &KDecoration3::DecorationSettings::decorationButtonsRightChanged, &context, interrupt);
+        break;
+    case 2:
+        connect(settings.get(), &KDecoration3::DecorationSettings::closeOnDoubleClickOnMenuChanged, &context, interrupt);
+        break;
+    case 3:
+        connect(settings.get(), &KDecoration3::DecorationSettings::alwaysShowExcludeFromCaptureChanged, &context, interrupt);
+        break;
+    case 4:
+        connect(settings.get(), &KDecoration3::DecorationSettings::borderSizeChanged, &context, interrupt);
+        break;
+    }
+    QList<QList<KDecoration3::DecorationButtonType>> delivered;
+    if (boundary == 0) {
+        connect(settings.get(), &KDecoration3::DecorationSettings::decorationButtonsLeftChanged, &context,
+                [&](const QList<KDecoration3::DecorationButtonType> &buttons) {
+            delivered.append(buttons);
+        });
+    } else if (boundary == 1) {
+        connect(settings.get(), &KDecoration3::DecorationSettings::decorationButtonsRightChanged, &context,
+                [&](const QList<KDecoration3::DecorationButtonType> &buttons) {
+            delivered.append(buttons);
+        });
+    }
+    writeSettings(true);
+    Q_EMIT workspace()->configChanged();
+    QVERIFY(interrupted);
+    const QList<KDecoration3::DecorationButtonType> expectedLeft = {KDecoration3::DecorationButtonType::Menu};
+    const QList<KDecoration3::DecorationButtonType> expectedRight = {KDecoration3::DecorationButtonType::Close};
+    QCOMPARE(settings->decorationButtonsLeft(), expectedLeft);
+    QCOMPARE(settings->decorationButtonsRight(), expectedRight);
+    QVERIFY(!settings->isCloseOnDoubleClickOnMenu());
+    QVERIFY(!settings->isAlwaysShowExcludeFromCapture());
+    QCOMPARE(settings->borderSize(), KDecoration3::BorderSize::Normal);
+    const auto registered = QDBusConnection::sessionBus().interface()->isServiceRegistered(QStringLiteral("org.kde.kappmenuview"));
+    QVERIFY(registered.isValid());
+    QVERIFY(!registered.value());
+    QCOMPARE(reconfigured.count(), 1);
+    if (boundary == 0 || boundary == 1) {
+        const QList<KDecoration3::DecorationButtonType> outerLeft = {KDecoration3::DecorationButtonType::ApplicationMenu};
+        const QList<KDecoration3::DecorationButtonType> outerRight = {KDecoration3::DecorationButtonType::ApplicationMenu, KDecoration3::DecorationButtonType::Close};
+        QCOMPARE(delivered.size(), 2);
+        // The nested emission finishes first. The still-unwinding outer signal must keep
+        // its original payload, not alias a member overwritten by the nested read.
+        QCOMPARE(delivered.at(0), boundary == 0 ? expectedLeft : expectedRight);
+        QCOMPARE(delivered.at(1), boundary == 0 ? outerLeft : outerRight);
+    }
+}
+
+void TestXdgShellWindow::testDecorationSettingsDestruction()
+{
+    KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    const auto saved = config.entryMap();
+    const QStringList keys = {QStringLiteral("ButtonsOnLeft"), QStringLiteral("ButtonsOnRight")};
+    const auto restore = qScopeGuard([&]() {
+        for (const auto &key : keys) {
+            if (saved.contains(key)) {
+                config.writeEntry(key, saved.value(key));
+            } else {
+                config.deleteEntry(key);
+            }
+        }
+        Q_EMIT workspace()->configChanged();
+    });
+    config.writeEntry("ButtonsOnLeft", "M");
+    config.writeEntry("ButtonsOnRight", "X");
+    Q_EMIT workspace()->configChanged();
+    auto extra = std::make_unique<KDecoration3::DecorationSettings>(workspace()->decorationBridge());
+    QPointer<KDecoration3::DecorationSettings> guard(extra.get());
+    QSignalSpy reconfigured(extra.get(), &KDecoration3::DecorationSettings::reconfigured);
+    QObject context;
+    connect(extra.get(), &KDecoration3::DecorationSettings::decorationButtonsLeftChanged, &context, [&]() {
+        extra.reset();
+    });
+    config.writeEntry("ButtonsOnLeft", "N");
+    Q_EMIT workspace()->configChanged();
+    QVERIFY(!guard);
+    QCOMPARE(reconfigured.count(), 0);
+    const auto active = workspace()->decorationBridge()->settings();
+    QVERIFY(active);
+    const QList<KDecoration3::DecorationButtonType> expectedLeft = {KDecoration3::DecorationButtonType::ApplicationMenu};
+    const QList<KDecoration3::DecorationButtonType> expectedRight = {KDecoration3::DecorationButtonType::Close};
+    QCOMPARE(active->decorationButtonsLeft(), expectedLeft);
+    QCOMPARE(active->decorationButtonsRight(), expectedRight);
+    const auto registered = QDBusConnection::sessionBus().interface()->isServiceRegistered(QStringLiteral("org.kde.kappmenuview"));
+    QVERIFY(registered.isValid());
+    QVERIFY(registered.value());
 }
 
 void TestXdgShellWindow::testMapUnmap()

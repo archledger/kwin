@@ -17,6 +17,7 @@
 #include <KDecoration3/DecorationSettings>
 
 #include <QFontDatabase>
+#include <QPointer>
 
 namespace KWin
 {
@@ -137,45 +138,78 @@ static KDecoration3::BorderSize stringToSize(const QString &name)
 
 void SettingsImpl::readSettings()
 {
+    // Plugin notifications can start another read or destroy these settings. Keep each
+    // emission's payload stable, and let only the newest surviving read continue writing.
+    const auto update = std::make_shared<const SettingsUpdate>();
+    m_update = update;
+    const QPointer<SettingsImpl> guard(this);
+    const auto isCurrent = [guard, update]() {
+        return guard && guard->m_update == update;
+    };
     KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
-    const auto &left = readDecorationButtons(config, "ButtonsOnLeft", QList<KDecoration3::DecorationButtonType>({KDecoration3::DecorationButtonType::Menu, KDecoration3::DecorationButtonType::OnAllDesktops, KDecoration3::DecorationButtonType::ExcludeFromCapture}));
-    if (left != m_leftButtons) {
-        m_leftButtons = left;
-        Q_EMIT decorationSettings()->decorationButtonsLeftChanged(m_leftButtons);
-    }
-    const auto &right = readDecorationButtons(config, "ButtonsOnRight", QList<KDecoration3::DecorationButtonType>({KDecoration3::DecorationButtonType::ContextHelp, KDecoration3::DecorationButtonType::Minimize, KDecoration3::DecorationButtonType::Maximize, KDecoration3::DecorationButtonType::Close}));
-    if (right != m_rightButtons) {
-        m_rightButtons = right;
-        Q_EMIT decorationSettings()->decorationButtonsRightChanged(m_rightButtons);
-    }
-    Workspace::self()->applicationMenu()->setViewEnabled(left.contains(KDecoration3::DecorationButtonType::ApplicationMenu) || right.contains(KDecoration3::DecorationButtonType::ApplicationMenu));
+    const auto left = readDecorationButtons(config, "ButtonsOnLeft", QList<KDecoration3::DecorationButtonType>({KDecoration3::DecorationButtonType::Menu, KDecoration3::DecorationButtonType::OnAllDesktops, KDecoration3::DecorationButtonType::ExcludeFromCapture}));
+    const auto right = readDecorationButtons(config, "ButtonsOnRight", QList<KDecoration3::DecorationButtonType>({KDecoration3::DecorationButtonType::ContextHelp, KDecoration3::DecorationButtonType::Minimize, KDecoration3::DecorationButtonType::Maximize, KDecoration3::DecorationButtonType::Close}));
     const bool close = config.readEntry("CloseOnDoubleClickOnMenu", false);
-    if (close != m_closeDoubleClickMenu) {
-        m_closeDoubleClickMenu = close;
-        Q_EMIT decorationSettings()->closeOnDoubleClickOnMenuChanged(m_closeDoubleClickMenu);
-    }
-
     const bool alwaysShowExcludeFromCapture = config.readEntry("AlwaysShowExcludeFromCapture", false);
-    if (alwaysShowExcludeFromCapture != m_alwaysShowExcludeFromCapture) {
-        m_alwaysShowExcludeFromCapture = alwaysShowExcludeFromCapture;
-        Q_EMIT decorationSettings()->alwaysShowExcludeFromCaptureChanged(m_alwaysShowExcludeFromCapture);
-    }
-
-    m_autoBorderSize = config.readEntry("BorderSizeAuto", true);
-
+    const bool autoBorderSize = config.readEntry("BorderSizeAuto", true);
     auto size = stringToSize(config.readEntry("BorderSize", QStringLiteral("Normal")));
-    if (m_autoBorderSize) {
+    if (autoBorderSize) {
         /* Falls back to Normal border size, if the plugin does not provide a valid recommendation. */
         size = stringToSize(Workspace::self()->decorationBridge()->recommendedBorderSize());
     }
+    const QFont font = QFontDatabase::systemFont(QFontDatabase::TitleFont);
+    if (!isCurrent()) {
+        return;
+    }
+    if (left != m_leftButtons) {
+        m_leftButtons = left;
+        Q_EMIT decorationSettings()->decorationButtonsLeftChanged(left);
+        if (!isCurrent()) {
+            return;
+        }
+    }
+    if (right != m_rightButtons) {
+        m_rightButtons = right;
+        Q_EMIT decorationSettings()->decorationButtonsRightChanged(right);
+        if (!isCurrent()) {
+            return;
+        }
+    }
+    Workspace::self()->applicationMenu()->setViewEnabled(left.contains(KDecoration3::DecorationButtonType::ApplicationMenu) || right.contains(KDecoration3::DecorationButtonType::ApplicationMenu));
+    if (!isCurrent()) {
+        return;
+    }
+    if (close != m_closeDoubleClickMenu) {
+        m_closeDoubleClickMenu = close;
+        Q_EMIT decorationSettings()->closeOnDoubleClickOnMenuChanged(close);
+        if (!isCurrent()) {
+            return;
+        }
+    }
+
+    if (alwaysShowExcludeFromCapture != m_alwaysShowExcludeFromCapture) {
+        m_alwaysShowExcludeFromCapture = alwaysShowExcludeFromCapture;
+        Q_EMIT decorationSettings()->alwaysShowExcludeFromCaptureChanged(alwaysShowExcludeFromCapture);
+        if (!isCurrent()) {
+            return;
+        }
+    }
+
+    m_autoBorderSize = autoBorderSize;
+
     if (size != m_borderSize) {
         m_borderSize = size;
-        Q_EMIT decorationSettings()->borderSizeChanged(m_borderSize);
+        Q_EMIT decorationSettings()->borderSizeChanged(size);
+        if (!isCurrent()) {
+            return;
+        }
     }
-    const QFont font = QFontDatabase::systemFont(QFontDatabase::TitleFont);
     if (font != m_font) {
         m_font = font;
-        Q_EMIT decorationSettings()->fontChanged(m_font);
+        Q_EMIT decorationSettings()->fontChanged(font);
+        if (!isCurrent()) {
+            return;
+        }
     }
 
     Q_EMIT decorationSettings()->reconfigured();
