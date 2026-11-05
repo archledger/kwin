@@ -1894,13 +1894,37 @@ private:
         Owned,
         Restoring,
     };
+    enum class TransientRestoreStage {
+        Claimed,
+        Normalizing,
+        Dispatching,
+        // The synchronous wrapper returned; this is not native completion.
+        Returned,
+    };
     struct TransientRestoreAttempt
     {
+        TransientRestoreAttempt(quint64 sequence, QStringList activities, bool normalizeMaximize, std::function<bool()> stateIsCurrent)
+            : sequence(sequence)
+            , activities(std::move(activities))
+            , normalizeMaximize(normalizeMaximize)
+            , stateIsCurrent(std::move(stateIsCurrent))
+        {
+        }
         const quint64 sequence;
         const QStringList activities;
+        const bool normalizeMaximize;
+        // Backend state only: captured values, no record/stack references or retained Window.
+        std::function<bool()> stateIsCurrent;
         bool cancelled = false;
-        bool requestConsumed = false;
-        bool requesting = false;
+        TransientRestoreStage stage = TransientRestoreStage::Claimed;
+        bool requestConsumed() const
+        {
+            return stage != TransientRestoreStage::Claimed;
+        }
+        bool requesting() const
+        {
+            return stage == TransientRestoreStage::Dispatching;
+        }
         // Published before any callback from this attempt's geometry request; never reused.
         quint64 requestGeneration = 0;
     };
@@ -1977,10 +2001,15 @@ private:
     // the Window externally; the ownership record never stores its own lifetime checkpoint.
     // AppliedCurrent qualifies the claim/release continuation, not restoration completion.
     [[nodiscard]] TransientRestoreClaim claimTransientRestore(quint64 generation);
+    [[nodiscard]] virtual TransientRestoreClaim claimTransientRestoreWithMaximizeNormalization(quint64 generation);
+    TransientRestoreClaim claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, std::function<bool()> stateIsCurrent);
+    virtual std::function<bool()> transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const;
+    virtual AssignmentStepResult normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence);
     // Consumes the original claim continuation, not a newly sampled fence. A matching request
     // is attempted at most once; a duplicate cannot cancel the original. No completion is implied.
     [[nodiscard]] AssignmentGeometryRequest requestTransientRestore(TransientRestoreClaim claim);
     bool transientRestoreRequestIsCurrent(quint64 generation, quint64 sequence) const;
+    bool transientRestoreOperationIsCurrent(quint64 generation, quint64 sequence) const;
     bool transientRestoreClaimIsCurrent(const TransientRestoreClaim &claim) const;
     // Identity/context validity only. A consumer must also validate its synchronous continuation;
     // this predicate is not a way to refresh a superseded claim or to authorize geometry by itself.
