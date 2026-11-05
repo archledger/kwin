@@ -461,6 +461,8 @@ private Q_SLOTS:
     void testPublicTransientReleaseDestruction_data();
     void testPublicTransientReleaseDestruction();
     void testPublicTransientReleaseRefusal();
+    void testControllerReleaseOrdering_data();
+    void testControllerReleaseOrdering();
     void testCompatibilityCancellation_data();
     void testCompatibilityCancellation();
     void testTileAssignmentFenceNeutral();
@@ -11845,24 +11847,151 @@ void TestXdgShellWindow::testPublicTransientReleaseRefusal()
     other->destroyWindow();
 }
 
+void TestXdgShellWindow::testControllerReleaseOrdering_data()
+{
+    QTest::addColumn<bool>("committed");
+    QTest::newRow("pending") << false;
+    QTest::newRow("committed") << true;
+}
+
+void TestXdgShellWindow::testControllerReleaseOrdering()
+{
+    QFETCH(bool, committed);
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.release-ordering"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.release-ordering");
+    const QRectF original = window->frameGeometry();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, original, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    Tile *leaf = controller.tile();
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
+    const auto generation = window->m_transientOwnership->generation;
+    if (committed) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), leaf->windowGeometry().size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->tile(), leaf);
+    } else {
+        QVERIFY(!window->tile());
+    }
+    const auto geometryGeneration = window->geometryRequestGeneration();
+    QSignalSpy geometry(window, &Window::requestedGeometryChanged);
+    QStringList notifications;
+    QObject context;
+    const auto observe = [&](const QString &name) {
+        notifications.append(name);
+        QVERIFY(window->m_transientOwnership);
+        const auto &ownership = *window->m_transientOwnership;
+        QCOMPARE(ownership.generation, generation);
+        QCOMPARE(QRectF(ownership.floating), original);
+        QCOMPARE(ownership.phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(ownership.progress, Window::TransientRequestProgress::Requested);
+        QVERIFY(ownership.releasing);
+        QVERIFY(!ownership.controller);
+        QVERIFY(leaf->windows().isEmpty());
+        QVERIFY(!window->requestedTile());
+        QVERIFY(!window->tile());
+        QVERIFY(writer.isReserved(id));
+        QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
+        QCOMPARE(writer.snapshot().entries.value(key), original);
+        QCOMPARE(window->geometryRequestGeneration(), geometryGeneration);
+        QCOMPARE(geometry.count(), 0);
+    };
+    connect(window, &Window::requestedTileChanged, &context, [&]() {
+        observe(QStringLiteral("requested"));
+    });
+    connect(window, &Window::tileChanged, &context, [&]() {
+        observe(QStringLiteral("committed"));
+    });
+    connect(window, &Window::quickTileModeChanged, &context, [&]() {
+        observe(QStringLiteral("mode"));
+    });
+    connect(leaf, &Tile::windowRemoved, &context, [&]() {
+        observe(QStringLiteral("removed"));
+    });
+    connect(leaf, &Tile::windowsChanged, &context, [&]() {
+        observe(QStringLiteral("membership"));
+    });
+    auto result = window->cancelTransientRequestForAssignment();
+    const QStringList expected = committed
+        ? QStringList{QStringLiteral("requested"), QStringLiteral("committed"), QStringLiteral("mode"), QStringLiteral("removed"), QStringLiteral("membership")}
+        : QStringList{QStringLiteral("requested"), QStringLiteral("removed"), QStringLiteral("membership")};
+    QCOMPARE(notifications, expected);
+    QCOMPARE(result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QVERIFY(result.checkpoint);
+    QVERIFY(window->assignmentResultIsCurrent(result));
+    QVERIFY(window->m_transientOwnership);
+    QVERIFY(!window->m_transientOwnership->releasing);
+    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(writer.isReserved(id));
+    QCOMPARE(geometry.count(), 0);
+
+    // The native record, not a finished restoration, keeps the per-key writer barrier alive.
+    const auto other = QUuid::createUuid();
+    const QRectF manual(40, 50, 260, 160);
+    QVERIFY(writer.trackWindow(other, key));
+    QCOMPARE(writer.record(token, 2, {other, manual, 2, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Deferred);
+    QCOMPARE(writer.snapshot().entries.value(key), original);
+    QPointer<Window> guard(window);
+    window->setSkipCloseAnimation(true);
+    window->destroyWindow();
+    QVERIFY(guard && guard->isDeleted());
+    QVERIFY(!window->assignmentResultIsCurrent(result));
+    QVERIFY(window->m_transientOwnership);
+    QVERIFY(writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(key), original);
+    // Logical close cannot release the barrier while the caller's checkpoint retains the Window.
+    result.checkpoint.reset();
+    QTRY_VERIFY(!guard);
+    QVERIFY(!writer.isReserved(id));
+    QCOMPARE(writer.snapshot().entries.value(key), manual);
+}
+
 void TestXdgShellWindow::testCompatibilityCancellation_data()
 {
     QTest::addColumn<bool>("committed");
     QTest::addColumn<int>("action");
+    QTest::addColumn<bool>("viaProperty");
     for (bool committed : {false, true}) {
         const QByteArray prefix = committed ? "committed-" : "pending-";
-        QTest::newRow((prefix + "unchanged").constData()) << committed << 0;
-        QTest::newRow((prefix + "equal-null").constData()) << committed << 1;
-        QTest::newRow((prefix + "manual").constData()) << committed << 2;
-        QTest::newRow((prefix + "equal-geometry").constData()) << committed << 3;
-        QTest::newRow((prefix + "commit-only").constData()) << committed << 4;
-        QTest::newRow((prefix + "commit-roundtrip").constData()) << committed << 5;
-        QTest::newRow((prefix + "target-destroyed").constData()) << committed << 6;
-        QTest::newRow((prefix + "window-closed").constData()) << committed << 7;
-        QTest::newRow((prefix + "helper-window-closed").constData()) << committed << 8;
-        QTest::newRow((prefix + "saturation-next").constData()) << committed << 9;
-        QTest::newRow((prefix + "saturation-current").constData()) << committed << 10;
-        QTest::newRow((prefix + "outer-null-new-manual").constData()) << committed << 11;
+        QTest::newRow((prefix + "unchanged").constData()) << committed << 0 << false;
+        QTest::newRow((prefix + "equal-null").constData()) << committed << 1 << false;
+        QTest::newRow((prefix + "manual").constData()) << committed << 2 << false;
+        QTest::newRow((prefix + "equal-geometry").constData()) << committed << 3 << false;
+        QTest::newRow((prefix + "commit-only").constData()) << committed << 4 << false;
+        QTest::newRow((prefix + "commit-roundtrip").constData()) << committed << 5 << false;
+        QTest::newRow((prefix + "target-destroyed").constData()) << committed << 6 << false;
+        QTest::newRow((prefix + "window-closed").constData()) << committed << 7 << false;
+        QTest::newRow((prefix + "helper-window-closed").constData()) << committed << 8 << false;
+        QTest::newRow((prefix + "saturation-next").constData()) << committed << 9 << false;
+        QTest::newRow((prefix + "saturation-current").constData()) << committed << 10 << false;
+        QTest::newRow((prefix + "outer-null-new-manual").constData()) << committed << 11 << false;
+        QTest::newRow((prefix + "property-unchanged").constData()) << committed << 0 << true;
+        QTest::newRow((prefix + "property-equal-null").constData()) << committed << 1 << true;
+        QTest::newRow((prefix + "property-commit-only").constData()) << committed << 4 << true;
+        QTest::newRow((prefix + "property-commit-roundtrip").constData()) << committed << 5 << true;
     }
 }
 
@@ -11870,6 +11999,7 @@ void TestXdgShellWindow::testCompatibilityCancellation()
 {
     QFETCH(bool, committed);
     QFETCH(int, action);
+    QFETCH(bool, viaProperty);
     using Result = TransientTileController::Result;
     std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
     std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
@@ -11956,6 +12086,9 @@ void TestXdgShellWindow::testCompatibilityCancellation()
     });
     if (action == 8) {
         QVERIFY(!window->cancelTransientRequest());
+    } else if (viaProperty) {
+        // True means the meta-object dispatched the setter, not that placement succeeded.
+        QVERIFY(window->setProperty("tile", QVariant::fromValue(target.data())));
     } else {
         window->setTileCompatibility(action == 11 ? nullptr : target.data());
     }
