@@ -126,19 +126,19 @@ private:
         m_windows.removeAll(window);
     }
 
-    // The membership predicate is the admission's own currentness over the window's membership
-    // revision, checked after each callback boundary so a superseded admission publishes nothing
-    // further; the tile itself cannot read that revision.
-    bool publishAdded(Window *window, quint64 generation, const std::function<bool()> &membershipCurrent)
+    // The predicate is the admission's own continuation (its checkpoint sealed after the
+    // membership was recorded and before this first notification, its provenance the admission's
+    // currentness), evaluated after each notification so a superseded admission publishes nothing
+    // further; the tile reads nothing of the window itself.
+    bool publishAdded(Window *window, const std::function<bool()> &current)
     {
         const QPointer<TransientTile> guard(this);
-        const auto controller = m_controller;
         Q_EMIT windowAdded(window);
-        if (!guard || !controller || !controller->admissionCurrent(window, generation) || !membershipCurrent()) {
+        if (!guard || !current()) {
             return false;
         }
         Q_EMIT windowsChanged();
-        return guard && controller && controller->admissionCurrent(window, generation) && membershipCurrent();
+        return guard && current();
     }
 
     void publishRemoved(Window *window, quint64 generation)
@@ -609,8 +609,18 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
         return Result::StaleGeneration;
     }
     const auto activity = window ? activityContext(window) : std::nullopt;
-    if (!window || !writer || !activity || key.isEmpty() || placementKey(window) != key || !freeOfNativeMembership(window)) {
+    // The complete preflight, before any provisional admission state: the window's eligibility
+    // here (an ordinary membership anywhere stays ineligible) and on the window (no ownership,
+    // active request, association or unresolved marker; a backend that can start the request,
+    // which refuses X11 before any reservation; the native geometry settled; the target feasible),
+    // then the headroom for the whole synchronous path and its failure cleanup, a known shortage
+    // refused rather than superseded after a write.
+    if (!window || !writer || !activity || key.isEmpty() || placementKey(window) != key || !freeOfNativeMembership(window)
+        || !window->transientAdmissionEligible(m_tile->windowGeometry())) {
         return Result::Ineligible;
+    }
+    if (!window->transientAdmissionHeadroom()) {
+        return Result::Refused;
     }
     Mutation mutation(this);
     const QPointer<TransientTileController> guard(this);
@@ -655,20 +665,38 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
     // otherwise-valid public membership no-op made by a publication callback is newer intent that
     // no later fence of this admission would otherwise see.
     window->noteTileMembershipChanged();
-    // The window outlives this call (retained above); the predicate reads its membership revision
-    // through a pointer taken here so the tile needs no access of its own.
-    const quint64 *const revision = &window->m_tileMembershipChange;
-    const auto membership = *revision;
-    const auto membershipCurrent = [revision, membership]() {
-        return *revision == membership;
+    // The admission's own currentness, this attempt's stable constraint: the controller, its tree
+    // and leaf with their generation, the exact window and ownership generation, the writer and
+    // provider, the frozen context, the published membership. It is the publication's provenance
+    // and, carried into the native request's continuation, the application's.
+    const auto admission = [guard, this, window, generation]() {
+        return guard && admissionCurrent(window, generation);
+    };
+    // The publication's continuation: the checkpoint sealed here, after the admission's own
+    // callback-free writes and before its first notification, with the admission's currentness
+    // as an operation provenance (the owner is Owned, but its association is installed only by
+    // the request, so the ownership provenance belongs to the application). Evaluated after each
+    // notification; never refreshed.
+    Window::AssignmentStepResult publication;
+    publication.checkpoint = window->makeTileAssignmentCheckpoint();
+    publication.owned = Window::OwnedProvenance().withConstraint(admission);
+    const auto publicationCurrent = [window, &publication]() {
+        return window->assignmentResultIsCurrent(publication);
     };
     m_membershipPublished = true;
-    if (!m_tile->publishAdded(window, generation, membershipCurrent)) {
+    if (!m_tile->publishAdded(window, publicationCurrent)) {
         window->revokeTransientOwnership(ownership);
         return Result::Superseded;
     }
-    const auto receipt = window->applyTransientOwnership(ownership);
-    if (guard && guard->admissionCurrent(window, generation) && receipt.outcome == Window::TransientRequestOutcome::Applied) {
+    // Through the native request: its receipt (this attempt's progress and proof) and the
+    // continuation it qualifies beyond the request's destruction, bound to the admission's
+    // currentness. Accepted needs both the applied receipt and a current continuation, checked
+    // once more after the application returned; anything else releases this attempt's
+    // membership and association only, the restoration's barrier kept where the request was made.
+    const auto application = window->applyTransientOwnershipGuarded(ownership, admission);
+    if (guard && application.receipt.outcome == Window::TransientRequestOutcome::Applied
+        && application.continuation.outcome == Window::AssignmentStepOutcome::AppliedCurrent
+        && window->assignmentResultIsCurrent(application.continuation)) {
         return Result::Accepted;
     }
     window->revokeTransientOwnership(ownership);
