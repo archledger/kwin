@@ -72,7 +72,12 @@ private:
     bool initPlugin(const QString &pluginId);
     QString readTheme() const;
     void readDecorationOptions();
+    void leaveOperation();
     std::unique_ptr<KPluginFactory> m_factory;
+    // Plugin callbacks run inside init(), reconfigure() and createDecoration(). A configuration
+    // change requested from one is applied by a single follow-up pass once they have unwound.
+    int m_operationDepth = 0;
+    bool m_reconfigurePending = false;
     bool m_showToolTips;
     QString m_recommendedBorderSize;
     QString m_plugin;
