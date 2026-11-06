@@ -67,6 +67,9 @@ DecorationBridge::DecorationBridge()
     readDecorationOptions();
 }
 
+// The factory is not deleted here: it belongs to the plugin library, not to the bridge.
+DecorationBridge::~DecorationBridge() = default;
+
 QString DecorationBridge::readPlugin()
 {
     return kwinApp()->config()->group(s_configKeyName).readEntry("library", s_defaultPlugin);
@@ -145,7 +148,8 @@ bool DecorationBridge::initPlugin(const QString &pluginId)
     }
     qCDebug(KWIN_DECORATIONS) << "Trying to load decoration plugin: " << metaData.fileName();
     if (auto factoryResult = KPluginFactory::loadFactory(metaData)) {
-        m_factory.reset(factoryResult.plugin);
+        // Loading the same library again, under any id, returns the object already held.
+        m_factory = factoryResult.plugin;
         m_plugin = pluginId;
         loadMetaData(metaData.rawData());
         return true;
@@ -198,7 +202,7 @@ void DecorationBridge::reconfigure()
         if (m_noPlugin) {
             // decorations disabled now
             m_plugin = QString();
-            m_factory.reset();
+            m_factory.clear();
             m_settings.reset();
         } else {
             // decorations enabled now
@@ -209,10 +213,10 @@ void DecorationBridge::reconfigure()
     }
 
     const QString newPlugin = readPlugin();
-    if (newPlugin != m_plugin) {
+    // A factory destroyed elsewhere leaves the configured plugin unavailable; load it again.
+    if (newPlugin != m_plugin || (!m_noPlugin && !m_factory)) {
         if (initPlugin(newPlugin)) {
             recreateDecorations();
-            // TODO: unload and destroy old plugin
         }
     } else {
         // same plugin, but theme might have changed

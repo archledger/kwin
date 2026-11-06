@@ -52,6 +52,8 @@
 #include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusPendingReply>
+#include <QDir>
+#include <QFile>
 #include <QPointer>
 #include <QProcess>
 #include <QScopeGuard>
@@ -59,6 +61,8 @@
 #include <QTimer>
 
 #include <KConfigGroup>
+#include <KPluginFactory>
+#include <KPluginMetaData>
 #include <KSharedConfig>
 
 // system
@@ -245,6 +249,8 @@ private Q_SLOTS:
     void testDecorationRecreationTraversal();
     void testDecorationBridgeReentry_data();
     void testDecorationBridgeReentry();
+    void testDecorationFactoryOwnership_data();
+    void testDecorationFactoryOwnership();
 
     void testMapUnmap();
     void testWindowOutputs();
@@ -1234,6 +1240,214 @@ void TestXdgShellWindow::testDecorationBridgeReentry()
     QVERIFY2(afterRestore.isEmpty(), qPrintable(afterRestore));
     QCOMPARE(bridgePlugin(), breezePlugin);
     QVERIFY(Decoration::DecorationBridge::hasPlugin());
+    for (auto &fixture : fixtures) {
+        QCOMPARE(decorationClass(fixture.window), breezeClass);
+    }
+}
+
+void TestXdgShellWindow::testDecorationFactoryOwnership_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("switch-keeps-singleton") << 0;
+    QTest::newRow("same-library-alias") << 1;
+    QTest::newRow("second-bridge-teardown") << 2;
+    QTest::newRow("external-destruction") << 3;
+}
+
+void TestXdgShellWindow::testDecorationFactoryOwnership()
+{
+    QFETCH(int, scenario);
+    const QString fakesPath = QCoreApplication::applicationDirPath() + QStringLiteral("/fakes");
+    QCoreApplication::addLibraryPath(fakesPath);
+    const QString pluginNamespace = QStringLiteral("org.kde.kdecoration3");
+    const QString breezePlugin = QStringLiteral("org.kde.breeze");
+    const QString breezeClass = QStringLiteral("Breeze::Decoration");
+    const QString fakePlugin = QStringLiteral("fakedecoshadows");
+    const QString aliasPlugin = QStringLiteral("fakedecoshadowsalias");
+    const QString fakeClass = QStringLiteral("FakeDecoWithShadows");
+    auto bridge = workspace()->decorationBridge();
+    // The plugin loader hands every holder of a library the same root object; for the same
+    // metadata this is the object the bridge receives.
+    const auto sharedFactory = [&](const QString &pluginId) -> QPointer<KPluginFactory> {
+        const KPluginMetaData metaData = KPluginMetaData::findPluginById(pluginNamespace, pluginId);
+        if (!metaData.isValid()) {
+            return nullptr;
+        }
+        return KPluginFactory::loadFactory(metaData).plugin;
+    };
+    const auto decorationClass = [](Window *window) -> QString {
+        const auto decoration = window->nextDecoration();
+        return decoration ? QString::fromLatin1(decoration->metaObject()->className()) : QString();
+    };
+    const auto bridgePlugin = [bridge]() -> QString {
+        const QString info = bridge->supportInformation();
+        const auto start = info.indexOf(QLatin1String("Plugin: "));
+        if (start < 0) {
+            return QString();
+        }
+        const auto end = info.indexOf(QLatin1Char('\n'), start);
+        return info.mid(start + 8, end - start - 8);
+    };
+    struct Fixture
+    {
+        std::unique_ptr<KWayland::Client::Surface> surface;
+        std::unique_ptr<Test::XdgToplevel> shell;
+        std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+        QPointer<Window> window;
+    };
+    std::array<Fixture, 2> fixtures;
+    const auto create = [&](int i) -> Window * {
+        auto &fixture = fixtures[i];
+        fixture.surface = Test::createSurface();
+        fixture.shell = Test::createXdgToplevelSurface(fixture.surface.get(), Test::CreationSetup::CreateOnly);
+        fixture.decoration = Test::createXdgToplevelDecorationV1(fixture.shell.get());
+        fixture.decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+        QSignalSpy configure(fixture.shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+        fixture.surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        if (!configure.wait()) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        configure.clear();
+        fixture.window = Test::renderAndWaitForShown(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!fixture.window || (configure.isEmpty() && !configure.wait())) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!Test::waylandSync()) {
+            return nullptr;
+        }
+        return fixture.window;
+    };
+    QCOMPARE(bridgePlugin(), breezePlugin);
+    for (int i = 0; i < int(fixtures.size()); ++i) {
+        QVERIFY(create(i));
+        QCOMPARE(decorationClass(fixtures[i].window), breezeClass);
+    }
+    KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    const QStringList keys = {QStringLiteral("library"), QStringLiteral("NoPlugin"), QStringLiteral("theme")};
+    const auto saved = config.entryMap();
+    const auto restoreConfiguration = [&]() {
+        for (const auto &key : keys) {
+            if (saved.contains(key)) {
+                config.writeEntry(key, saved.value(key));
+            } else {
+                config.deleteEntry(key);
+            }
+        }
+        Q_EMIT workspace()->configChanged();
+    };
+    const auto apply = [&](const char *key, const QString &value) {
+        config.writeEntry(key, value);
+        Q_EMIT workspace()->configChanged();
+    };
+    // A recreation pass gives every window a new decoration object.
+    const auto currentDecorations = [&]() {
+        QList<QPointer<KDecoration3::Decoration>> decorations;
+        for (const auto &fixture : fixtures) {
+            decorations.append(fixture.window->nextDecoration());
+        }
+        return decorations;
+    };
+    const auto replaced = [&](const QList<QPointer<KDecoration3::Decoration>> &before) {
+        for (int i = 0; i < int(fixtures.size()); ++i) {
+            const auto now = fixtures[i].window->nextDecoration();
+            if (!now || (before[i] && before[i].data() == now)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    QTemporaryDir aliasRoot;
+    bool restored = false;
+    const auto teardown = qScopeGuard([&]() {
+        if (!restored) {
+            restoreConfiguration();
+        }
+        QCoreApplication::removeLibraryPath(aliasRoot.path());
+        for (auto &fixture : fixtures) {
+            if (fixture.window && !fixture.window->isDeleted()) {
+                fixture.window->setSkipCloseAnimation(true);
+                fixture.window->destroyWindow();
+            }
+        }
+    });
+
+    if (scenario == 0) {
+        QPointer<KPluginFactory> breeze = sharedFactory(breezePlugin);
+        QVERIFY(breeze);
+        apply("library", fakePlugin);
+        QCOMPARE(bridgePlugin(), fakePlugin);
+        for (auto &fixture : fixtures) {
+            QCOMPARE(decorationClass(fixture.window), fakeClass);
+        }
+        QVERIFY2(breeze, "switching plugins destroyed the Breeze factory");
+        restoreConfiguration();
+        QCOMPARE(bridgePlugin(), breezePlugin);
+        // Switching back reuses the same object.
+        QCOMPARE(sharedFactory(breezePlugin).data(), breeze.data());
+    } else if (scenario == 1) {
+        QVERIFY(aliasRoot.isValid());
+        QVERIFY(QDir(aliasRoot.path()).mkpath(pluginNamespace));
+        const QString library = fakesPath + QLatin1Char('/') + pluginNamespace + QLatin1Char('/') + fakePlugin + QStringLiteral(".so");
+        QVERIFY(QFile::exists(library));
+        QVERIFY(QFile::link(library, aliasRoot.path() + QLatin1Char('/') + pluginNamespace + QLatin1Char('/') + aliasPlugin + QStringLiteral(".so")));
+        QCoreApplication::addLibraryPath(aliasRoot.path());
+        apply("library", fakePlugin);
+        QCOMPARE(bridgePlugin(), fakePlugin);
+        QPointer<KPluginFactory> fake = sharedFactory(fakePlugin);
+        QVERIFY(fake);
+        // The alias id reaches the same loaded library and therefore the same object.
+        QCOMPARE(sharedFactory(aliasPlugin).data(), fake.data());
+        const auto before = currentDecorations();
+        apply("library", aliasPlugin);
+        QVERIFY2(fake, "loading the same library under another id destroyed its factory");
+        QCOMPARE(bridgePlugin(), aliasPlugin);
+        QVERIFY(replaced(before));
+        for (auto &fixture : fixtures) {
+            QCOMPARE(decorationClass(fixture.window), fakeClass);
+        }
+    } else if (scenario == 2) {
+        QPointer<KPluginFactory> breeze = sharedFactory(breezePlugin);
+        QVERIFY(breeze);
+        {
+            // Another holder of the same library, constructed and initialized like the
+            // workspace bridge.
+            auto second = std::make_unique<Decoration::DecorationBridge>();
+            second->init();
+            QVERIFY(second->supportInformation().startsWith(QStringLiteral("Plugin: ") + breezePlugin + QLatin1Char('\n')));
+        }
+        QVERIFY2(breeze, "destroying a second bridge destroyed the shared Breeze factory");
+        QVERIFY(Decoration::DecorationBridge::hasPlugin());
+        const auto before = currentDecorations();
+        apply("theme", QStringLiteral("factory-ownership-pass"));
+        QVERIFY(replaced(before));
+        for (auto &fixture : fixtures) {
+            QCOMPARE(decorationClass(fixture.window), breezeClass);
+        }
+    } else {
+        QPointer<KPluginFactory> breeze = sharedFactory(breezePlugin);
+        QVERIFY(breeze);
+        const auto before = currentDecorations();
+        // As another holder of the library, or an unload, would.
+        delete breeze.data();
+        QVERIFY(!breeze);
+        QVERIFY2(!Decoration::DecorationBridge::hasPlugin(), "the bridge still reports a destroyed factory");
+        // The configuration is unchanged; the bridge loads the configured plugin again.
+        Q_EMIT workspace()->configChanged();
+        QVERIFY2(Decoration::DecorationBridge::hasPlugin(), "the bridge did not reload the destroyed factory");
+        QVERIFY(sharedFactory(breezePlugin));
+        QVERIFY(replaced(before));
+        for (auto &fixture : fixtures) {
+            QCOMPARE(decorationClass(fixture.window), breezeClass);
+        }
+    }
+    restoreConfiguration();
+    restored = true;
+    QCOMPARE(bridgePlugin(), breezePlugin);
+    QVERIFY(Decoration::DecorationBridge::hasPlugin());
+    QVERIFY(sharedFactory(breezePlugin));
     for (auto &fixture : fixtures) {
         QCOMPARE(decorationClass(fixture.window), breezeClass);
     }
