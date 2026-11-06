@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# CI for the archledger/kwin fork (Plasma Fusion's KWin), on GitHub-hosted runners only:
+# - commits: every fork commit (those not on an upstream Plasma/* mirror branch) carries exactly one
+#   Signed-off-by trailer and no other trailer, credits no AI tool, and has a signature GitHub verifies;
+# - suites: the 18 qualification suites in the ThinkPad lane's Fedora 44 container (.github/ci/suites.sh),
+#   with Valgrind Memcheck over the closure and reentry functions on the weekly run or on request.
+# Candidate branches (candidate/**) are where a new tip is checked before plasma-fusion moves to it.
+
+name: fork CI
+
+on:
+  push:
+    branches: ["plasma-fusion", "candidate/**"]
+  pull_request:
+    branches: ["plasma-fusion"]
+  schedule:
+    - cron: "30 3 * * 1" # Mondays 03:30 UTC: a Fedora 44 update that breaks the fork shows up here
+  workflow_dispatch:
+    inputs:
+      memcheck:
+        description: "Also run the Memcheck functions"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commits:
+    name: "DCO, attribution and signatures"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history and every branch, so the upstream mirrors bound the fork's own commits.
+          fetch-depth: 0
+
+      - name: Every fork commit carries one Signed-off-by, no other trailer or AI attribution, and a verified signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mirrors=$(git for-each-ref --format='%(refname)' 'refs/remotes/origin/Plasma/*')
+          [ -n "$mirrors" ] || { echo "::error::no Plasma/* mirror branch to bound the fork's commits"; exit 1; }
+          # shellcheck disable=SC2086 # one argument per mirror ref
+          range=$(git rev-list --no-merges "$HEAD_SHA" --not $mirrors)
+          [ -n "$range" ] || { echo "::error::no fork commits above the mirrors"; exit 1; }
+          status=0
+          count=0
+          for c in $range; do
+            count=$((count + 1))
+            what=$(git log -1 --format='%h %s' "$c")
+            trailers=$(git log -1 --format='%(trailers:only=true,unfold=true)' "$c")
+            n=$(printf '%s\n' "$trailers" | grep -c '^Signed-off-by: .\+ <.\+@.\+>$' || true)
+            if [ "$n" -ne 1 ]; then
+              printf 'DCO: %s has %s Signed-off-by trailers (need exactly 1)\n' "$what" "$n" >&2
+              status=1
+            fi
+            other=$(printf '%s\n' "$trailers" | grep -v '^Signed-off-by: ' | grep -v '^$' || true)
+            if [ -n "$other" ]; then
+              printf 'Trailers: %s carries other trailers:\n%s\n' "$what" "$other" >&2
+              status=1
+            fi
+            if git log -1 --format='%B' "$c" \
+                | grep -inE 'claude|anthropic|openai|chatgpt|copilot|codex|opencode|gemini|generated (with|by) (an? )?ai|ai[- ]generated|co-authored-by' >&2; then
+              printf 'Attribution: %s credits an AI tool (lines above)\n' "$what" >&2
+              status=1
+            fi
+            verified=$(gh api "repos/$GITHUB_REPOSITORY/commits/$c" --jq '.commit.verification.verified')
+            if [ "$verified" != true ]; then
+              printf 'Signature: %s is not verified by GitHub\n' "$what" >&2
+              status=1
+            fi
+          done
+          echo "Checked $count fork commits above the Plasma/* mirrors." | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+  suites:
+    name: "KWin 18 suites (Fedora 44)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Room for the image and the build (the runner's preinstalled toolchains are not used)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h / "$RUNNER_TEMP"
+
+      - name: KWin's software render device (KWin 6.8 composites only on a render device; runners have no GPU)
+        run: |
+          set -euo pipefail
+          [ -e /dev/udmabuf ] || sudo modprobe udmabuf
+          # The runner is a throwaway VM and the containers run as the runner user (rootless podman).
+          sudo chmod 0666 /dev/udmabuf
+          ls -l /dev/udmabuf
+          ls -l /dev/dri 2>/dev/null || echo "no /dev/dri: the suites use KWin's software device over /dev/udmabuf"
+
+      - name: Build and run the suites
+        env:
+          MEMCHECK: ${{ (github.event_name == 'schedule' || inputs.memcheck) && '1' || '0' }}
+        run: .github/ci/suites.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/ci"
+
+      - name: Summary
+        if: always()
+        run: |
+          out=$RUNNER_TEMP/ci/out
+          {
+            echo '```'
+            cat "$out/STATUS" "$out/render-device.txt" "$out/summary.txt" 2>/dev/null || echo "no results (see the logs)"
+            echo '```'
+            if [ -s "$out/repeats.txt" ]; then
+              echo 'Suites that needed a repeat (failed attempts):'
+              echo '```'; cat "$out/repeats.txt"; echo '```'
+            fi
+            if [ -s "$out/memcheck.txt" ]; then
+              echo 'Memcheck:'
+              echo '```'; cat "$out/memcheck.txt"; echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fork-ci-suites
+          path: ${{ runner.temp }}/ci/out
+          retention-days: 14
+          if-no-files-found: warn
