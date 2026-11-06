@@ -91,6 +91,8 @@ private Q_SLOTS:
     void testDecorationSettingsDestruction();
     void testDecorationRecreationTraversal_data();
     void testDecorationRecreationTraversal();
+    void testDecorationBridgeReentry_data();
+    void testDecorationBridgeReentry();
 
     void testMapUnmap();
     void testWindowOutputs();
@@ -638,6 +640,221 @@ void TestXdgShellWindow::testDecorationRecreationTraversal()
     }
     for (const auto &fixture : fixtures) {
         QTRY_VERIFY(!fixture.window);
+    }
+}
+
+void TestXdgShellWindow::testDecorationBridgeReentry_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("idle-switch-control") << 0;
+    QTest::newRow("switch-during-recreation") << 1;
+    QTest::newRow("switch-during-client-request") << 2;
+    QTest::newRow("disable-during-creation") << 3;
+    QTest::newRow("coalesced-follow-up") << 4;
+}
+
+void TestXdgShellWindow::testDecorationBridgeReentry()
+{
+    QFETCH(int, scenario);
+    // The in-tree fake decoration plugin is built next to the test binary. A loaded C++ plugin's
+    // id is its file base name, looked up as <library path>/org.kde.kdecoration3/<id>.
+    QCoreApplication::addLibraryPath(QCoreApplication::applicationDirPath() + QStringLiteral("/fakes"));
+    const QString breezePlugin = QStringLiteral("org.kde.breeze");
+    const QString breezeClass = QStringLiteral("Breeze::Decoration");
+    const QString fakePlugin = QStringLiteral("fakedecoshadows");
+    const QString fakeClass = QStringLiteral("FakeDecoWithShadows");
+    auto bridge = workspace()->decorationBridge();
+    const auto decorationClass = [](Window *window) -> QString {
+        const auto decoration = window->nextDecoration();
+        return decoration ? QString::fromLatin1(decoration->metaObject()->className()) : QString();
+    };
+    const auto bridgePlugin = [bridge]() -> QString {
+        const QString info = bridge->supportInformation();
+        const auto start = info.indexOf(QLatin1String("Plugin: "));
+        if (start < 0) {
+            return QString();
+        }
+        const auto end = info.indexOf(QLatin1Char('\n'), start);
+        return info.mid(start + 8, end - start - 8);
+    };
+    struct Fixture
+    {
+        std::unique_ptr<KWayland::Client::Surface> surface;
+        std::unique_ptr<Test::XdgToplevel> shell;
+        std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+        QPointer<Window> window;
+        int visits = 0;
+    };
+    std::array<Fixture, 3> fixtures;
+    const auto create = [&](int i, Test::XdgToplevelDecorationV1::mode mode) -> Window * {
+        auto &fixture = fixtures[i];
+        fixture.surface = Test::createSurface();
+        fixture.shell = Test::createXdgToplevelSurface(fixture.surface.get(), Test::CreationSetup::CreateOnly);
+        fixture.decoration = Test::createXdgToplevelDecorationV1(fixture.shell.get());
+        fixture.decoration->set_mode(mode);
+        QSignalSpy configure(fixture.shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+        fixture.surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        if (!configure.wait()) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        configure.clear();
+        fixture.window = Test::renderAndWaitForShown(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!fixture.window || (configure.isEmpty() && !configure.wait())) {
+            return nullptr;
+        }
+        fixture.shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(fixture.surface.get(), QSize(320, 240), Qt::blue);
+        if (!Test::waylandSync()) {
+            return nullptr;
+        }
+        return fixture.window;
+    };
+    QCOMPARE(bridgePlugin(), breezePlugin);
+    for (int i = 0; i < 3; ++i) {
+        const bool clientSide = scenario == 2 && i == 2;
+        QVERIFY(create(i, clientSide ? Test::XdgToplevelDecorationV1::mode_client_side : Test::XdgToplevelDecorationV1::mode_server_side));
+        QCOMPARE(decorationClass(fixtures[i].window), clientSide ? QString() : breezeClass);
+    }
+    KConfigGroup config = kwinApp()->config()->group(QStringLiteral("org.kde.kdecoration2"));
+    const QStringList keys = {QStringLiteral("library"), QStringLiteral("NoPlugin"), QStringLiteral("theme")};
+    const auto saved = config.entryMap();
+    const auto restoreConfiguration = [&]() {
+        for (const auto &key : keys) {
+            if (saved.contains(key)) {
+                config.writeEntry(key, saved.value(key));
+            } else {
+                config.deleteEntry(key);
+            }
+        }
+    };
+    const auto visitCounts = [&]() {
+        QList<int> counts;
+        for (const auto &fixture : fixtures) {
+            counts.append(fixture.visits);
+        }
+        return counts;
+    };
+    const auto countsText = [](const QList<int> &counts) {
+        QStringList parts;
+        for (int count : counts) {
+            parts.append(QString::number(count));
+        }
+        return parts.join(QLatin1Char(','));
+    };
+    // A deferred follow-up runs from the event loop. Give it a turn, then require quiet: an empty
+    // result means no window was recreated during the second turn.
+    const auto drain = [&]() -> QString {
+        QTest::qWait(50);
+        const auto before = visitCounts();
+        QTest::qWait(50);
+        const auto after = visitCounts();
+        if (after == before) {
+            return QString();
+        }
+        return QStringLiteral("recreations still running: %1 then %2").arg(countsText(before), countsText(after));
+    };
+    bool triggered = false;
+    const int triggerIndex = scenario == 0 ? -1 : (scenario == 2 ? 2 : 0);
+    RegistryEventFilter filter(QEvent::ChildAdded, [&](QObject *object, QEvent *) {
+        for (int i = 0; i < 3; ++i) {
+            if (object != fixtures[i].window) {
+                continue;
+            }
+            ++fixtures[i].visits;
+            if (triggered || i != triggerIndex) {
+                return;
+            }
+            // Inside the plugin decoration's construction for this window: ask for a different
+            // configuration while the bridge is still creating with the current one.
+            triggered = true;
+            if (scenario == 3) {
+                config.writeEntry("NoPlugin", true);
+            } else {
+                config.writeEntry("library", fakePlugin);
+            }
+            Q_EMIT workspace()->configChanged();
+            if (scenario == 4) {
+                config.writeEntry("theme", QStringLiteral("reentry-second-write"));
+                Q_EMIT workspace()->configChanged();
+            }
+            return;
+        }
+    });
+    bool restored = false;
+    const auto teardown = qScopeGuard([&]() {
+        for (auto &fixture : fixtures) {
+            if (fixture.window) {
+                fixture.window->removeEventFilter(&filter);
+            }
+        }
+        if (!restored) {
+            restoreConfiguration();
+            Q_EMIT workspace()->configChanged();
+            QTest::qWait(50);
+        }
+        for (auto &fixture : fixtures) {
+            if (fixture.window && !fixture.window->isDeleted()) {
+                fixture.window->setSkipCloseAnimation(true);
+                fixture.window->destroyWindow();
+            }
+        }
+    });
+    for (auto &fixture : fixtures) {
+        fixture.window->installEventFilter(&filter);
+    }
+    if (scenario == 0) {
+        config.writeEntry("library", fakePlugin);
+        Q_EMIT workspace()->configChanged();
+        // An idle reconfiguration stays synchronous: the switch is complete on return.
+        QCOMPARE(bridgePlugin(), fakePlugin);
+        for (auto &fixture : fixtures) {
+            QCOMPARE(decorationClass(fixture.window), fakeClass);
+        }
+        QCOMPARE(visitCounts(), QList<int>({1, 1, 1}));
+        const QString afterSwitch = drain();
+        QVERIFY2(afterSwitch.isEmpty(), qPrintable(afterSwitch));
+        QCOMPARE(visitCounts(), QList<int>({1, 1, 1}));
+    } else {
+        if (scenario == 2) {
+            fixtures[2].decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+            QVERIFY(Test::waylandSync());
+        } else {
+            config.writeEntry("theme", QStringLiteral("reentry-first-pass"));
+            Q_EMIT workspace()->configChanged();
+        }
+        QVERIFY(triggered);
+        // Per window, so a stale one is named with the decoration it kept.
+        const QString expectedClass = scenario == 3 ? QString() : fakeClass;
+        const auto describe = [&](int i) {
+            const QString current = decorationClass(fixtures[i].window);
+            return QStringLiteral("window %1 has %2").arg(i).arg(current.isEmpty() ? QStringLiteral("no decoration") : current);
+        };
+        for (int i = 0; i < 3; ++i) {
+            QTRY_VERIFY2(decorationClass(fixtures[i].window) == expectedClass, qPrintable(describe(i)));
+        }
+        if (scenario == 3) {
+            QVERIFY(!Decoration::DecorationBridge::hasPlugin());
+            QCOMPARE(bridgePlugin(), QString());
+        } else {
+            QCOMPARE(bridgePlugin(), fakePlugin);
+        }
+        const QString afterReentry = drain();
+        QVERIFY2(afterReentry.isEmpty(), qPrintable(afterReentry));
+        // One interrupted pass plus one complete follow-up; the disabled follow-up creates nothing,
+        // and the client-request row's other windows are reached only by the follow-up.
+        const QList<int> expected = scenario == 3 ? QList<int>({1, 1, 1}) : (scenario == 2 ? QList<int>({1, 1, 2}) : QList<int>({2, 2, 2}));
+        QCOMPARE(visitCounts(), expected);
+    }
+    restoreConfiguration();
+    Q_EMIT workspace()->configChanged();
+    restored = true;
+    const QString afterRestore = drain();
+    QVERIFY2(afterRestore.isEmpty(), qPrintable(afterRestore));
+    QCOMPARE(bridgePlugin(), breezePlugin);
+    QVERIFY(Decoration::DecorationBridge::hasPlugin());
+    for (auto &fixture : fixtures) {
+        QCOMPARE(decorationClass(fixture.window), breezeClass);
     }
 }
 

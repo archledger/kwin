@@ -105,8 +105,24 @@ QSet<KDecoration3::Style> DecorationBridge::supportedStyles()
     return bridge->m_supportedStyles;
 }
 
+void DecorationBridge::leaveOperation()
+{
+    if (--m_operationDepth > 0 || !m_reconfigurePending) {
+        return;
+    }
+    // The caller may still be installing a decoration created with the previous configuration.
+    // Apply the newest one with a complete pass after this stack has unwound; the call is bound
+    // to this object so a bridge destroyed first simply drops it.
+    m_reconfigurePending = false;
+    QMetaObject::invokeMethod(this, &DecorationBridge::reconfigure, Qt::QueuedConnection);
+}
+
 void DecorationBridge::init()
 {
+    ++m_operationDepth;
+    const auto scope = qScopeGuard([this]() {
+        leaveOperation();
+    });
     m_noPlugin = readNoPlugin();
     if (m_noPlugin) {
         waylandServer()->decorationManager()->setDefaultMode(ServerSideDecorationManagerInterface::Mode::None);
@@ -173,6 +189,16 @@ static void recreateDecorations()
 
 void DecorationBridge::reconfigure()
 {
+    if (m_operationDepth > 0) {
+        // Requested from a plugin callback inside a running operation. That operation finishes
+        // with the configuration it started from; the newest one is applied afterwards.
+        m_reconfigurePending = true;
+        return;
+    }
+    ++m_operationDepth;
+    const auto scope = qScopeGuard([this]() {
+        leaveOperation();
+    });
     readDecorationOptions();
 
     if (m_noPlugin != readNoPlugin()) {
@@ -272,6 +298,10 @@ KDecoration3::Decoration *DecorationBridge::createDecoration(Window *window, KDe
     if (!m_factory) {
         return nullptr;
     }
+    ++m_operationDepth;
+    const auto scope = qScopeGuard([this]() {
+        leaveOperation();
+    });
     QVariantMap args({
         {QStringLiteral("bridge"), QVariant::fromValue(this)},
         {QStringLiteral("style"), QVariant::fromValue(style)},
