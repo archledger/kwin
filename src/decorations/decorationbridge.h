@@ -11,6 +11,7 @@
 #include "kwin_export.h"
 #include <KDecoration3/Private/DecorationBridge>
 #include <QObject>
+#include <QPointer>
 #include <QSet>
 
 class KPluginFactory;
@@ -36,6 +37,7 @@ class KWIN_EXPORT DecorationBridge : public KDecoration3::DecorationBridge
 
 public:
     explicit DecorationBridge();
+    ~DecorationBridge() override;
 
     static bool hasPlugin();
     static QSet<KDecoration3::Style> supportedStyles();
@@ -76,7 +78,9 @@ private:
     QString readTheme() const;
     void readDecorationOptions();
     void leaveOperation();
-    std::unique_ptr<KPluginFactory> m_factory;
+    // The plugin library's shared root object, borrowed from Qt's plugin loader: every holder
+    // of the library receives the same one, and Qt deletes it when the library is unloaded.
+    QPointer<KPluginFactory> m_factory;
     // Plugin callbacks run inside init(), reconfigure() and createDecoration(). A configuration
     // change requested from one is applied by a single follow-up pass once they have unwound.
     int m_operationDepth = 0;
