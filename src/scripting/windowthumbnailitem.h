@@ -82,6 +82,13 @@ class WindowThumbnailItem : public QQuickItem
      */
     Q_PROPERTY(KWin::Window *client READ client WRITE setClient NOTIFY clientChanged)
 
+    /*!
+     * \qmlproperty int WindowThumbnail::plasmaFusionThumbnailSourceLifecycleVersion
+     *
+     * The version of the thumbnail source lifecycle handling this compositor provides.
+     */
+    Q_PROPERTY(int plasmaFusionThumbnailSourceLifecycleVersion READ plasmaFusionThumbnailSourceLifecycleVersion CONSTANT)
+
 public:
     explicit WindowThumbnailItem(QQuickItem *parent = nullptr);
     ~WindowThumbnailItem() override;
@@ -91,6 +98,19 @@ public:
 
     Window *client() const;
     void setClient(Window *client);
+
+    /*!
+     * Returns the version of the thumbnail source lifecycle handling that this
+     * compositor provides, with 0 meaning none.
+     *
+     * Version 1 denotes that recreating an expired weak thumbnail source adds
+     * no further cache-cleanup connections for its (view, client) pair, that
+     * destroying either endpoint removes the pair's cache entry and
+     * disconnects the remaining cleanup callback, and that the cache holds
+     * only weak references. The value is available before a client is
+     * assigned.
+     */
+    int plasmaFusionThumbnailSourceLifecycleVersion() const;
 
     QSGTextureProvider *textureProvider() const override;
     bool isTextureProvider() const override;
