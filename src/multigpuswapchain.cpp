@@ -169,18 +169,18 @@ static std::optional<CopyRet> createCopy(RenderDevice *device,
     // use Vulkan if possible.
     // NOTE that using Vulkan to copy from an Nvidia GPU to a dmabuf in system memory
     // causes glitches due to a driver bug, so that path is disabled by default for now
-    if (device->vulkanDevice() && s_allowVulkanCopy.value_or(!device->isNvidia() || (targetType == BufferType::SystemMemory && !hostAllocator))) {
+    if (device->vulkanDevice() && s_allowVulkanCopy.value_or(!device->isNvidia() || targetType != BufferType::SystemMemory || hostAllocator)) {
         auto retModifiers = device->vulkanDevice()->transferFormats()[sourceFormat].intersected(sourceModifiers);
         if (!retModifiers.empty()) {
             const auto fmt = chooseFormat(sourceFormat, device->vulkanDevice()->transferFormats(), formats);
             if (fmt) {
+                options.format = fmt->format;
                 if (s_forceLinear.value_or(device->drmDevice() && device->drmDevice()->isAmdgpu() && allocator == device->allocator())
                     && fmt->modifiers.contains(DRM_FORMAT_MOD_LINEAR)) {
                     options.modifiers = {DRM_FORMAT_MOD_LINEAR};
                 } else {
-                    options.format = fmt->format;
+                    options.modifiers = fmt->modifiers;
                 }
-                options.modifiers = fmt->modifiers;
                 options.render = false;
                 auto swapchain = Swapchain::create(allocator, options);
                 if (swapchain) {
