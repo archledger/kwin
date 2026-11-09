@@ -192,6 +192,13 @@ class KWIN_EXPORT QuickSceneEffect : public Effect
      */
     Q_PROPERTY(QQmlComponent *delegate READ delegate WRITE setDelegate NOTIFY delegateChanged)
 
+    /*!
+     * \qmlproperty int QuickSceneEffect::plasmaFusionOffscreenOpacityVersion
+     *
+     * The version of the offscreen view opacity handling this compositor provides.
+     */
+    Q_PROPERTY(int plasmaFusionOffscreenOpacityVersion READ plasmaFusionOffscreenOpacityVersion CONSTANT)
+
 public:
     /*!
      * Constructs a QtQuick scene effect with the given \a parent.
@@ -214,6 +221,17 @@ public:
      * last time.
      */
     QuickSceneView *activeView() const;
+
+    /*!
+     * Returns the version of the offscreen view opacity handling that this compositor
+     * provides, with 0 meaning none.
+     *
+     * Version 1 denotes that OffscreenQuickView::setOpacity() is propagated to the
+     * compositor-side item and that the item reports no opaque region while its
+     * opacity is not 1 or the view has an alpha channel. The value is available as
+     * soon as the effect is constructed, before any scene view is created.
+     */
+    int plasmaFusionOffscreenOpacityVersion() const;
 
     /*!
      * \qmlmethod SceneView QuickSceneEffect::viewForScreen(LogicalOutput screen)
