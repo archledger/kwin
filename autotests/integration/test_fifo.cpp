@@ -10,8 +10,12 @@
 #include "core/output.h"
 #include "core/outputbackend.h"
 #include "core/outputconfiguration.h"
+#include "core/renderbackend.h"
+#include "core/renderloop.h"
 #include "outputconfigurationstore.h"
 #include "pointer_input.h"
+#include "scene/item.h"
+#include "scene/workspacescene.h"
 #include "tiles/tilemanager.h"
 #include "wayland/surface.h"
 #include "wayland_server.h"
@@ -40,6 +44,9 @@ private Q_SLOTS:
 
     void testFifo_data();
     void testFifo();
+    void testFifoOnMixedRefreshOutputs_data();
+    void testFifoOnMixedRefreshOutputs();
+    void testFifoIgnoresCaptureViews();
     void testFifoInitiallyHidden();
     void testFifoBarriersOnly();
     void testFifoWaitOnly();
@@ -90,6 +97,23 @@ public:
         const uint64_t seconds = time / 1s;
         const uint64_t nanos = (time - std::chrono::seconds(seconds)).count();
         set_timestamp(seconds >> 32, seconds & 0xFFFFFFFF, nanos);
+    }
+};
+
+// Mimics a screencast capture view: same logical output as a real one, an
+// arbitrary (higher) refresh rate, but no backend output and a viewport of
+// its own; the compositor's frame clock never drives it.
+class CaptureOnlyView : public SceneView
+{
+public:
+    CaptureOnlyView(Scene *scene, LogicalOutput *output)
+        : SceneView(scene, output, nullptr, nullptr, nullptr)
+    {
+    }
+
+    uint refreshRate() const override
+    {
+        return 240'000;
     }
 };
 
@@ -225,6 +249,176 @@ void FifoTest::testFifo()
             QCOMPARE_LT(diff, targetRefreshDuration * 2);
         }
     }
+}
+
+void FifoTest::testFifoOnMixedRefreshOutputs_data()
+{
+    QTest::addColumn<int>("windowX");
+    QTest::addColumn<int>("centerOutput");
+    QTest::addRow("center-on-60Hz") << 125 << 0;
+    QTest::addRow("center-on-144Hz") << 175 << 1;
+}
+
+void FifoTest::testFifoOnMixedRefreshOutputs()
+{
+    QFETCH(int, windowX);
+    QFETCH(int, centerOutput);
+    Test::setOutputConfig({
+        Test::OutputInfo{
+            .geometry = Rect(0, 0, 200, 200),
+            .modes = {OutputModeline(QSize(200, 200), 60'000, OutputModeline::Flag::Preferred)},
+        },
+        Test::OutputInfo{
+            .geometry = Rect(200, 0, 200, 200),
+            .modes = {OutputModeline(QSize(200, 200), 144'000, OutputModeline::Flag::Preferred)},
+        },
+    });
+    const auto outputs = workspace()->outputs();
+    QCOMPARE(outputs.size(), 2);
+    QCOMPARE(outputs[0]->refreshRate(), 60'000u);
+    QCOMPARE(outputs[1]->refreshRate(), 144'000u);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    window->move(QPoint(windowX, 75));
+    QCOMPARE(workspace()->outputAt(window->frameGeometry().center()), outputs[centerOutput]);
+    QVERIFY(window->frameGeometry().intersects(outputs[0]->geometry()));
+    QVERIFY(window->frameGeometry().intersects(outputs[1]->geometry()));
+    auto scene = kwinApp()->scene();
+    const auto views = scene->sceneViews();
+    QCOMPARE(views.size(), 2);
+    scene->addRepaintFull();
+    for (auto view : views) {
+        QTRY_COMPARE(view->refreshRate(), view->logicalOutput()->refreshRate());
+    }
+    auto fifo = std::make_unique<FifoV1Surface>(Test::fifoManager()->get_fifo(*surface));
+    auto timer = std::make_unique<CommitTimerV1>(Test::connection()->commitTiming->get_timer(*surface));
+    auto firstFrame = std::make_unique<Test::WpPresentationFeedback>(Test::presentationTime()->feedback(*surface));
+    QSignalSpy firstPresented(firstFrame.get(), &Test::WpPresentationFeedback::presented);
+    QSignalSpy firstDiscarded(firstFrame.get(), &Test::WpPresentationFeedback::discarded);
+    QSignalSpy committed(window->surface(), &SurfaceInterface::committed);
+
+    // Keep real-time rendering and the fallback timer from applying either commit.
+    // Both are due at the same synthetic presentation time, so only FIFO separates them.
+    const auto target = std::chrono::steady_clock::now().time_since_epoch() + 1h;
+    fifo->set_barrier();
+    fifo->wait_barrier();
+    timer->setTimestamp(target);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    auto secondFrame = std::make_unique<Test::WpPresentationFeedback>(Test::presentationTime()->feedback(*surface));
+    QSignalSpy secondPresented(secondFrame.get(), &Test::WpPresentationFeedback::presented);
+    QSignalSpy secondDiscarded(secondFrame.get(), &Test::WpPresentationFeedback::discarded);
+    fifo->set_barrier();
+    fifo->wait_barrier();
+    timer->setTimestamp(target);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(committed.count(), 0);
+    QVERIFY(window->surface()->firstTransaction());
+    // The refresh reported with the feedback is the one of the view that drove
+    // the presentation: only the center output's traversal reaches the item.
+    const auto refreshDuration = std::chrono::nanoseconds(1'000'000'000'000 / outputs[centerOutput]->refreshRate());
+    RenderLoop renderLoop(nullptr);
+    for (int i = 0; i < 2; ++i) {
+        const auto timestamp = target + i * refreshDuration;
+        // Use the same item-tree dispatch as WorkspaceScene::prePaint().
+        // Calling the surface item directly would bypass the output filter.
+        for (auto view : views) {
+            scene->containerItem()->prepareFrame(view, view->logicalOutput(), timestamp);
+        }
+        QCOMPARE(committed.count(), i + 1);
+        QVERIFY(window->surface()->hasFifoBarrier());
+        for (auto view : views) {
+            renderLoop.prepareNewFrame();
+            OutputFrame frame(&renderLoop, std::chrono::nanoseconds(1'000'000'000'000 / view->refreshRate()));
+            scene->frame(view, &frame);
+            renderLoop.newFramePrepared();
+            frame.presented(timestamp, PresentationMode::VSync);
+        }
+        QVERIFY(!window->surface()->hasFifoBarrier());
+        QCOMPARE(committed.count(), i + 1);
+    }
+    QVERIFY(!window->surface()->firstTransaction());
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(firstPresented.count(), 1);
+    QCOMPARE(secondPresented.count(), 1);
+    QCOMPARE(firstDiscarded.count(), 0);
+    QCOMPARE(secondDiscarded.count(), 0);
+    QCOMPARE(firstPresented[0][0].value<std::chrono::nanoseconds>(), target);
+    QCOMPARE(secondPresented[0][0].value<std::chrono::nanoseconds>(), target + refreshDuration);
+    QCOMPARE(firstPresented[0][1].value<std::chrono::nanoseconds>(), refreshDuration);
+    QCOMPARE(secondPresented[0][1].value<std::chrono::nanoseconds>(), refreshDuration);
+}
+
+void FifoTest::testFifoIgnoresCaptureViews()
+{
+    Test::setOutputConfig({
+        Test::OutputInfo{
+            .geometry = Rect(0, 0, 200, 200),
+            .modes = {OutputModeline(QSize(200, 200), 60'000, OutputModeline::Flag::Preferred)},
+        },
+    });
+    const auto outputs = workspace()->outputs();
+    QCOMPARE(outputs.size(), 1);
+    auto scene = kwinApp()->scene();
+    SceneView *realView = nullptr;
+    for (auto view : scene->sceneViews()) {
+        if (view->backendOutput()) {
+            realView = view;
+        }
+    }
+    QVERIFY(realView);
+    QCOMPARE(realView->logicalOutput(), outputs[0]);
+    scene->addRepaintFull();
+    QTRY_COMPARE(realView->refreshRate(), outputs[0]->refreshRate());
+
+    // The capture region does not intersect the window under test.
+    CaptureOnlyView captureView(scene, outputs[0]);
+    captureView.setViewport(RectF(150, 150, 50, 50));
+
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    window->move(QPoint(25, 75));
+    QCOMPARE(workspace()->outputAt(window->frameGeometry().center()), outputs[0]);
+    QVERIFY(!captureView.viewport().intersects(window->frameGeometry()));
+
+    auto fifo = std::make_unique<FifoV1Surface>(Test::fifoManager()->get_fifo(*surface));
+    auto timer = std::make_unique<CommitTimerV1>(Test::connection()->commitTiming->get_timer(*surface));
+    auto frame = std::make_unique<Test::WpPresentationFeedback>(Test::presentationTime()->feedback(*surface));
+    QSignalSpy presented(frame.get(), &Test::WpPresentationFeedback::presented);
+    QSignalSpy discarded(frame.get(), &Test::WpPresentationFeedback::discarded);
+    QSignalSpy committed(window->surface(), &SurfaceInterface::committed);
+
+    const auto target = std::chrono::steady_clock::now().time_since_epoch() + 1h;
+    fifo->set_barrier();
+    fifo->wait_barrier();
+    timer->setTimestamp(target);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(committed.count(), 0);
+    QVERIFY(window->surface()->firstTransaction());
+
+    // Only the compositor's own view drives frame dispatch; a capture view is
+    // never presented by the compositor.
+    scene->containerItem()->prepareFrame(realView, realView->logicalOutput(), target);
+    QCOMPARE(committed.count(), 1);
+    QVERIFY(window->surface()->hasFifoBarrier());
+    RenderLoop renderLoop(nullptr);
+    renderLoop.prepareNewFrame();
+    OutputFrame outputFrame(&renderLoop, std::chrono::nanoseconds(1'000'000'000'000 / realView->refreshRate()));
+    scene->frame(realView, &outputFrame);
+    renderLoop.newFramePrepared();
+    outputFrame.presented(target, PresentationMode::VSync);
+    QVERIFY(!window->surface()->hasFifoBarrier());
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(presented.count(), 1);
+    QCOMPARE(discarded.count(), 0);
+    QCOMPARE(presented[0][0].value<std::chrono::nanoseconds>(), target);
+    QCOMPARE(presented[0][1].value<std::chrono::nanoseconds>(),
+             std::chrono::nanoseconds(1'000'000'000'000 / outputs[0]->refreshRate()));
 }
 
 void FifoTest::testFifoInitiallyHidden()

@@ -110,7 +110,9 @@ jobs:
       - name: Build and run the suites
         env:
           MEMCHECK: ${{ (github.event_name == 'schedule' || inputs.memcheck) && '1' || '0' }}
-        run: .github/ci/suites.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/ci"
+        run: |
+          python3 -m unittest discover -s .github/ci -p 'test_*.py'
+          .github/ci/suites.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/ci"
 
       - name: Summary
         if: always()

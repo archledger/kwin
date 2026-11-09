@@ -102,6 +102,8 @@ function(integrationTest)
 endfunction()
 
 integrationTest(NAME testStartupDefaults SRCS startup_defaults_test.cpp LIBS KF6::ConfigCore)
+integrationTest(NAME testHangDetectorShutdown SRCS hang_detector_shutdown_test.cpp
+    PROPERTIES TIMEOUT 60)
 
 if(KWIN_BUILD_X11)
     integrationTest(NAME testDontCrashGlxgears SRCS dont_crash_glxgears.cpp LIBS KF6::I18n KDecoration3::KDecoration)
