@@ -36,9 +36,6 @@ REQUIRED = {
         "HangDetectorShutdown",
     )
 } | {"kwayland-testWaylandSurface"}
-TOTALS = re.compile(
-    r"Totals: (\d+) passed, (\d+) failed, (\d+) skipped, (\d+) blacklisted"
-)
 
 
 class ValidationError(ValueError):
@@ -82,27 +79,46 @@ def validate(
         raise ValidationError(
             "JUnit does not contain every required suite exactly once"
         )
-    passed = 0
     for case in cases:
         if case.get("status") != "run" or any(
             case.find(tag) is not None for tag in ("failure", "error", "skipped")
         ):
             raise ValidationError("Required CTest suite failed or did not run")
-        output = case.findtext("system-out", "")
-        totals = TOTALS.findall(output)
-        if not totals:
-            raise ValidationError("Required suite has no QTest result")
-        success, failed, skipped, blacklisted = map(int, totals[-1])
+    # ctest -V prefixes every line of a test's output with its test number, and
+    # the JUnit system-out only carries the loader trace, so the per-suite QTest
+    # results are parsed from the console log instead.
+    start = re.compile(r"^\s*Start\s+(\d+): (\S+)", re.MULTILINE)
+    numbers = {int(number): name for number, name in start.findall(console)}
+    if not numbers:
+        raise ValidationError("Console log has no test start markers")
+    duplicate_names = len(numbers) != len(set(numbers.values()))
+    if duplicate_names or set(numbers.values()) != set(expected):
+        raise ValidationError("Console log does not cover every required suite")
+    per_suite: dict[str, list[tuple[int, ...]]] = {name: [] for name in expected}
+    prefixed = re.compile(
+        r"^(\d+): Totals: (\d+) passed, (\d+) failed, (\d+) skipped, (\d+) blacklisted",
+        re.MULTILINE,
+    )
+    for number, *counts in prefixed.findall(console):
+        name = numbers.get(int(number))
+        if name in per_suite:
+            per_suite[name].append(tuple(int(value) for value in counts))
+    passed = 0
+    failed_attempts = 0
+    for name, attempts in per_suite.items():
+        if not attempts:
+            raise ValidationError(f"Required suite {name} has no QTest result")
+        failed_attempts += sum(row[1] != 0 for row in attempts)
+        if any(row[2] or row[3] for row in attempts):
+            raise ValidationError(
+                f"Required suite {name} skipped or blacklisted cases in an attempt"
+            )
+        success, failed, skipped, blacklisted = attempts[-1]
         if not success or failed or skipped or blacklisted:
             raise ValidationError(
-                "Required QTest cases failed, skipped or were blacklisted"
+                f"Required suite {name} ended with failed, skipped or blacklisted cases"
             )
         passed += success
-    attempts = [tuple(map(int, row)) for row in TOTALS.findall(console)]
-    if not attempts or any(row[2] or row[3] for row in attempts):
-        raise ValidationError(
-            "Missing QTest log or skipped/blacklisted cases in an attempt"
-        )
     if "calling init: /build/bin/libkwin.so" not in libkwin_init:
         raise ValidationError("Built libkwin was not loaded by the test suites")
     if re.search(r"calling init: /usr/lib(64)?/libkwin\.so", libkwin_init):
@@ -110,7 +126,7 @@ def validate(
     return {
         "suites": len(cases),
         "passed": passed,
-        "failed_qtest_attempts": sum(row[1] != 0 for row in attempts),
+        "failed_qtest_attempts": failed_attempts,
     }
 
 
