@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Prepare a signed KWin stable-update pull request
+OnFailure=kwin-upstream-publisher-failure.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -Es %h/.local/lib/kwin-upstream-publisher/publisher.py --publish
+WorkingDirectory=%h
+Environment=KWIN_PUBLISHER_SERVICE=1
+UMask=0077
+TimeoutStartSec=20min
+NoNewPrivileges=yes
+MemoryMax=1G
+CPUQuota=200%
+Nice=10

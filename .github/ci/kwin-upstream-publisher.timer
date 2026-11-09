@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Weekly KWin stable-update proposals
+
+[Timer]
+OnCalendar=Mon *-*-* 03:10:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=kwin-upstream-publisher.service
+
+[Install]
+WantedBy=timers.target
