@@ -10,6 +10,7 @@
 
 #include "core/output.h"
 #include "cursor.h"
+#include "options.h"
 #include "placement.h"
 #include "pointer_input.h"
 #include "scene/windowitem.h"
@@ -23,6 +24,8 @@
 #include <KWayland/Client/pointer.h>
 #include <KWayland/Client/seat.h>
 #include <KWayland/Client/surface.h>
+
+#include <QScopeGuard>
 
 #include <linux/input.h>
 
@@ -47,6 +50,8 @@ private Q_SLOTS:
     void testPackAgainstClient();
     void testGrowShrink_data();
     void testGrowShrink();
+    void testPointerMoveResizeEnd_data();
+    void testPointerMoveResizeEnd();
     void testClientSideMove();
     void testResizeForVirtualKeyboard_data();
     void testResizeForVirtualKeyboard();
@@ -440,6 +445,108 @@ void MoveResizeWindowTest::testGrowShrink()
     m_connection->flush();
     QVERIFY(frameGeometryChangedSpy.wait());
     QTEST(window->frameGeometry(), "expectedGeometry");
+}
+
+void MoveResizeWindowTest::testPointerMoveResizeEnd_data()
+{
+    QTest::addColumn<bool>("resize");
+    QTest::addColumn<int>("initiatingButton");
+    QTest::addColumn<int>("additionalButton");
+    QTest::addColumn<bool>("releaseInitiatorFirst");
+
+    for (bool resize : {false, true}) {
+        for (int initiatingButton : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}) {
+            for (int additionalButton = BTN_LEFT; additionalButton < BTN_JOYSTICK; additionalButton++) {
+                if (additionalButton == initiatingButton) {
+                    continue;
+                }
+                for (bool releaseInitiatorFirst : {false, true}) {
+                    QTest::addRow("%s-%x-%x-%s", resize ? "resize" : "move", initiatingButton, additionalButton,
+                                  releaseInitiatorFirst ? "initiator-first" : "additional-first")
+                        << resize << initiatingButton << additionalButton << releaseInitiatorFirst;
+                }
+            }
+        }
+    }
+}
+
+void MoveResizeWindowTest::testPointerMoveResizeEnd()
+{
+    QFETCH(bool, resize);
+    QFETCH(int, initiatingButton);
+    QFETCH(int, additionalButton);
+    QFETCH(bool, releaseInitiatorFirst);
+
+    const auto oldCommand1 = options->commandAll1();
+    const auto oldCommand2 = options->commandAll2();
+    const auto oldCommand3 = options->commandAll3();
+    const auto oldModifier = options->keyCmdAllModKey();
+    const auto restoreOptions = qScopeGuard([&]() {
+        options->setCommandAll1(oldCommand1);
+        options->setCommandAll2(oldCommand2);
+        options->setCommandAll3(oldCommand3);
+        options->setKeyCmdAllModKey(oldModifier);
+    });
+    const auto command = resize ? Options::MouseUnrestrictedResize : Options::MouseUnrestrictedMove;
+    options->setCommandAll1(command);
+    options->setCommandAll2(command);
+    options->setCommandAll3(command);
+    options->setKeyCmdAllModKey(Qt::Key_Meta);
+
+    auto [window, surface, shellSurface] = showWindow();
+    QVERIFY(window);
+    const auto isInteractive = [window]() {
+        return window->isInteractiveMove() || window->isInteractiveResize();
+    };
+    input()->pointer()->warp(window->frameGeometry().center());
+    QSignalSpy finishedSpy(window, &Window::interactiveMoveResizeFinished);
+    quint32 timestamp = 1;
+    bool initiatingHeld = false;
+    bool additionalHeld = false;
+    bool modifierHeld = false;
+    const auto releaseInput = qScopeGuard([&]() {
+        if (additionalHeld) {
+            Test::pointerButtonReleased(additionalButton, timestamp++);
+        }
+        if (initiatingHeld) {
+            Test::pointerButtonReleased(initiatingButton, timestamp++);
+        }
+        if (modifierHeld) {
+            Test::keyboardKeyReleased(KEY_LEFTMETA, timestamp++);
+        }
+        if (isInteractive()) {
+            window->endInteractiveMoveResize();
+        }
+    });
+
+    Test::keyboardKeyPressed(KEY_LEFTMETA, timestamp++);
+    modifierHeld = true;
+    Test::pointerButtonPressed(initiatingButton, timestamp++);
+    initiatingHeld = true;
+    QCOMPARE(window->isInteractiveResize(), resize);
+    QCOMPARE(window->isInteractiveMove(), !resize);
+    Test::keyboardKeyReleased(KEY_LEFTMETA, timestamp++);
+    modifierHeld = false;
+    Test::pointerButtonPressed(additionalButton, timestamp++);
+    additionalHeld = true;
+    QVERIFY(isInteractive());
+
+    if (releaseInitiatorFirst) {
+        Test::pointerButtonReleased(initiatingButton, timestamp++);
+        initiatingHeld = false;
+        const bool primaryButtonRemaining = additionalButton == BTN_LEFT || additionalButton == BTN_RIGHT || additionalButton == BTN_MIDDLE;
+        QCOMPARE(isInteractive(), primaryButtonRemaining);
+        Test::pointerButtonReleased(additionalButton, timestamp++);
+        additionalHeld = false;
+    } else {
+        Test::pointerButtonReleased(additionalButton, timestamp++);
+        additionalHeld = false;
+        QVERIFY(isInteractive());
+        Test::pointerButtonReleased(initiatingButton, timestamp++);
+        initiatingHeld = false;
+    }
+    QVERIFY(!isInteractive());
+    QCOMPARE(finishedSpy.count(), 1);
 }
 
 void MoveResizeWindowTest::testClientSideMove()
