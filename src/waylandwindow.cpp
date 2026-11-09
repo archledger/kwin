@@ -158,8 +158,7 @@ void WaylandWindow::updateClientOutputs()
         return;
     }
 
-    surface()->setOutputs(waylandServer()->display()->outputsIntersecting(rect),
-                          waylandServer()->display()->largestIntersectingOutput(rect));
+    surface()->setOutputs(waylandServer()->display()->outputsIntersecting(rect));
 }
 
 void WaylandWindow::updateResourceName()

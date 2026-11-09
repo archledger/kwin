@@ -19,8 +19,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: kwin\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2026-10-24 02:54+0000\n"
-"PO-Revision-Date: 2026-09-03 06:36-0300\n"
+"POT-Creation-Date: 2026-11-04 03:16+0000\n"
+"PO-Revision-Date: 2026-10-31 12:34-0300\n"
 "Last-Translator: Marcus Gama <marcus.gama@gmail.com>\n"
 "Language-Team: Portuguese <kde-i18n-pt_BR@kde.org>\n"
 "Language: pt_BR\n"
@@ -28,7 +28,7 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n > 1);\n"
-"X-Generator: Lokalize 26.08.0\n"
+"X-Generator: Lokalize 26.08.2\n"
 
 #, kde-format
 msgctxt "NAME OF TRANSLATORS"
@@ -1424,7 +1424,7 @@ msgid ""
 msgstr ""
 "<para>\"%1\" de <application>%2</application> não está respondendo. Deseja "
 "encerrar este aplicativo?</para><para><emphasis strong='true'>Encerrar este "
-"aplicativo fechará todas as suas janelas.Todos os dados não salvos serão "
+"aplicativo fechará todas as suas janelas. Todos os dados não salvos serão "
 "perdidos.</emphasis></para>"
 
 #: helpers/killer/killdialog.cpp:66
@@ -1523,7 +1523,7 @@ msgstr ""
 "Selecione a janela para forçar o fechamento com clique esquerdo ou Enter. \n"
 "ESC ou clique direito para cancelar."
 
-#: main.cpp:140 plugins/mouseclick/mouseclick_config.cpp:40
+#: main.cpp:178 plugins/mouseclick/mouseclick_config.cpp:40
 #: plugins/mousemark/mousemark_config.cpp:43
 #: plugins/overview/kcm/overvieweffectkcm.cpp:35
 #: plugins/thumbnailaside/thumbnailaside_config.cpp:46
@@ -1534,57 +1534,57 @@ msgstr ""
 msgid "KWin"
 msgstr "KWin"
 
-#: main.cpp:142 main.cpp:160
+#: main.cpp:180 main.cpp:198
 #, kde-format
 msgid "KDE window manager"
 msgstr "Gerenciador de janelas do KDE"
 
-#: main.cpp:144
+#: main.cpp:182
 #, kde-format
 msgid "(c) 1999-2019, The KDE Developers"
 msgstr "(c) 1999-2019, Os desenvolvedores do KDE"
 
-#: main.cpp:146
+#: main.cpp:184
 #, kde-format
 msgid "Matthias Ettrich"
 msgstr "Matthias Ettrich"
 
-#: main.cpp:147
+#: main.cpp:185
 #, kde-format
 msgid "Cristian Tibirna"
 msgstr "Cristian Tibirna"
 
-#: main.cpp:148
+#: main.cpp:186
 #, kde-format
 msgid "Daniel M. Duley"
 msgstr "Daniel M. Duley"
 
-#: main.cpp:149
+#: main.cpp:187
 #, kde-format
 msgid "Luboš Luňák"
 msgstr "Luboš Luňák"
 
-#: main.cpp:150
+#: main.cpp:188
 #, kde-format
 msgid "Martin Flöser"
 msgstr "Martin Flöser"
 
-#: main.cpp:151
+#: main.cpp:189
 #, kde-format
 msgid "David Edmundson"
 msgstr "David Edmundson"
 
-#: main.cpp:152
+#: main.cpp:190
 #, kde-format
 msgid "Roman Gilg"
 msgstr "Roman Gilg"
 
-#: main.cpp:153
+#: main.cpp:191
 #, kde-format
 msgid "Vlad Zahorodnii"
 msgstr "Vlad Zahorodnii"
 
-#: main.cpp:154
+#: main.cpp:192
 #, kde-format
 msgid "Xaver Hugl"
 msgstr "Xaver Hugl"
@@ -1713,7 +1713,7 @@ msgstr "Método de entrada que o KWin inicia."
 msgid "Starts the session in locked mode."
 msgstr "Inicia a sessão em modo bloqueado."
 
-#: main_wayland.cpp:453
+#: main_wayland.cpp:454
 #, kde-format
 msgid "Starts the session without lock screen support."
 msgstr "Inicia a sessão sem suporte a bloqueio de tela."
@@ -1723,17 +1723,17 @@ msgstr "Inicia a sessão sem suporte a bloqueio de tela."
 msgid "Starts the session without global shortcuts support."
 msgstr "Inicia a sessão sem suporte para os atalhos globais."
 
-#: main_wayland.cpp:463
+#: main_wayland.cpp:462
 #, kde-format
 msgid "Disable KActivities integration."
 msgstr "Desativar a integração com o KActivities."
 
-#: main_wayland.cpp:468
+#: main_wayland.cpp:466
 #, kde-format
 msgid "Exit after the session application, which is started by KWin, closed."
 msgstr "Sair após fechar o aplicativo de sessões iniciado pelo KWin."
 
-#: main_wayland.cpp:473
+#: main_wayland.cpp:471
 #, kde-format
 msgid "Applications to start once Wayland and Xwayland server are started"
 msgstr ""
@@ -1906,10 +1906,10 @@ msgid ""
 "revoke this permission later on <application>System Settings</application>’ "
 "“Legacy X11 App Support” page."
 msgstr ""
-"Não é possível verificar a identidade de aplicativos X11 legados. Qualquer "
-"aplicativo que se declare como <application>%1</application> poderá "
+"Não é possível verificar a identidade de aplicativos legados do X11. "
+"Qualquer aplicativo que se declare como <application>%1</application> poderá "
 "controlar dispositivos de entrada. Você pode revogar essa permissão "
-"posteriormente na página \"Suporte a aplicativos X11 legados\" das "
+"posteriormente na página \"Suporte a aplicativos legados do X11\" das "
 "<application>Configurações do Sistema</application>."
 
 #: plugins/eis/eisprompter.cpp:69
@@ -4408,30 +4408,30 @@ msgctxt "Application is not responding, appended to window title"
 msgid "(Not Responding)"
 msgstr "(não está respondendo)"
 
-#: workspace.cpp:1339
+#: workspace.cpp:1348
 #, kde-format
 msgid "Built-in Screen"
 msgstr "Tela embutida"
 
-#: workspace.cpp:1352
+#: workspace.cpp:1361
 #, kde-format
 msgctxt "Display label: manufacturer + model name + connector name"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1362
+#: workspace.cpp:1371
 #, kde-format
 msgctxt "Display label: manufacturer + model name + serial number"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1365
+#: workspace.cpp:1374
 #, kde-format
 msgctxt "Display label: manufacturer + model name"
 msgid "%1 %2"
 msgstr "%1 %2"
 
-#: workspace.cpp:1834
+#: workspace.cpp:1843
 #, kde-format
 msgctxt "Introductory text shown in the support information."
 msgid ""

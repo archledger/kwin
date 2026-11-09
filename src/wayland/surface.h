@@ -135,7 +135,7 @@ public:
     void frameRendered(quint32 msec);
     bool hasFrameCallbacks() const;
 
-    std::shared_ptr<PresentationFeedback> presentationFeedback(LogicalOutput *output);
+    std::shared_ptr<PresentationFeedback> presentationFeedback();
     bool hasPresentationFeedback() const;
 
     RegionF opaque() const;
@@ -243,7 +243,7 @@ public:
      *
      * @see outputs
      */
-    void setOutputs(const QList<OutputInterface *> &outputs, OutputInterface *primaryOutput);
+    void setOutputs(const QList<OutputInterface *> &outputs);
 
     /**
      * @returns All OutputInterfaces the SurfaceInterface is on.

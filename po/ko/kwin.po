@@ -9,7 +9,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: kwin\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2026-10-24 02:54+0000\n"
+"POT-Creation-Date: 2026-11-04 03:16+0000\n"
 "PO-Revision-Date: 2026-10-05 21:52+0200\n"
 "Last-Translator: Shinjo Park <kde@peremen.name>\n"
 "Language-Team: Korean <kde-kr@kde.org>\n"
@@ -1496,7 +1496,7 @@ msgstr ""
 "왼쪽 단추를 누르거나 Enter 키를 눌러서 강제로 닫을 창을 선택합니다.\n"
 "Esc 키나 오른쪽 단추를 클릭하면 취소합니다."
 
-#: main.cpp:140 plugins/mouseclick/mouseclick_config.cpp:40
+#: main.cpp:178 plugins/mouseclick/mouseclick_config.cpp:40
 #: plugins/mousemark/mousemark_config.cpp:43
 #: plugins/overview/kcm/overvieweffectkcm.cpp:35
 #: plugins/thumbnailaside/thumbnailaside_config.cpp:46
@@ -1507,57 +1507,57 @@ msgstr ""
 msgid "KWin"
 msgstr "KWin"
 
-#: main.cpp:142 main.cpp:160
+#: main.cpp:180 main.cpp:198
 #, kde-format
 msgid "KDE window manager"
 msgstr "KDE 창 관리자"
 
-#: main.cpp:144
+#: main.cpp:182
 #, kde-format
 msgid "(c) 1999-2019, The KDE Developers"
 msgstr "(c) 1999-2019, The KDE Developers"
 
-#: main.cpp:146
+#: main.cpp:184
 #, kde-format
 msgid "Matthias Ettrich"
 msgstr "Matthias Ettrich"
 
-#: main.cpp:147
+#: main.cpp:185
 #, kde-format
 msgid "Cristian Tibirna"
 msgstr "Cristian Tibirna"
 
-#: main.cpp:148
+#: main.cpp:186
 #, kde-format
 msgid "Daniel M. Duley"
 msgstr "Daniel M. Duley"
 
-#: main.cpp:149
+#: main.cpp:187
 #, kde-format
 msgid "Luboš Luňák"
 msgstr "Luboš Luňák"
 
-#: main.cpp:150
+#: main.cpp:188
 #, kde-format
 msgid "Martin Flöser"
 msgstr "Martin Flöser"
 
-#: main.cpp:151
+#: main.cpp:189
 #, kde-format
 msgid "David Edmundson"
 msgstr "David Edmundson"
 
-#: main.cpp:152
+#: main.cpp:190
 #, kde-format
 msgid "Roman Gilg"
 msgstr "Roman Gilg"
 
-#: main.cpp:153
+#: main.cpp:191
 #, kde-format
 msgid "Vlad Zahorodnii"
 msgstr "Vlad Zahorodnii"
 
-#: main.cpp:154
+#: main.cpp:192
 #, kde-format
 msgid "Xaver Hugl"
 msgstr "Xaver Hugl"
@@ -1678,7 +1678,7 @@ msgstr "KWin에서 불러오는 입력기입니다."
 msgid "Starts the session in locked mode."
 msgstr "세션을 잠긴 상태로 시작합니다."
 
-#: main_wayland.cpp:453
+#: main_wayland.cpp:454
 #, kde-format
 msgid "Starts the session without lock screen support."
 msgstr "잠금 화면 지원 없이 세션을 시작합니다."
@@ -1688,17 +1688,17 @@ msgstr "잠금 화면 지원 없이 세션을 시작합니다."
 msgid "Starts the session without global shortcuts support."
 msgstr "전역 단축키 지원 없이 세션을 시작합니다."
 
-#: main_wayland.cpp:463
+#: main_wayland.cpp:462
 #, kde-format
 msgid "Disable KActivities integration."
 msgstr "KActivities 통합을 사용하지 않습니다."
 
-#: main_wayland.cpp:468
+#: main_wayland.cpp:466
 #, kde-format
 msgid "Exit after the session application, which is started by KWin, closed."
 msgstr "KWin에서 시작한 세션 앱이 끝난 후에 닫습니다."
 
-#: main_wayland.cpp:473
+#: main_wayland.cpp:471
 #, kde-format
 msgid "Applications to start once Wayland and Xwayland server are started"
 msgstr "Wayland 및 Xwayland 서버가 시작되었을 때 시작할 앱"
@@ -4348,30 +4348,30 @@ msgctxt "Application is not responding, appended to window title"
 msgid "(Not Responding)"
 msgstr "(응답 없음)"
 
-#: workspace.cpp:1339
+#: workspace.cpp:1348
 #, kde-format
 msgid "Built-in Screen"
 msgstr "내장 화면"
 
-#: workspace.cpp:1352
+#: workspace.cpp:1361
 #, kde-format
 msgctxt "Display label: manufacturer + model name + connector name"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1362
+#: workspace.cpp:1371
 #, kde-format
 msgctxt "Display label: manufacturer + model name + serial number"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1365
+#: workspace.cpp:1374
 #, kde-format
 msgctxt "Display label: manufacturer + model name"
 msgid "%1 %2"
 msgstr "%1 %2"
 
-#: workspace.cpp:1834
+#: workspace.cpp:1843
 #, kde-format
 msgctxt "Introductory text shown in the support information."
 msgid ""

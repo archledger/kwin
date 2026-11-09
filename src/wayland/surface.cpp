@@ -70,7 +70,7 @@ void SurfaceInterfacePrivate::addChild(SubSurfaceInterface *child)
         });
     }
 
-    child->surface()->setOutputs(outputs, primaryOutput);
+    child->surface()->setOutputs(outputs);
     if (preferredBufferScale.has_value()) {
         child->surface()->setPreferredBufferScale(preferredBufferScale.value());
     }
@@ -511,11 +511,8 @@ void SurfaceInterface::frameRendered(quint32 msec)
     }
 }
 
-std::shared_ptr<PresentationFeedback> SurfaceInterface::presentationFeedback(LogicalOutput *output)
+std::shared_ptr<PresentationFeedback> SurfaceInterface::presentationFeedback()
 {
-    if (output && (!d->primaryOutput || d->primaryOutput->handle() != output)) {
-        return nullptr;
-    }
     return d->current->presentationFeedback;
 }
 
@@ -971,9 +968,9 @@ QList<OutputInterface *> SurfaceInterface::outputs() const
     return d->outputs;
 }
 
-void SurfaceInterface::setOutputs(const QList<OutputInterface *> &outputs, OutputInterface *primaryOutput)
+void SurfaceInterface::setOutputs(const QList<OutputInterface *> &outputs)
 {
-    if (d->outputs == outputs && d->primaryOutput == primaryOutput) {
+    if (d->outputs == outputs) {
         return;
     }
 
@@ -1004,7 +1001,7 @@ void SurfaceInterface::setOutputs(const QList<OutputInterface *> &outputs, Outpu
         d->outputDestroyedConnections[o] = connect(o, &OutputInterface::removed, this, [this, o] {
             auto outputs = d->outputs;
             if (outputs.removeOne(o)) {
-                setOutputs(outputs, d->primaryOutput);
+                setOutputs(outputs);
             }
         });
 
@@ -1018,12 +1015,11 @@ void SurfaceInterface::setOutputs(const QList<OutputInterface *> &outputs, Outpu
     }
 
     d->outputs = outputs;
-    d->primaryOutput = primaryOutput;
     for (auto child : std::as_const(d->current->subsurface.below)) {
-        child->surface()->setOutputs(outputs, primaryOutput);
+        child->surface()->setOutputs(outputs);
     }
     for (auto child : std::as_const(d->current->subsurface.above)) {
-        child->surface()->setOutputs(outputs, primaryOutput);
+        child->surface()->setOutputs(outputs);
     }
 }
 

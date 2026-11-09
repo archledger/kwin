@@ -12,7 +12,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: kwin\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2026-10-24 02:54+0000\n"
+"POT-Creation-Date: 2026-11-04 03:16+0000\n"
 "PO-Revision-Date: 2026-10-11 15:20+0200\n"
 "Last-Translator: Josep M. Ferrer <txemaq@gmail.com>\n"
 "Language-Team: Catalan <kde-i18n-ca@kde.org>\n"
@@ -1513,7 +1513,7 @@ msgstr ""
 "retorn.\n"
 "La tecla Esc o un clic dret per a cancel·lar."
 
-#: main.cpp:140 plugins/mouseclick/mouseclick_config.cpp:40
+#: main.cpp:178 plugins/mouseclick/mouseclick_config.cpp:40
 #: plugins/mousemark/mousemark_config.cpp:43
 #: plugins/overview/kcm/overvieweffectkcm.cpp:35
 #: plugins/thumbnailaside/thumbnailaside_config.cpp:46
@@ -1524,57 +1524,57 @@ msgstr ""
 msgid "KWin"
 msgstr "KWin"
 
-#: main.cpp:142 main.cpp:160
+#: main.cpp:180 main.cpp:198
 #, kde-format
 msgid "KDE window manager"
 msgstr "El gestor de finestres del KDE"
 
-#: main.cpp:144
+#: main.cpp:182
 #, kde-format
 msgid "(c) 1999-2019, The KDE Developers"
 msgstr "(c) 1999-2019, The KDE Developers"
 
-#: main.cpp:146
+#: main.cpp:184
 #, kde-format
 msgid "Matthias Ettrich"
 msgstr "Matthias Ettrich"
 
-#: main.cpp:147
+#: main.cpp:185
 #, kde-format
 msgid "Cristian Tibirna"
 msgstr "Cristian Tibirna"
 
-#: main.cpp:148
+#: main.cpp:186
 #, kde-format
 msgid "Daniel M. Duley"
 msgstr "Daniel M. Duley"
 
-#: main.cpp:149
+#: main.cpp:187
 #, kde-format
 msgid "Luboš Luňák"
 msgstr "Luboš Luňák"
 
-#: main.cpp:150
+#: main.cpp:188
 #, kde-format
 msgid "Martin Flöser"
 msgstr "Martin Flöser"
 
-#: main.cpp:151
+#: main.cpp:189
 #, kde-format
 msgid "David Edmundson"
 msgstr "David Edmundson"
 
-#: main.cpp:152
+#: main.cpp:190
 #, kde-format
 msgid "Roman Gilg"
 msgstr "Roman Gilg"
 
-#: main.cpp:153
+#: main.cpp:191
 #, kde-format
 msgid "Vlad Zahorodnii"
 msgstr "Vlad Zahorodnii"
 
-#: main.cpp:154
+#: main.cpp:192
 #, kde-format
 msgid "Xaver Hugl"
 msgstr "Xaver Hugl"
@@ -1703,7 +1703,7 @@ msgstr "Mètode d'entrada que inicia el KWin."
 msgid "Starts the session in locked mode."
 msgstr "Inicia la sessió en mode bloquejat."
 
-#: main_wayland.cpp:453
+#: main_wayland.cpp:454
 #, kde-format
 msgid "Starts the session without lock screen support."
 msgstr "Inicia la sessió sense el suport del bloqueig de pantalla."
@@ -1713,19 +1713,19 @@ msgstr "Inicia la sessió sense el suport del bloqueig de pantalla."
 msgid "Starts the session without global shortcuts support."
 msgstr "Inicia la sessió sense el suport de les dreceres globals."
 
-#: main_wayland.cpp:463
+#: main_wayland.cpp:462
 #, kde-format
 msgid "Disable KActivities integration."
 msgstr "Desactiva la integració de les «KActivities»."
 
-#: main_wayland.cpp:468
+#: main_wayland.cpp:466
 #, kde-format
 msgid "Exit after the session application, which is started by KWin, closed."
 msgstr ""
 "Surt després de tancar l'aplicació de sessió, la qual ha estat iniciada pel "
 "KWin."
 
-#: main_wayland.cpp:473
+#: main_wayland.cpp:471
 #, kde-format
 msgid "Applications to start once Wayland and Xwayland server are started"
 msgstr ""
@@ -4406,30 +4406,30 @@ msgctxt "Application is not responding, appended to window title"
 msgid "(Not Responding)"
 msgstr "(No respon)"
 
-#: workspace.cpp:1339
+#: workspace.cpp:1348
 #, kde-format
 msgid "Built-in Screen"
 msgstr "Pantalla integrada"
 
-#: workspace.cpp:1352
+#: workspace.cpp:1361
 #, kde-format
 msgctxt "Display label: manufacturer + model name + connector name"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1362
+#: workspace.cpp:1371
 #, kde-format
 msgctxt "Display label: manufacturer + model name + serial number"
 msgid "%1 %2 %3"
 msgstr "%1 %2 %3"
 
-#: workspace.cpp:1365
+#: workspace.cpp:1374
 #, kde-format
 msgctxt "Display label: manufacturer + model name"
 msgid "%1 %2"
 msgstr "%1 %2"
 
-#: workspace.cpp:1834
+#: workspace.cpp:1843
 #, kde-format
 msgctxt "Introductory text shown in the support information."
 msgid ""
@@ -4457,91 +4457,3 @@ msgstr ""
 #, kde-format
 msgid "Xwayland has crashed"
 msgstr "L'Xwayland ha fallat"
-
-#~ msgid "OpenGL compositing is required for screencasting"
-#~ msgstr ""
-#~ "Es requereix la composició OpenGL per als vídeos de captura de pantalla"
-
-#~ msgctxt "@label"
-#~ msgid "Paint Amount"
-#~ msgstr "Quantitat del pintat"
-
-#~ msgid "Desktop effects were restarted due to a graphics reset"
-#~ msgstr ""
-#~ "Els efectes d'escriptori s'han reiniciat a causa d'una reinicialització "
-#~ "dels gràfics"
-
-#~ msgid "Disable configuration options"
-#~ msgstr "Desactiva les opcions de configuració"
-
-#~ msgid "Block Compositing"
-#~ msgstr "Bloqueja la composició"
-
-#~ msgid "Block Compositing rule type"
-#~ msgstr "Tipus de regla de bloquejar la composició"
-
-#~ msgid "Autogroup with identical"
-#~ msgstr "Agrupa automàticament com a idèntiques"
-
-#~ msgid "Autogroup with identical rule type"
-#~ msgstr "Tipus de regla d'agrupar automàticament com a idèntiques"
-
-#~ msgid "Autogroup in foreground"
-#~ msgstr "Agrupa automàticament en primer pla"
-
-#~ msgid "Autogroup in foreground rule type"
-#~ msgstr "Tipus de regla d'agrupar automàticament en primer pla"
-
-#~ msgid "Autogroup by ID"
-#~ msgstr "Agrupa automàticament per ID"
-
-#~ msgid "Autogroup by ID rule type"
-#~ msgstr "Tipus de regla d'agrupar automàticament per ID"
-
-#~ msgid "Obey geometry restrictions"
-#~ msgstr "Obeeix les restriccions de geometria"
-
-#~ msgid "Obey geometry restrictions rule type"
-#~ msgstr "Tipus de regla d'obeir les restriccions de geometria"
-
-#~ msgid "Move Mouse to Focus"
-#~ msgstr "Mou el ratolí al focus"
-
-#~ msgid "Move Mouse to Center"
-#~ msgstr "Mou el ratolí al centre"
-
-#~ msgid "Indicate that KWin has recently crashed n times"
-#~ msgstr "Indica que el KWin ha fallat recentment n vegades"
-
-#~ msgid "Hide from screencast"
-#~ msgstr "Oculta dels vídeos de captura de pantalla"
-
-#~ msgid "&Hide from Screencast"
-#~ msgstr "&Oculta dels vídeos de captura de pantalla"
-
-#~ msgctxt "@label"
-#~ msgid "Compositing"
-#~ msgstr "Composició"
-
-#~ msgctxt "@label"
-#~ msgid "Unknown"
-#~ msgstr "Desconegut"
-
-#~ msgid "Position of output %s is negative, that is not supported"
-#~ msgstr "La posició de la sortida %s és negativa. Això no està implementat"
-
-#~ msgid "Buttons"
-#~ msgstr "Botons"
-
-#~ msgid "The provided output order doesn't contain all outputs"
-#~ msgstr "L'ordre de sortida proporcionat no conté totes les sortides"
-
-#~ msgid "The provided output order is invalid"
-#~ msgstr "L'ordre de sortida proporcionada no és vàlid"
-
-#~ msgid "Saturation strength:"
-#~ msgstr "Intensitat de la saturació:"
-
-#~ msgctxt "Special entry in alt+tab list for minimizing all windows"
-#~ msgid "Show Desktop"
-#~ msgstr "Mostra l'escriptori"

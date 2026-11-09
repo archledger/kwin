@@ -402,7 +402,13 @@ void Workspace::init()
     });
 
     connect(kwinApp()->session(), &Session::aboutToSleep, this, [this]() {
+        // Once the system is going to sleep, the screens must stay off. Waking
+        // them would leave the delay inhibitor open until logind times out.
+        m_sleepPending = true;
         requestDpmsState(DpmsState::Off);
+    });
+    connect(kwinApp()->session(), &Session::awoke, this, [this]() {
+        m_sleepPending = false;
     });
 
     m_sleepInhibitor = kwinApp()->session()->delaySleep("turning screens off");
@@ -630,6 +636,9 @@ std::expected<void, OutputError> Workspace::applyOutputConfiguration(OutputConfi
 
 void Workspace::requestDpmsState(DpmsState state)
 {
+    if (state == DpmsState::On && m_sleepPending) {
+        return;
+    }
     const bool requestOn = state == DpmsState::On;
     const bool isOn = m_dpms == DpmsState::On;
     if (requestOn == isOn) {
@@ -2946,12 +2955,11 @@ QPointF Workspace::adjustWindowPosition(const Window *window, QPointF pos, bool 
     int guideMaximized = MaximizeRestore;
     if (window->maximizeMode() != MaximizeRestore) {
         maxRect = clientArea(MaximizeArea, window, pos + window->rect().center());
-        RectF geo = window->frameGeometry();
-        if (window->maximizeMode() & MaximizeHorizontal && (geo.x() == maxRect.left() || geo.right() == maxRect.right())) {
+        if (window->maximizeMode() & MaximizeHorizontal) {
             guideMaximized |= MaximizeHorizontal;
             borderSnapZone.setWidth(std::max(borderSnapZone.width() + 2, maxRect.width() / 16));
         }
-        if (window->maximizeMode() & MaximizeVertical && (geo.y() == maxRect.top() || geo.bottom() == maxRect.bottom())) {
+        if (window->maximizeMode() & MaximizeVertical) {
             guideMaximized |= MaximizeVertical;
             borderSnapZone.setHeight(std::max(borderSnapZone.height() + 2, maxRect.height() / 16));
         }
@@ -3098,7 +3106,7 @@ RectF Workspace::adjustWindowSize(const Window *window, RectF moveResizeGeom, Gr
     if (options->windowSnapZone() || options->borderSnapZone()) { // || options->centerSnapZone )
         const bool sOWO = options->isSnapOnlyWhenOverlapping();
 
-        const RectF maxRect = clientArea(MaximizeArea, window, window->rect().center());
+        const RectF maxRect = clientArea(MaximizeArea, window, moveResizeGeom.center());
         const qreal xmin = maxRect.left();
         const qreal xmax = maxRect.right(); // desk size
         const qreal ymin = maxRect.top();
