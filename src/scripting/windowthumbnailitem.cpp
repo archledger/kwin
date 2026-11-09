@@ -84,7 +84,8 @@ std::shared_ptr<WindowThumbnailSource> WindowThumbnailSource::getOrCreate(QQuick
     const WindowThumbnailSourceKey key{window, handle};
 
     static std::map<WindowThumbnailSourceKey, std::weak_ptr<WindowThumbnailSource>> sources;
-    auto &source = sources[key];
+    auto [entry, inserted] = sources.try_emplace(key);
+    auto &source = entry->second;
     if (!source.expired()) {
         return source.lock();
     }
@@ -92,12 +93,16 @@ std::shared_ptr<WindowThumbnailSource> WindowThumbnailSource::getOrCreate(QQuick
     auto s = std::make_shared<WindowThumbnailSource>(Compositor::self()->primaryDevice(), window, handle);
     source = s;
 
-    QObject::connect(handle, &Window::destroyed, handle, [key]() {
-        sources.erase(key);
-    });
-    QObject::connect(window, &QQuickWindow::destroyed, handle, [key]() {
-        sources.erase(key);
-    });
+    if (inserted) {
+        // The weak entry survives source recreation. Track each pair only once and
+        // disconnect both callbacks when either endpoint goes away.
+        QObject::connect(handle, &Window::destroyed, window, [key]() {
+            sources.erase(key);
+        });
+        QObject::connect(window, &QQuickWindow::destroyed, handle, [key]() {
+            sources.erase(key);
+        });
+    }
     return s;
 }
 
@@ -370,6 +375,11 @@ void WindowThumbnailItem::setWId(const QUuid &wId)
 Window *WindowThumbnailItem::client() const
 {
     return m_client;
+}
+
+int WindowThumbnailItem::plasmaFusionThumbnailSourceLifecycleVersion() const
+{
+    return 1;
 }
 
 void WindowThumbnailItem::setClient(Window *client)

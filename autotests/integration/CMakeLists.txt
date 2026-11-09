@@ -104,6 +104,12 @@ endfunction()
 integrationTest(NAME testStartupDefaults SRCS startup_defaults_test.cpp LIBS KF6::ConfigCore)
 integrationTest(NAME testHangDetectorShutdown SRCS hang_detector_shutdown_test.cpp
     PROPERTIES TIMEOUT 60)
+integrationTest(NAME testWindowThumbnailSource
+    SRCS windowthumbnail_source_test.cpp
+         ../../src/scripting/windowthumbnailitem.cpp
+         ../../src/scripting/windowthumbnailitem.h
+         ../../src/scripting/scripting_logging.cpp
+    LIBS Qt::Quick epoxy::epoxy)
 
 if(KWIN_BUILD_X11)
     integrationTest(NAME testDontCrashGlxgears SRCS dont_crash_glxgears.cpp LIBS KF6::I18n KDecoration3::KDecoration)
