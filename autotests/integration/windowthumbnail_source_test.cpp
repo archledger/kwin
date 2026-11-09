@@ -84,6 +84,7 @@ void WindowThumbnailSourceTest::testLifecycleCapabilityVersion()
     QVERIFY(property.isValid());
     QVERIFY(property.isReadable());
     QVERIFY(!property.isWritable());
+    QVERIFY(property.isConstant());
     QCOMPARE(property.typeId(), QMetaType::Int);
 
     WindowThumbnailItem item;
