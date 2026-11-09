@@ -690,7 +690,8 @@ public:
             return false;
         }
         if (event->state == PointerButtonState::Released) {
-            if ((event->buttons & (Qt::MouseButton::LeftButton | Qt::MouseButton::RightButton)) == 0) {
+            // All three primary buttons support configurable move/resize bindings.
+            if ((event->buttons & (Qt::MouseButton::LeftButton | Qt::MouseButton::RightButton | Qt::MouseButton::MiddleButton)) == 0) {
                 window->endInteractiveMoveResize();
             }
         }
