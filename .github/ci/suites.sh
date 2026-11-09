@@ -128,8 +128,8 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
     # runner (QTest event-loop deadlines under ~30x valgrind + llvmpipe; zero memory
     # errors every time). The excluded entries, like the fifo/tiles ones, stay
     # covered by the GPU-backed native lane and the functional CI, and must not
-    # randomly turn the weekly gate red. Every attempt is reported; a real memory
-    # finding still fails all attempts and fails the gate.
+    # randomly turn the weekly gate red. Every attempt keeps its own log and is
+    # reported; an unsuppressed memory finding is sticky and fails the gate.
     for run in "testXdgShellWindow testDecorationSettingsReentry" \
         "testXdgShellWindow testRequestedGeometryReentrantMove" \
         "testXdgShellWindow testGeometryCallbackClose" "testXdgShellWindow testGeometrySupersession" \
@@ -137,12 +137,16 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
         "testHangDetectorShutdown"; do
         read -r binary function <<<"$run"
         code=0
-        # Bounded retries, as for the functional suites: an intermittent QTest
-        # timeout under valgrind on the software-rendering runner passes on a
-        # retry, while a real finding (memory error or deterministic failure)
-        # fails every attempt and fails the gate. Every attempt is reported.
+        # Bounded retries, as for the functional suites, for intermittent QTest
+        # timeouts under valgrind on the software-rendering runner. An
+        # unsuppressed memory finding is sticky: memory errors can depend on
+        # scheduling or heap layout, so any attempt reporting one fails the
+        # entry immediately and is never retried away, and every attempt keeps
+        # its own log.
+        sticky=0
         for attempt in 1 2 3; do
             code=0
+            log="$out/memcheck-$binary-$function-attempt$attempt.log"
             # shellcheck disable=SC2154 # dri is defined for test runs above
             podman run "${common[@]}" "${dri[@]}" "${supp[@]}" \
                 -e HOME=/tmp/home -e XDG_CONFIG_HOME=/tmp/home/config -e XDG_CACHE_HOME=/tmp/home/cache \
@@ -154,12 +158,17 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
                   if [ ! -d /tmp/.X11-unix ]; then mkdir /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; fi
                   cd /build/bin
                   dbus-run-session valgrind --suppressions=/ci-known.supp --error-exitcode=91 --track-origins=yes --leak-check=no --num-callers=28 ./'"$binary $function" \
-                >"$out/memcheck-$binary-$function.log" 2>&1 || code=$?
-            printf '%s %s attempt=%s exit=%s %s\n' "$binary" "$function" "$attempt" "$code" "$(grep -E 'ERROR SUMMARY' "$out/memcheck-$binary-$function.log" | tail -n 1 | sed -E 's/^==[0-9]+== //')" |
-                tee -a "$out/memcheck.txt"
+                >"$log" 2>&1 || code=$?
+            if grep -qE 'ERROR SUMMARY: [1-9][0-9]* errors' "$log"; then
+                sticky=1
+            fi
+            printf '%s %s attempt=%s exit=%s%s %s\n' "$binary" "$function" "$attempt" "$code" \
+                "$([[ $sticky = 1 ]] && printf ' unsuppressed-memory-error')" \
+                "$(grep -E 'ERROR SUMMARY' "$log" | tail -n 1 | sed -E 's/^==[0-9]+== //')" | tee -a "$out/memcheck.txt"
+            (( sticky == 1 )) && break
             (( code == 0 )) && break
         done
-        (( code == 0 )) || status=1
+        (( code == 0 && sticky == 0 )) || status=1
     done
     (( status == 0 )) || fail
     printf 'memcheck=0\n' >>"$out/STATUS"
