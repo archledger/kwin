@@ -212,6 +212,11 @@ bool QuickSceneEffect::supported()
     return effects->compositingType() == OpenGLCompositing;
 }
 
+int QuickSceneEffect::plasmaFusionOffscreenOpacityVersion() const
+{
+    return 1;
+}
+
 void QuickSceneEffect::checkItemDraggedOutOfScreen(QQuickItem *item)
 {
     const RectF globalGeom = RectF(item->mapToGlobal(QPointF(0, 0)), QSizeF(item->width(), item->height()));

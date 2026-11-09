@@ -11,6 +11,7 @@
 #include "effect/effecthandler.h"
 #include "effect/effectloader.h"
 #include "effect/offscreenquickview.h"
+#include "effect/quickeffect.h"
 #include "opengl/eglbackend.h"
 #include "opengl/eglcontext.h"
 #include "opengl/gltexture.h"
@@ -65,6 +66,7 @@ private Q_SLOTS:
     void testOpacity_data();
     void testOpacity();
     void testResynchronizeOpacity();
+    void testOpacityCapabilityVersion();
     void testOpaqueRegion_data();
     void testOpaqueRegion();
     void testRepaint();
@@ -130,6 +132,26 @@ void OffscreenQuickViewTest::testResynchronizeOpacity()
     view.setOpacity(0.25);
     QCOMPARE(item->opacity(), 0.25);
     QCOMPARE(view.opacity(), 0.25);
+}
+
+void OffscreenQuickViewTest::testOpacityCapabilityVersion()
+{
+    // The downstream capability is visible before any scene view exists and
+    // describes both the opacity propagation and the occlusion behavior that
+    // the tests above verify.
+    const QMetaObject &metaObject = QuickSceneEffect::staticMetaObject;
+    const int index = metaObject.indexOfProperty("plasmaFusionOffscreenOpacityVersion");
+    QVERIFY(index >= 0);
+    const QMetaProperty property = metaObject.property(index);
+    QVERIFY(property.isValid());
+    QVERIFY(property.isReadable());
+    QVERIFY(!property.isWritable());
+    QCOMPARE(property.typeId(), QMetaType::Int);
+
+    QuickSceneEffect effect;
+    QCOMPARE(effect.property("plasmaFusionOffscreenOpacityVersion").toInt(), 1);
+    QCOMPARE(effect.plasmaFusionOffscreenOpacityVersion(), 1);
+    QVERIFY(!effect.viewAt(QPoint(0, 0)));
 }
 
 void OffscreenQuickViewTest::testOpaqueRegion_data()
