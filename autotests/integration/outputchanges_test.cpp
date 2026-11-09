@@ -1570,6 +1570,57 @@ void OutputChangesTest::testGenerateConfigs_data()
                },
            }
         << OutputModeline(QSize(1920, 1080), 60000, OutputModeline::Flag::Preferred) << 1.0 << true;
+
+    QTest::addRow("mixed-modes-without-preferred")
+        << DeviceType::Desktop
+        << Test::OutputInfo{
+               .geometry = Rect(),
+               .internal = false,
+               .physicalSizeInMM = QSize(527, 296),
+               .modes = {
+                   OutputModeline(QSize(1920, 1080), 60000, OutputModeline::Flags{}),
+                   OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}),
+               },
+           }
+        << OutputModeline(QSize(1920, 1080), 60000, OutputModeline::Flags{}) << 1.0 << true;
+
+    QTest::addRow("preferred-after-filtered-mode")
+        << DeviceType::Desktop
+        << Test::OutputInfo{
+               .geometry = Rect(),
+               .internal = false,
+               .physicalSizeInMM = QSize(527, 296),
+               .modes = {
+                   OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}),
+                   OutputModeline(QSize(1920, 1080), 60000, OutputModeline::Flag::Preferred),
+               },
+           }
+        << OutputModeline(QSize(1920, 1080), 60000, OutputModeline::Flag::Preferred) << 1.0 << true;
+
+    QTest::addRow("interlaced-only-without-preferred")
+        << DeviceType::Desktop
+        << Test::OutputInfo{
+               .geometry = Rect(),
+               .internal = false,
+               .physicalSizeInMM = QSize(527, 296),
+               .modes = {
+                   OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}),
+               },
+           }
+        << OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}) << 1.0 << true;
+
+    QTest::addRow("interlaced-only-best-fallback")
+        << DeviceType::Desktop
+        << Test::OutputInfo{
+               .geometry = Rect(),
+               .internal = false,
+               .physicalSizeInMM = QSize(527, 296),
+               .modes = {
+                   OutputModeline(CvtModeline::generate(QSize(1024, 768), 60000, false, true), OutputModeline::Flags{}),
+                   OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}),
+               },
+           }
+        << OutputModeline(CvtModeline::generate(QSize(1920, 1080), 75000, false, true), OutputModeline::Flags{}) << 1.0 << true;
 }
 
 void OutputChangesTest::testGenerateConfigs()

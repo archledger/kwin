@@ -14,6 +14,7 @@
 #include "wayland/subcompositor.h"
 #include "wayland/surface.h"
 #include "window.h"
+#include "workspace.h"
 
 #if KWIN_BUILD_X11
 #include "x11window.h"
@@ -245,10 +246,15 @@ void SurfaceItemWayland::handleCommitTiming()
 
 SceneView *SurfaceItemWayland::primaryView() const
 {
+    // Items are traversed only on the output that contains their center, so the
+    // view that drives fifo, commit timing and presentation feedback has to be
+    // one of those; any other selection would never be dispatched to. Capture
+    // views (screencasts) have no backend output and are never driven by the
+    // compositor's frame clock, so they must not own this either.
+    LogicalOutput *const output = workspace()->outputAt(mapToScene(boundingRect()).center());
     const auto views = scene()->sceneViews();
-    auto relevant = views | std::views::filter([this](SceneView *view) {
-        const RectF geometry = mapToView(boundingRect(), view);
-        return view->viewport().intersects(geometry);
+    auto relevant = views | std::views::filter([output](SceneView *view) {
+        return view->backendOutput() && view->logicalOutput() == output;
     });
     auto it = std::ranges::max_element(relevant, [](SceneView *left, SceneView *right) {
         return left->refreshRate() < right->refreshRate();

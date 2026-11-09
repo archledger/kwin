@@ -814,26 +814,34 @@ std::shared_ptr<OutputMode> OutputConfigurationStore::chooseMode(BackendOutput *
         return (mode->flags() & OutputModeline::Flag::Preferred);
     });
     const auto nativeSizeIt = std::ranges::max_element(preferredOnly, findBiggestFastest);
+    // Filtering the backing list invalidates its iterators, including a saved end.
+    const auto nativeMode = nativeSizeIt != preferredOnly.end() ? *nativeSizeIt : std::shared_ptr<OutputMode>();
 
     // match progressive vs. interlaced with the preferred mode,
     // since interlaced might not actually work
-    const bool interlace = nativeSizeIt != preferredOnly.end()
-        && (*nativeSizeIt)->modeline().cvt()
-        && ((*nativeSizeIt)->modeline().cvt()->flags & DRM_MODE_FLAG_INTERLACE);
-    erase_if(notPotentiallyBroken, [&](const auto &mode) {
+    const bool interlace = nativeMode
+        && nativeMode->modeline().cvt()
+        && (nativeMode->modeline().cvt()->flags & DRM_MODE_FLAG_INTERLACE);
+    auto matchingScanType = notPotentiallyBroken;
+    erase_if(matchingScanType, [&](const auto &mode) {
         const auto modeCvt = mode->modeline().cvt();
         if (!modeCvt) {
             return false;
         }
         return interlace != bool(modeCvt->flags & DRM_MODE_FLAG_INTERLACE);
     });
+    // a display with only interlaced modes and no preferred one must not
+    // end up with an empty candidate list
+    if (!matchingScanType.empty()) {
+        notPotentiallyBroken = std::move(matchingScanType);
+    }
 
     auto is32by9 = [](const auto &mode) {
         const double aspectRatio = mode->size().width() / double(mode->size().height());
         return aspectRatio > 31 / 9.0 && aspectRatio < 33 / 9.0;
     };
 
-    if (nativeSizeIt == preferredOnly.end() || is32by9(*nativeSizeIt)) {
+    if (!nativeMode || is32by9(nativeMode)) {
         // 32:9 displays often advertise a lower resolution mode as preferred, special case them
         auto only32by9 = notPotentiallyBroken | std::ranges::views::filter(is32by9);
         const auto best32By9 = std::ranges::max_element(only32by9, findBiggestFastest);
@@ -845,8 +853,8 @@ std::shared_ptr<OutputMode> OutputConfigurationStore::chooseMode(BackendOutput *
     // Non-default modes have a decent chance of not working on VGA,
     // so avoid doing anything out of the ordinary there
     const bool isVGA = output->name().contains("VGA");
-    if (!isVGA && (nativeSizeIt != preferredOnly.end() || output->edid().likelyNativeResolution())) {
-        const auto size = nativeSizeIt != preferredOnly.end() ? (*nativeSizeIt)->size() : *output->edid().likelyNativeResolution();
+    if (!isVGA && (nativeMode || output->edid().likelyNativeResolution())) {
+        const auto size = nativeMode ? nativeMode->size() : *output->edid().likelyNativeResolution();
         auto correctSize = notPotentiallyBroken | std::ranges::views::filter([size](const auto &mode) {
             return mode->size() == size;
         });

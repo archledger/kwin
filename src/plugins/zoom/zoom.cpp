@@ -281,7 +281,7 @@ void ZoomEffect::prePaintScreen(ScreenPrePaintData &data)
         const int screenLeft = currScreen.left();
         const int screenRight = currScreen.right();
         const int screenBottom = currScreen.bottom();
-        
+
         // figure out whether we have adjacent displays in all 4 directions
         // We pan within the screen in directions where there are no adjacent screens.
         const bool adjacentLeft = screenExistsAt(QPoint(screenLeft - 1, y));

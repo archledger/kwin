@@ -133,7 +133,7 @@ void Application::start()
                 }
                 onMainHang();
                 m_hangDetection.pong.wait(lock, [&]() {
-                    return !m_hangDetection.ping;
+                    return !m_hangDetection.ping || thisThread->isInterruptionRequested();
                 });
 
                 const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - before);

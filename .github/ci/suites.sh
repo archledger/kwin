@@ -1,17 +1,15 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-or-later
-# The fork's 18 qualification suites in the ThinkPad lane's container, on a CI runner or a workstation:
-# build the test image (Containerfile), configure with Fedora's %cmake_kf6 flags and BUILD_TESTING, build
-# the suites' targets, run them with Fedora's KWin effects hidden and the built libkwin loaded, then check
-# that the source and the tested binaries did not change. Differences from the ThinkPad lane: without a GPU
-# render node (a CI runner) the tests use KWin's software render device, llvmpipe over /dev/udmabuf (KWin
-# 6.8's compositor needs a render device; without one it does not composite), and ctest repeats a failing
-# suite up to three times as KWin's own CI does (.kde-ci.yml), reporting every suite that needed a repeat.
-# MEMCHECK=1 then also runs the closure and reentry functions under Valgrind Memcheck.
-# Usage: suites.sh SOURCE_DIR WORK_DIR. Exit status: 0 passed, 1 a stage failed.
+# The fork's test image, as the ThinkPad qualification lane builds it: Fedora 44 with current updates,
+# the package names of the earlier KWin builder (packages-old-builder.txt) and the build dependencies
+# of Fedora's kwin source package. Packages that no longer exist are skipped and listed in /skipped.txt.
+# The image includes Fedora's own KWin; suites.sh hides its scripted effects and loads the built libkwin.
+# The build recipe and package list come from this trusted helper directory, never from the candidate
+# source, and the package version is parsed from the candidate without executing any of its code.
 set -euo pipefail
 (( $# == 2 )) || { echo "usage: $0 SOURCE_DIR WORK_DIR" >&2; exit 64; }
+ci=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 src=$(cd "$1" && pwd)
 mkdir -p "$2"
 work=$(cd "$2" && pwd)
@@ -19,15 +17,16 @@ work=$(cd "$2" && pwd)
 # The tested tree is HEAD exactly, as a detached worktree: no untracked files, and no .git directory for KDE's
 # commit-hook module (KDEGitCommitHooks) to write into, since the source is mounted read-only.
 tree=$work/source
-git -C "$src" worktree remove --force "$tree" >/dev/null 2>&1 || true
+[ ! -e "$tree" ] && [ ! -L "$tree" ] || { echo "candidate worktree already exists: $tree" >&2; exit 1; }
 git -C "$src" worktree add -q --detach "$tree" HEAD
-trap 'git -C "$src" worktree remove --force "$tree" >/dev/null 2>&1 || true' EXIT
+trap 'git -C "$src" worktree remove "$tree" >/dev/null 2>&1 || echo "retained non-clean candidate: $tree" >&2' EXIT
+version=$(python3 "$ci/upstream.py" version "$tree")
 out=$work/out
 bld=$work/build
 mkdir -p "$out" "$bld" "$work/tmp" "$work/empty-effects"
 image=localhost/kwin-fork-ci:fedora44
-suites='X11Window|DecorationInput|DontCrashEmptyDeco|DontCrashAuroraeDestroyDeco|Tiles|XdgShellWindow|QuickTiling|MoveResize|FractionalScaling|OutputChanges|Maximized|ScreenChanges|OffscreenQuickView|InternalWindow|TabBox|Placement|TransientPlacement|StartupDefaults'
-targets="kwin kill fakedecoshadows $(tr '|' '\n' <<<"$suites" | sed 's/^/test/' | tr '\n' ' ')"
+suites='X11Window|DecorationInput|DontCrashEmptyDeco|DontCrashAuroraeDestroyDeco|Tiles|XdgShellWindow|QuickTiling|MoveResize|FractionalScaling|OutputChanges|Maximized|ScreenChanges|OffscreenQuickView|InternalWindow|TabBox|Placement|TransientPlacement|StartupDefaults|Rect|RectF|Fifo|HangDetectorShutdown'
+targets="kwin kill fakedecoshadows testWaylandSurface $(tr '|' '\n' <<<"$suites" | sed 's/^/test/' | tr '\n' ' ')"
 cpus=${CPUS:-4}
 stage=device
 fail() {
@@ -49,7 +48,7 @@ printf '%s\n' "${node:-/dev/udmabuf (software)}" >"$out/render-device.txt"
 printf 'device=0\n' >>"$out/STATUS"
 stage=image
 git -C "$src" rev-parse HEAD 'HEAD^{tree}' >"$out/source-commit.txt"
-podman build --pull=newer -t "$image" -f "$src/.github/ci/Containerfile" "$src/.github/ci" >"$out/image.log" 2>&1 || fail
+podman build --pull=newer -t "$image" -f "$ci/Containerfile" "$ci" >"$out/image.log" 2>&1 || fail
 podman image inspect "$image" --format '{{.Id}}' >"$out/image-id.txt"
 for f in packages.tsv skipped.txt; do podman run --rm "$image" cat "/$f" >"$out/$f"; done
 printf 'image=0\n' >>"$out/STATUS"
@@ -58,7 +57,7 @@ common=(--rm --userns=keep-id --network=none --ulimit core=1:1 --cap-drop=all --
     --cpus="$cpus" --memory=12g --memory-swap=12g --tmpfs /tmp:rw,nosuid,nodev,size=1g)
 container() {
     # Fedora's linker specs (redhat-package-notes) read the package identity from the environment, as in rpmbuild.
-    podman run "${common[@]}" -e TMPDIR=/scratch -e RPM_ARCH=x86_64 -e RPM_PACKAGE_NAME=kwin -e RPM_PACKAGE_VERSION=6.8.2 \
+    podman run "${common[@]}" -e TMPDIR=/scratch -e RPM_ARCH=x86_64 -e RPM_PACKAGE_NAME=kwin -e RPM_PACKAGE_VERSION="$version" \
         -e RPM_PACKAGE_RELEASE=1.fc44.ci -v "$tree:/source:ro,z" -v "$bld:/build:rw,z" -v "$work/tmp:/scratch:rw,z" \
         --entrypoint bash "$image" -euc "$1"
 }
@@ -75,9 +74,9 @@ run_test() {
 }
 stage=configure
 if [ ! -f "$bld/CMakeCache.txt" ]; then
-    container 'cmd=$(rpm --define "_vpath_srcdir /source" --define "_vpath_builddir /build" \
-        --define "name kwin" --define "version 6.8.2" --define "release 1.fc44.ci" \
-        --eval "%cmake_kf6 -G Ninja -DBUILD_TESTING=ON"); printf "%s\n" "$cmd"; bash -euc "$cmd"' \
+    container "cmd=\$(rpm --define '_vpath_srcdir /source' --define '_vpath_builddir /build' \
+        --define 'name kwin' --define 'version $version' --define 'release 1.fc44.ci' \
+        --eval '%cmake_kf6 -G Ninja -DBUILD_TESTING=ON'); printf '%s\n' \"\$cmd\"; bash -euc \"\$cmd\"" \
         >"$out/configure.log" 2>&1 || fail
 fi
 printf 'configure=0\n' >>"$out/STATUS"
@@ -87,20 +86,28 @@ container "cmake --build /build --parallel $cpus --target $targets -- -k 0" >"$o
     fail
 }
 printf 'build=0\n' >>"$out/STATUS"
-(cd "$bld/bin" && sha256sum libkwin.so.6.8.2 testXdgShellWindow testTiles testOffscreenQuickView testStartupDefaults) >"$out/binaries.sha256"
+(cd "$bld/bin" && sha256sum "libkwin.so.$version" testXdgShellWindow testTiles testOffscreenQuickView testStartupDefaults testFifo testHangDetectorShutdown testWaylandSurface) >"$out/binaries.sha256"
+stage=inventory
+run_test "ctest --test-dir /build --show-only=json-v1 -R '^(kwin-test($suites)|kwayland-testWaylandSurface)\$'" \
+    >"$out/test-inventory.json" 2>"$out/test-inventory.stderr" || fail
 stage=core
 rc=0
-run_test "export LD_DEBUG=libs; ctest --test-dir /build -V --no-tests=error --timeout 300 --repeat until-pass:3 -R '^kwin-test($suites)\$'" \
+junit=$(mktemp "$bld/ci-results-XXXXXX.xml")
+run_test "export LD_DEBUG=libs; ctest --test-dir /build -V --no-tests=error --timeout 300 --repeat until-pass:3 --output-junit /build/${junit##*/} -R '^(kwin-test($suites)|kwayland-testWaylandSurface)\$'" \
     >"$work/core-full.log" 2>&1 || rc=$?
+cp "$junit" "$out/ctest.xml"
+rm -- "$junit"
 # The dynamic loader's trace is only needed for the libkwin check below; keep its init lines.
 grep -vE '^[0-9]+: +[0-9]+:[[:space:]]' "$work/core-full.log" >"$out/core.log" || true
 grep -E 'calling init: .*libkwin\.so' "$work/core-full.log" | sed -E 's/^[0-9]+: +[0-9]+:[[:space:]]+//' | sort | uniq -c >"$out/libkwin-init.txt" || true
 rm -f "$work/core-full.log"
 grep -E 'tests passed|tests failed' "$out/core.log" | tail -n 1 >"$out/summary.txt" || true
 # Suites that passed only after a repeat: ctest reports the failed attempt before the passing one.
-grep -E 'Test +#[0-9]+: kwin-test[A-Za-z0-9]+ .*\*\*\*(Failed|Timeout|Exception)' "$out/core.log" |
-    sed -E 's/.*(kwin-test[A-Za-z0-9]+).*/\1/' | sort | uniq -c >"$out/repeats.txt" || true
+grep -E 'Test +#[0-9]+: (kwin|kwayland)-test[A-Za-z0-9]+ .*\*\*\*(Failed|Timeout|Exception)' "$out/core.log" |
+    grep -oE '(kwin|kwayland)-test[A-Za-z0-9]+' | sort | uniq -c >"$out/repeats.txt" || true
 (( rc == 0 )) || fail
+python3 "$ci/suite_results.py" --discovery "$out/test-inventory.json" --junit "$out/ctest.xml" \
+    --log "$out/core.log" --libkwin-init "$out/libkwin-init.txt" --output "$out/test-validation.json" || fail
 # Every suite must have loaded the built libkwin and none Fedora's.
 grep -q 'calling init: /build/bin/libkwin\.so' "$out/libkwin-init.txt" || { echo "built libkwin not loaded" >&2; fail; }
 if grep -qE 'calling init: /usr/lib(64)?/libkwin\.so' "$out/libkwin-init.txt"; then echo "Fedora's libkwin loaded" >&2; fail; fi
@@ -113,7 +120,8 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
         "testXdgShellWindow testGeometryCallbackClose" "testXdgShellWindow testGeometrySupersession" \
         "testXdgShellWindow testConfigureDiscardReentry" "testXdgShellWindow testConfigureContentHandoff" \
         "testXdgShellWindow testMaximizeRestoreRecursion" "testTiles decorationGeneration" \
-        "testTiles x11NormalizeMaximizeForAssignment"; do
+        "testTiles x11NormalizeMaximizeForAssignment" "testFifo testFifoOnMixedRefreshOutputs" \
+        "testFifo testFifoIgnoresCaptureViews" "testHangDetectorShutdown"; do
         read -r binary function <<<"$run"
         code=0
         run_test 'cd /build/bin; dbus-run-session valgrind --error-exitcode=91 --track-origins=yes --leak-check=no --num-callers=28 ./'"$binary $function" \
