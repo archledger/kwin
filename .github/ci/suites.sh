@@ -120,16 +120,21 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
     # header). It comes from this trusted helper directory, never candidate
     # source, so imported code cannot widen the weekly gate.
     supp=(-v "$ci/memcheck-qt611-known.supp:/ci-known.supp:ro,z")
-    # Entries limited to what passes under valgrind on the hosted software-rendering
-    # runner. The fifo and tiles timing-sensitive entries time out functionally there
-    # (QTest event-loop deadlines under ~30x valgrind + llvmpipe) while passing under
-    # valgrind with a real GPU in the native lane; they stay covered by that lane and
-    # by the functional CI, and must not silently turn the weekly gate red.
-    for run in "testXdgShellWindow testDecorationSettingsReentry" "testXdgShellWindow testDecorationRecreationTraversal" \
-        "testXdgShellWindow testDecorationBridgeReentry" "testXdgShellWindow testRequestedGeometryReentrantMove" \
+    # Entries limited to what passes deterministically under valgrind on the hosted
+    # software-rendering runner, chosen from three dispatch runs on this branch
+    # (42622615853, 42627504561, 42632270739): the seven below passed every time;
+    # testDecorationRecreationTraversal, testDecorationBridgeReentry and
+    # testMaximizeRestoreRecursion each failed all retry attempts on at least one
+    # runner (QTest event-loop deadlines under ~30x valgrind + llvmpipe; zero memory
+    # errors every time). The excluded entries, like the fifo/tiles ones, stay
+    # covered by the GPU-backed native lane and the functional CI, and must not
+    # randomly turn the weekly gate red. Every attempt is reported; a real memory
+    # finding still fails all attempts and fails the gate.
+    for run in "testXdgShellWindow testDecorationSettingsReentry" \
+        "testXdgShellWindow testRequestedGeometryReentrantMove" \
         "testXdgShellWindow testGeometryCallbackClose" "testXdgShellWindow testGeometrySupersession" \
         "testXdgShellWindow testConfigureDiscardReentry" "testXdgShellWindow testConfigureContentHandoff" \
-        "testXdgShellWindow testMaximizeRestoreRecursion" "testHangDetectorShutdown"; do
+        "testHangDetectorShutdown"; do
         read -r binary function <<<"$run"
         code=0
         # Bounded retries, as for the functional suites: an intermittent QTest
