@@ -16,10 +16,16 @@ class SuiteResultsTest(unittest.TestCase):
         self.xml = ET.Element("testsuite")
         for name in sorted(self.names):
             case = ET.SubElement(self.xml, "testcase", name=name, status="run")
+            # The JUnit system-out only carries the loader trace on the runner.
             ET.SubElement(
                 case, "system-out"
-            ).text = "Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms"
-        self.console = "Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n" * 2
+            ).text = "calling init: /build/bin/libkwin.so.6\n"
+        self.console = (
+            "Start  7: kwin-testFirst\n"
+            "7: Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n"
+            "Start  9: kwin-testSecond\n"
+            "9: Totals: 3 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms\n"
+        )
 
     def validate(self, libkwin_init="calling init: /build/bin/libkwin.so.6"):
         return suite_results.validate(
@@ -55,15 +61,18 @@ class SuiteResultsTest(unittest.TestCase):
                     )
 
     def test_qtest_skip_is_failure_even_when_ctest_passed(self):
-        self.xml[0].find(
-            "system-out"
-        ).text = "Totals: 2 passed, 0 failed, 1 skipped, 0 blacklisted, 1ms"
+        self.console = self.console.replace(
+            "7: Totals: 3 passed, 0 failed, 0 skipped",
+            "7: Totals: 2 passed, 0 failed, 1 skipped",
+        )
         with self.assertRaises(suite_results.ValidationError):
             self.validate()
 
     def test_retry_remains_visible_without_rejecting_final_pass(self):
-        self.console = (
-            "Totals: 2 passed, 1 failed, 0 skipped, 0 blacklisted, 1ms\n" + self.console
+        self.console = self.console.replace(
+            "Start  7: kwin-testFirst\n",
+            "Start  7: kwin-testFirst\n"
+            "7: Totals: 2 passed, 1 failed, 0 skipped, 0 blacklisted, 1ms\n",
         )
         result = self.validate()
         self.assertEqual(result["failed_qtest_attempts"], 1)
@@ -82,21 +91,25 @@ class SuiteResultsTest(unittest.TestCase):
         with self.assertRaises(suite_results.ValidationError):
             self.validate()
         self.xml[0].remove(self.xml[0].find("failure"))
-        self.xml[0].find("system-out").text = "No result"
+        self.console = self.console.replace(
+            "7: Totals:", "7: no result here\n7: something:"
+        )
         with self.assertRaises(suite_results.ValidationError):
             self.validate()
 
     def test_skipped_earlier_attempt_is_not_hidden_by_retry(self):
-        self.console = (
-            "Totals: 1 passed, 1 failed, 1 skipped, 0 blacklisted, 1ms\n" + self.console
+        self.console = self.console.replace(
+            "Start  7: kwin-testFirst\n",
+            "Start  7: kwin-testFirst\n"
+            "7: Totals: 1 passed, 1 failed, 1 skipped, 0 blacklisted, 1ms\n",
         )
         with self.assertRaises(suite_results.ValidationError):
             self.validate()
 
     def test_empty_qtest_run_is_not_success(self):
-        self.xml[0].find(
-            "system-out"
-        ).text = "Totals: 0 passed, 0 failed, 0 skipped, 0 blacklisted, 1ms"
+        self.console = self.console.replace(
+            "7: Totals: 3 passed", "7: Totals: 0 passed"
+        )
         with self.assertRaises(suite_results.ValidationError):
             self.validate()
 
