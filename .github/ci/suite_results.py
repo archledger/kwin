@@ -34,6 +34,7 @@ REQUIRED = {
         "RectF",
         "Fifo",
         "HangDetectorShutdown",
+        "WindowThumbnailSource",
     )
 } | {"kwayland-testWaylandSurface"}
 
