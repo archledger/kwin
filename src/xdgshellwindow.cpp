@@ -1987,9 +1987,45 @@ void XdgToplevelWindow::processDecorationState(std::shared_ptr<KDecoration3::Dec
         return;
     }
 
+    const auto previousState = m_nextDecorationState;
     m_nextDecorationState = state->clone();
-    if (m_shellSurface->isConfigured()) {
-        scheduleConfigure();
+    if (!m_shellSurface->isConfigured()) {
+        return;
+    }
+    // Stage the configure before changing geometry: output-property callbacks can commit
+    // older content, which must not synchronize over the new requested frame.
+    scheduleConfigure();
+
+    if (!previousState || m_nextDecoration.get() != decoration() || moveResizeGeometry().isEmpty()
+        || isInteractiveMoveResize() || m_geometryResizePending
+        || isFullScreen() || isRequestedFullScreen()
+        || maximizeMode() != MaximizeRestore || requestedMaximizeMode() != MaximizeRestore
+        || m_tile || m_requestedTile || m_activeTransientRequest || m_transientOwnership
+        || m_requestedTransientTileGeneration || isElectricBorderMaximizing()) {
+        return;
+    }
+
+    // A floating window keeps its requested client size, including an unacknowledged resize.
+    // The decoration's mutable nextState already has the new borders, so use our old snapshot.
+    const auto delta = m_nextDecorationState->borders() - previousState->borders();
+    if (delta.isNull()) {
+        return;
+    }
+    RectF geometry = moveResizeGeometry();
+    geometry.setSize(geometry.size() + QSizeF(delta.left() + delta.right(), delta.top() + delta.bottom()));
+    // Scale-dependent borders must not move the center across an output boundary and
+    // feed back into another border update. Keep the existing frame policy at that edge.
+    if (workspace()->outputAt(geometry.center()) != moveResizeOutput()) {
+        return;
+    }
+
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    setMoveResizeGeometry(geometry);
+    if (!isDeleted()) {
+        notifyRequestedGeometryChanged();
     }
 }
 
