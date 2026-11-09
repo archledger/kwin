@@ -148,6 +148,10 @@ public:
     Test::VirtualInputDevice *virtualTablet() const;
     Test::VirtualInputDeviceTabletTool *virtualTabletTool() const;
 
+Q_SIGNALS:
+    void inputDevicesCreated();
+
+public:
 #if KWIN_BUILD_X11
     XwaylandInterface *xwayland() const override;
 #endif
