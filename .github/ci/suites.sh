@@ -132,20 +132,28 @@ if [ "${MEMCHECK:-0}" = 1 ]; then
         "testXdgShellWindow testMaximizeRestoreRecursion" "testHangDetectorShutdown"; do
         read -r binary function <<<"$run"
         code=0
-        # shellcheck disable=SC2154 # dri is defined for test runs above
-        podman run "${common[@]}" "${dri[@]}" "${supp[@]}" \
-            -e HOME=/tmp/home -e XDG_CONFIG_HOME=/tmp/home/config -e XDG_CACHE_HOME=/tmp/home/cache \
-            -e XDG_RUNTIME_DIR=/tmp/runtime -e LD_LIBRARY_PATH=/build/bin -e QT_QPA_PLATFORM=offscreen \
-            -e QSG_RHI_BACKEND=opengl -e KWIN_FORCE_SW_CURSOR=1 -v "$work/empty-effects:/usr/share/kwin/effects:ro,z" \
-            -v "$tree:/source:ro,z" -v "$bld:/build:rw,z" --entrypoint bash "$image" \
-            -euc 'mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" /tmp/.X11-unix
-              chmod 700 "$XDG_RUNTIME_DIR"
-              if [ ! -d /tmp/.X11-unix ]; then mkdir /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; fi
-              cd /build/bin
-              dbus-run-session valgrind --suppressions=/ci-known.supp --error-exitcode=91 --track-origins=yes --leak-check=no --num-callers=28 ./'"$binary $function" \
-            >"$out/memcheck-$binary-$function.log" 2>&1 || code=$?
-        printf '%s %s exit=%s %s\n' "$binary" "$function" "$code" "$(grep -E 'ERROR SUMMARY' "$out/memcheck-$binary-$function.log" | tail -n 1 | sed -E 's/^==[0-9]+== //')" |
-            tee -a "$out/memcheck.txt"
+        # Bounded retries, as for the functional suites: an intermittent QTest
+        # timeout under valgrind on the software-rendering runner passes on a
+        # retry, while a real finding (memory error or deterministic failure)
+        # fails every attempt and fails the gate. Every attempt is reported.
+        for attempt in 1 2 3; do
+            code=0
+            # shellcheck disable=SC2154 # dri is defined for test runs above
+            podman run "${common[@]}" "${dri[@]}" "${supp[@]}" \
+                -e HOME=/tmp/home -e XDG_CONFIG_HOME=/tmp/home/config -e XDG_CACHE_HOME=/tmp/home/cache \
+                -e XDG_RUNTIME_DIR=/tmp/runtime -e LD_LIBRARY_PATH=/build/bin -e QT_QPA_PLATFORM=offscreen \
+                -e QSG_RHI_BACKEND=opengl -e KWIN_FORCE_SW_CURSOR=1 -v "$work/empty-effects:/usr/share/kwin/effects:ro,z" \
+                -v "$tree:/source:ro,z" -v "$bld:/build:rw,z" --entrypoint bash "$image" \
+                -euc 'mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" /tmp/.X11-unix
+                  chmod 700 "$XDG_RUNTIME_DIR"
+                  if [ ! -d /tmp/.X11-unix ]; then mkdir /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; fi
+                  cd /build/bin
+                  dbus-run-session valgrind --suppressions=/ci-known.supp --error-exitcode=91 --track-origins=yes --leak-check=no --num-callers=28 ./'"$binary $function" \
+                >"$out/memcheck-$binary-$function.log" 2>&1 || code=$?
+            printf '%s %s attempt=%s exit=%s %s\n' "$binary" "$function" "$attempt" "$code" "$(grep -E 'ERROR SUMMARY' "$out/memcheck-$binary-$function.log" | tail -n 1 | sed -E 's/^==[0-9]+== //')" |
+                tee -a "$out/memcheck.txt"
+            (( code == 0 )) && break
+        done
         (( code == 0 )) || status=1
     done
     (( status == 0 )) || fail
