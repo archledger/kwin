@@ -75,11 +75,13 @@
 #include <linux/input.h>
 
 #include <array>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <functional>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 using namespace KWin;
 
@@ -285,6 +287,15 @@ private Q_SLOTS:
     void testMinimizeWindowWithTransients();
     void testXdgDecoration_data();
     void testXdgDecoration();
+    void testDecorationBorderClientSize_data();
+    void testDecorationBorderClientSize();
+    void testDecorationBorderPendingConfigure_data();
+    void testDecorationBorderPendingConfigure();
+    void testDecorationBorderManagedFrame_data();
+    void testDecorationBorderManagedFrame();
+    void testDecorationBorderReentry_data();
+    void testDecorationBorderReentry();
+    void testDecorationBorderOutputBoundary();
     void testXdgNeverCommitted();
     void testXdgInitialState();
     void testXdgInitiallyMaximised();
@@ -2227,6 +2238,394 @@ void TestXdgShellWindow::testXdgDecoration()
     shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last()[0].toInt());
     auto window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
     QCOMPARE(window->isDecorated(), expectedMode == Test::XdgToplevelDecorationV1::mode_server_side);
+}
+
+void TestXdgShellWindow::testDecorationBorderClientSize_data()
+{
+    QTest::addColumn<qreal>("scale");
+    QTest::addColumn<QMarginsF>("borderDelta");
+    QTest::addColumn<bool>("fixedSize");
+    QTest::newRow("grow") << 1.0 << QMarginsF(0, 3, 0, 0) << true;
+    QTest::newRow("shrink") << 1.0 << QMarginsF(0, -3, 0, 0) << true;
+    QTest::newRow("grow-fractional") << (4.0 / 3.0) << QMarginsF(0, 2.25, 0, 0) << true;
+    QTest::newRow("shrink-fractional") << (4.0 / 3.0) << QMarginsF(0, -2.25, 0, 0) << true;
+    QTest::newRow("resizable") << 1.0 << QMarginsF(0, 3, 0, 0) << false;
+    QTest::newRow("resizable-horizontal") << 1.0 << QMarginsF(3, 0, 2, 0) << false;
+    QTest::newRow("resizable-fractional") << (4.0 / 3.0) << QMarginsF(1.5, 2.25, 0.75, 0) << false;
+    QTest::newRow("unchanged") << 1.0 << QMarginsF() << false;
+}
+
+void TestXdgShellWindow::testDecorationBorderClientSize()
+{
+    QFETCH(qreal, scale);
+    QFETCH(QMarginsF, borderDelta);
+    QFETCH(bool, fixedSize);
+    Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1024), .scale = scale}});
+
+    const QSize clientSize(360, 240);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    if (fixedSize) {
+        shell->set_min_size(clientSize.width(), clientSize.height());
+        shell->set_max_size(clientSize.width(), clientSize.height());
+    }
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    auto window = Test::renderAndWaitForShown(surface.get(), clientSize, Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QCOMPARE(window->targetScale(), scale);
+    QCOMPARE(window->clientSize(), QSizeF(clientSize));
+
+    // Consume the activation configure before changing only the decoration's borders.
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), clientSize, Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    toplevelConfigure.clear();
+    const auto originalGeometry = window->frameGeometry();
+    const auto originalBorders = window->decoration()->currentState()->borders();
+    auto state = window->nextDecoration()->nextState();
+    state->setBorders(state->borders() + borderDelta);
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(configure.wait());
+    QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), clientSize);
+    const QSizeF frameDelta(borderDelta.left() + borderDelta.right(), borderDelta.top() + borderDelta.bottom());
+    QCOMPARE(window->moveResizeGeometry().size(), originalGeometry.size() + frameDelta);
+    QCOMPARE(window->frameGeometry(), originalGeometry);
+    QCOMPARE(window->clientSize(), QSizeF(clientSize));
+    QCOMPARE(window->decoration()->currentState()->borders(), originalBorders);
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), clientSize, Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->clientSize(), QSizeF(clientSize));
+    QCOMPARE(window->frameGeometry().topLeft(), originalGeometry.topLeft());
+    QCOMPARE(window->frameGeometry().size(), originalGeometry.size() + frameDelta);
+
+    // Repeated enter/leave cycles must not accumulate frame or client size drift.
+    configure.clear();
+    state = window->nextDecoration()->nextState();
+    state->setBorders(originalBorders);
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(configure.wait());
+    QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), clientSize);
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), clientSize, Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), originalGeometry);
+    QCOMPARE(window->clientSize(), QSizeF(clientSize));
+}
+
+void TestXdgShellWindow::testDecorationBorderPendingConfigure_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("queued-resize") << 0;
+    QTest::newRow("coalesced-borders") << 1;
+    QTest::newRow("unacknowledged-borders") << 2;
+}
+
+void TestXdgShellWindow::testDecorationBorderPendingConfigure()
+{
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    const auto originalGeometry = window->frameGeometry();
+    const auto originalBorders = window->decoration()->currentState()->borders();
+    const QSize targetClient = scenario == 0 ? QSize(520, 360) : QSize(360, 240);
+    const QSizeF targetFrame = window->nextClientSizeToFrameSize(targetClient);
+
+    if (scenario == 0) {
+        window->resize(targetFrame);
+    } else {
+        auto state = window->nextDecoration()->nextState();
+        state->setBorders(originalBorders + QMarginsF(0, 3, 0, 0));
+        Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    }
+    quint32 olderSerial = 0;
+    if (scenario != 1) {
+        QVERIFY(configure.wait());
+        olderSerial = configure.last().at(0).toUInt();
+        QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), targetClient);
+        configure.clear();
+    }
+    auto state = window->nextDecoration()->nextState();
+    state->setBorders(originalBorders + QMarginsF(0, 5, 0, 0));
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(configure.wait());
+    const quint32 latestSerial = configure.last().at(0).toUInt();
+    QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), targetClient);
+    QCOMPARE(window->frameGeometry(), originalGeometry);
+    QCOMPARE(window->moveResizeGeometry().size(), targetFrame + QSizeF(0, 5));
+    QCOMPARE(window->decoration()->currentState()->borders(), originalBorders);
+
+    if (olderSerial) {
+        shell->xdgSurface()->ack_configure(olderSerial);
+        Test::render(surface.get(), targetClient, Qt::yellow);
+        QVERIFY(Test::waylandSync());
+        // An older configure may update content, but cannot roll back the latest request.
+        QCOMPARE(window->moveResizeGeometry().size(), targetFrame + QSizeF(0, 5));
+    }
+    shell->xdgSurface()->ack_configure(latestSerial);
+    Test::render(surface.get(), targetClient, Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->clientSize(), QSizeF(targetClient));
+    QCOMPARE(window->frameGeometry().size(), targetFrame + QSizeF(0, 5));
+    QCOMPARE(window->frameGeometry().topLeft(), originalGeometry.topLeft());
+    QCOMPARE(window->moveResizeGeometry(), window->frameGeometry());
+}
+
+void TestXdgShellWindow::testDecorationBorderManagedFrame_data()
+{
+    QTest::addColumn<int>("mode");
+    QTest::addColumn<int>("phase");
+    for (const auto &[mode, state] : {std::pair{MaximizeRestore, "tiled"}, std::pair{MaximizeHorizontal, "maximized-horizontal"},
+                                      std::pair{MaximizeVertical, "maximized-vertical"}, std::pair{MaximizeFull, "maximized-full"}}) {
+        const std::array<QByteArray, 3> phases = {"requested", "committed", "restore-pending"};
+        for (int phase = 0; phase < 3; ++phase) {
+            const QByteArray name = QByteArray(state) + '-' + phases[phase];
+            QTest::newRow(name.constData()) << int(mode) << phase;
+        }
+    }
+}
+
+void TestXdgShellWindow::testDecorationBorderManagedFrame()
+{
+    QFETCH(int, mode);
+    QFETCH(int, phase);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+
+    // mode 0 exercises tiling; the other modes cover partial and full maximization.
+    if (mode == int(MaximizeRestore)) {
+        window->setQuickTileModeAtCurrentPosition(QuickTileFlag::Left);
+    } else {
+        window->maximize(MaximizeMode(mode));
+    }
+    QVERIFY(configure.wait());
+    if (phase != 0) {
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+    }
+    configure.clear();
+    if (phase == 2) {
+        if (mode == int(MaximizeRestore)) {
+            window->setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
+        } else {
+            window->maximize(MaximizeRestore);
+        }
+        QVERIFY(configure.wait());
+        configure.clear();
+    }
+    const auto requested = window->moveResizeGeometry();
+    const auto committed = window->frameGeometry();
+    const QSizeF requestedClient = window->nextFrameSizeToClientSize(requested.size());
+    auto state = window->nextDecoration()->nextState();
+    state->setBorders(state->borders() + QMarginsF(0, 3, 0, 0));
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(configure.wait());
+    // Frame-controlled states retain their target, even while entering or leaving them.
+    QCOMPARE(window->moveResizeGeometry(), requested);
+    QCOMPARE(window->frameGeometry(), committed);
+    QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), (requestedClient - QSizeF(0, 3)).toSize());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), requested);
+}
+
+void TestXdgShellWindow::testDecorationBorderReentry_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("notify-move") << 0;
+    QTest::newRow("notify-resize") << 1;
+    QTest::newRow("notify-close") << 2;
+    QTest::newRow("resize-in-progress") << 3;
+    QTest::newRow("interactive-resize") << 4;
+}
+
+void TestXdgShellWindow::testDecorationBorderReentry()
+{
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    const auto original = window->frameGeometry();
+    QPointer<Window> guard(window);
+    QObject context;
+    bool called = false;
+    RectF expected = original;
+    auto changeBorders = [&]() {
+        auto state = window->nextDecoration()->nextState();
+        state->setBorders(state->borders() + QMarginsF(0, 3, 0, 0));
+        Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    };
+    if (scenario <= 2) {
+        connect(window, &Window::requestedGeometryChanged, &context, [&]() {
+            if (called) {
+                return;
+            }
+            called = true;
+            if (scenario == 2) {
+                window->setSkipCloseAnimation(true);
+                window->destroyWindow();
+            } else {
+                expected = RectF(QPointF(45, 60), scenario == 0 ? window->moveResizeGeometry().size() : window->nextClientSizeToFrameSize(QSize(520, 360)));
+                window->moveResize(expected);
+            }
+        });
+        changeBorders();
+        QVERIFY(called);
+        if (scenario == 2) {
+            QVERIFY(guard.isNull());
+            return;
+        }
+    } else if (scenario == 3) {
+        connect(window, &Window::frameGeometryAboutToChange, &context, [&]() {
+            if (!called) {
+                called = true;
+                changeBorders();
+            }
+        });
+        expected.setSize(window->nextClientSizeToFrameSize(QSize(520, 360)));
+        window->resize(expected.size());
+        QVERIFY(called);
+    } else {
+        window->setInteractiveMoveResizeGravity(Gravity::BottomRight);
+        QVERIFY(window->startInteractiveMoveResize());
+        changeBorders();
+    }
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    QCOMPARE(window->moveResizeGeometry(), expected);
+    const QSize expectedClient = window->nextFrameSizeToClientSize(expected.size()).toSize();
+    QCOMPARE(toplevelConfigure.last().at(0).value<QSize>(), expectedClient);
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), expectedClient, Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), expected);
+    if (scenario == 4) {
+        window->finishInteractiveMoveResize(false);
+    }
+}
+
+void TestXdgShellWindow::testDecorationBorderOutputBoundary()
+{
+    Test::setOutputConfig({
+        Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1200), .scale = 4.0 / 3.0},
+        Test::OutputInfo{.geometry = Rect(0, 1200, 1280, 1200), .scale = 1.0},
+    });
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    auto state = window->nextDecoration()->nextState();
+    state->setBorders(QMarginsF(0, 50.25, 0, 0));
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(360, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    window->move(QPointF(100, 1053.375));
+    const auto original = window->moveResizeGeometry();
+    QCOMPARE(original.height(), 290.25);
+    QCOMPARE(window->nextTargetScale(), 4.0 / 3.0);
+    auto originalOutput = window->moveResizeOutput();
+    QCOMPARE(originalOutput, workspace()->outputs().first());
+
+    // Pixel-rounded tablet borders feed back into output selection if compensation moves
+    // the frame center across the boundary. Bound the callback so a regression cannot hang.
+    QObject context;
+    int scaleChanges = 0;
+    connect(window, &Window::nextTargetScaleChanged, &context, [&]() {
+        if (++scaleChanges < 6) {
+            const qreal scale = window->nextTargetScale();
+            auto next = window->nextDecoration()->nextState();
+            next->setBorders(QMarginsF(0, std::ceil(52 * scale) / scale, 0, 0));
+            Q_EMIT window->nextDecoration()->nextStateChanged(next);
+        }
+    });
+    state = window->nextDecoration()->nextState();
+    state->setBorders(QMarginsF(0, 52.5, 0, 0));
+    Q_EMIT window->nextDecoration()->nextStateChanged(state);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    QCOMPARE(scaleChanges, 0);
+    QCOMPARE(window->moveResizeOutput(), originalOutput);
+    QCOMPARE(window->moveResizeGeometry(), original);
+    QCOMPARE(window->frameGeometry(), original);
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(scaleChanges, 0);
+    QCOMPARE(window->moveResizeOutput(), originalOutput);
 }
 
 void TestXdgShellWindow::testXdgNeverCommitted()
