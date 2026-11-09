@@ -18,9 +18,9 @@
 #include "inputmethod.h"
 #include "placement.h"
 #include "pluginmanager.h"
+#include "wayland/display.h"
 #include "wayland_server.h"
 #include "workspace.h"
-#include "wayland/display.h"
 
 #include <KWayland/Client/seat.h>
 
@@ -210,6 +210,7 @@ void WaylandTestApplication::performStartup()
     // try creating the Wayland Backend
     createInput();
     createVirtualInputDevices();
+    Q_EMIT inputDevicesCreated();
     createTabletModeManager();
     createA11yManager();
 

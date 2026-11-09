@@ -102,6 +102,7 @@ function(integrationTest)
 endfunction()
 
 integrationTest(NAME testStartupDefaults SRCS startup_defaults_test.cpp LIBS KF6::ConfigCore)
+integrationTest(NAME testTabletModeStartup SRCS tabletmode_startup_test.cpp)
 integrationTest(NAME testHangDetectorShutdown SRCS hang_detector_shutdown_test.cpp
     PROPERTIES TIMEOUT 60)
 integrationTest(NAME testWindowThumbnailSource

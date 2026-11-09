@@ -108,11 +108,7 @@ private:
 
 TabletModeManager::TabletModeManager()
 {
-    if (input()->hasTabletModeSwitch()) {
-        input()->installInputEventSpy(new TabletModeSwitchEventSpy(this));
-    } else {
-        hasTabletModeInputChanged(false);
-    }
+    hasTabletModeInputChanged(input()->hasTabletModeSwitch());
 
     KSharedConfig::Ptr kwinSettings = kwinApp()->config();
     m_settingsWatcher = KConfigWatcher::create(kwinSettings);
