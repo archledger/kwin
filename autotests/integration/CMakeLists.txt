@@ -102,7 +102,14 @@ function(integrationTest)
 endfunction()
 
 integrationTest(NAME testStartupDefaults SRCS startup_defaults_test.cpp LIBS KF6::ConfigCore)
-integrationTest(NAME testTabletModeStartup SRCS tabletmode_startup_test.cpp)
+integrationTest(NAME testTabletModeStartup
+    SRCS tabletmode_startup_test.cpp
+         ../libinput/mock_libinput.cpp
+         ../../src/backends/libinput/libinputbackend.cpp
+    LIBS Libinput::Libinput)
+# libkwin uses the test transport while retaining its production Device/Connection.
+set_source_files_properties(../libinput/mock_libinput.cpp PROPERTIES COMPILE_OPTIONS "-fvisibility=default")
+target_link_options(testTabletModeStartup PRIVATE "LINKER:--export-dynamic-symbol=libinput_*")
 integrationTest(NAME testHangDetectorShutdown SRCS hang_detector_shutdown_test.cpp
     PROPERTIES TIMEOUT 60)
 integrationTest(NAME testWindowThumbnailSource

@@ -490,12 +490,25 @@ void Device::writeEntry(const ConfigKey &key, const T &value)
 
 void Device::loadConfiguration()
 {
+    readConfiguration(true);
+}
+
+void Device::loadConfigurationWithoutOutputMapping()
+{
+    readConfiguration(false);
+}
+
+void Device::readConfiguration(bool loadOutputMapping)
+{
     if (!m_config.isValid() && !m_defaultConfig.isValid()) {
         return;
     }
 
     m_loading = true;
     for (auto it = s_configData.begin(), end = s_configData.end(); it != end; ++it) {
+        if (!loadOutputMapping && (it.key() == ConfigKey::OutputName || it.key() == ConfigKey::OutputUuid)) {
+            continue;
+        }
         (*it)->read(this, m_config);
     };
 

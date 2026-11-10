@@ -53,6 +53,11 @@ void LibinputBackend::initialize()
 void LibinputBackend::updateScreens()
 {
     m_connection->updateScreens();
+    // The first screen update finishes InputRedirection::setupWorkspace(), after
+    // handlers, filters and the tablet-mode spy exist. Replay on our main thread.
+    QMetaObject::invokeMethod(this, [this]() {
+        m_connection->startProcessingEvents();
+    }, Qt::QueuedConnection);
 }
 
 } // namespace KWin
