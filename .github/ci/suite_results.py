@@ -35,6 +35,8 @@ REQUIRED = {
         "Fifo",
         "HangDetectorShutdown",
         "WindowThumbnailSource",
+        "LibinputConnection",
+        "TabletModeStartup",
     )
 } | {"kwayland-testWaylandSurface"}
 

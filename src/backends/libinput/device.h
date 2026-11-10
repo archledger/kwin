@@ -720,6 +720,11 @@ public:
      * Loads the configuration and applies it to the Device
      */
     void loadConfiguration();
+    /**
+     * Loads input settings needed before integration, deferring output bindings
+     * until a later loadConfiguration() call when Workspace exists.
+     */
+    void loadConfigurationWithoutOutputMapping();
 
     bool isSwitch() const
     {
@@ -843,6 +848,8 @@ Q_SIGNALS:
     void currentModesChanged();
 
 private:
+    void readConfiguration(bool loadOutputMapping);
+
     template<typename T>
     void writeEntry(const ConfigKey &key, const T &value);
 

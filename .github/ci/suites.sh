@@ -25,7 +25,7 @@ out=$work/out
 bld=$work/build
 mkdir -p "$out" "$bld" "$work/tmp" "$work/empty-effects"
 image=localhost/kwin-fork-ci:fedora44
-suites='X11Window|DecorationInput|DontCrashEmptyDeco|DontCrashAuroraeDestroyDeco|Tiles|XdgShellWindow|QuickTiling|MoveResize|FractionalScaling|OutputChanges|Maximized|ScreenChanges|OffscreenQuickView|InternalWindow|TabBox|Placement|TransientPlacement|StartupDefaults|Rect|RectF|Fifo|HangDetectorShutdown|WindowThumbnailSource'
+suites='X11Window|DecorationInput|DontCrashEmptyDeco|DontCrashAuroraeDestroyDeco|Tiles|XdgShellWindow|QuickTiling|MoveResize|FractionalScaling|OutputChanges|Maximized|ScreenChanges|OffscreenQuickView|InternalWindow|TabBox|Placement|TransientPlacement|StartupDefaults|Rect|RectF|Fifo|HangDetectorShutdown|WindowThumbnailSource|LibinputConnection|TabletModeStartup'
 targets="kwin kill fakedecoshadows testWaylandSurface $(tr '|' '\n' <<<"$suites" | sed 's/^/test/' | tr '\n' ' ')"
 cpus=${CPUS:-4}
 stage=device
@@ -86,7 +86,7 @@ container "cmake --build /build --parallel $cpus --target $targets -- -k 0" >"$o
     fail
 }
 printf 'build=0\n' >>"$out/STATUS"
-(cd "$bld/bin" && sha256sum "libkwin.so.$version" testXdgShellWindow testTiles testOffscreenQuickView testStartupDefaults testFifo testHangDetectorShutdown testWaylandSurface testWindowThumbnailSource) >"$out/binaries.sha256"
+(cd "$bld/bin" && sha256sum "libkwin.so.$version" testXdgShellWindow testTiles testOffscreenQuickView testStartupDefaults testFifo testHangDetectorShutdown testWaylandSurface testWindowThumbnailSource testLibinputConnection testTabletModeStartup) >"$out/binaries.sha256"
 stage=inventory
 run_test "ctest --test-dir /build --show-only=json-v1 -R '^(kwin-test($suites)|kwayland-testWaylandSurface)\$'" \
     >"$out/test-inventory.json" 2>"$out/test-inventory.stderr" || fail
