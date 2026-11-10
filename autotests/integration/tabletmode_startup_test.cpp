@@ -33,6 +33,18 @@ public:
     }
 };
 
+class NativeTabletStorage : public QObject
+{
+public:
+    NativeTabletStorage(std::shared_ptr<libinput_device> native, QObject *parent)
+        : QObject(parent)
+        , device(std::move(native))
+    {
+    }
+
+    const std::shared_ptr<libinput_device> device;
+};
+
 class TabletModeStartupTest : public QObject
 {
     Q_OBJECT
@@ -49,7 +61,7 @@ private:
     StartupTabletSwitch m_switch;
     bool m_registered = false;
     bool m_beforeManager = false;
-    std::unique_ptr<libinput_device> m_nativeTablet;
+    std::shared_ptr<libinput_device> m_nativeTablet;
     libinput *m_nativeContext = nullptr;
     LibinputBackend *m_backend = nullptr;
     QPointer<LibInput::Device> m_device;
@@ -87,7 +99,7 @@ void TabletModeStartupTest::initTestCase()
         m_outputUuid = outputs.constFirst()->uuid();
         QVERIFY(!m_outputUuid.isEmpty());
 
-        m_nativeTablet = std::make_unique<libinput_device>();
+        m_nativeTablet = std::make_shared<libinput_device>();
         m_nativeTablet->tabletTool = true;
         m_nativeTablet->name = QByteArrayLiteral("Startup relative tablet");
         m_nativeTablet->sysName = QByteArrayLiteral("eventTabletStartup");
@@ -102,6 +114,9 @@ void TabletModeStartupTest::initTestCase()
         mockLibinputSetNextContext(std::move(context));
         auto backend = std::make_unique<LibinputBackend>(kwinApp()->session());
         m_backend = backend.get();
+        // QObject children outlive the backend's derived destructor, which joins
+        // its worker and destroys the Connection and its Device wrappers.
+        new NativeTabletStorage(m_nativeTablet, m_backend);
         connect(m_backend, &InputBackend::deviceAdded, this, [this](InputDevice *device) {
             m_device = qobject_cast<LibInput::Device *>(device);
             m_relativeAtAnnouncement = device->tabletToolIsRelative();
@@ -126,15 +141,16 @@ void TabletModeStartupTest::initTestCase()
 
 void TabletModeStartupTest::cleanupTestCase()
 {
+    if (m_registered) {
+        input()->removeInputDevice(&m_switch);
+        m_registered = false;
+    }
     if (m_device) {
         auto event = std::make_unique<libinput_event>();
         event->type = LIBINPUT_EVENT_DEVICE_REMOVED;
         event->device = m_nativeTablet.get();
         mockLibinputEnqueueEvent(m_nativeContext, std::move(event));
         QTRY_VERIFY(m_device.isNull());
-    }
-    if (m_registered) {
-        input()->removeInputDevice(&m_switch);
     }
 }
 
