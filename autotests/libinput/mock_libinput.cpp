@@ -10,7 +10,57 @@
 
 #include "mock_libinput.h"
 
+#include <cerrno>
+#include <cstring>
 #include <linux/input.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+namespace
+{
+
+thread_local std::unique_ptr<libinput> s_nextContext;
+
+}
+
+libinput::libinput()
+    : fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK))
+{
+}
+
+libinput::~libinput()
+{
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+void mockLibinputSetNextContext(std::unique_ptr<libinput> context)
+{
+    Q_ASSERT(!s_nextContext);
+    s_nextContext = std::move(context);
+}
+
+void mockLibinputEnqueueEvent(libinput *context, std::unique_ptr<libinput_event> event)
+{
+    Q_ASSERT(event);
+    const std::lock_guard lock(context->eventMutex);
+    context->events.push_back(std::move(event));
+    int result;
+    do {
+        result = eventfd_write(context->fd, 1);
+    } while (result < 0 && errno == EINTR);
+    // EAGAIN means that the counter is already full and the fd is readable.
+    if (result < 0 && errno != EAGAIN) {
+        qFatal("Failed to wake mock libinput context: %s", std::strerror(errno));
+    }
+}
+
+std::size_t mockLibinputPendingEventCount(libinput *context)
+{
+    const std::lock_guard lock(context->eventMutex);
+    return context->events.size();
+}
 
 int libinput_device_keyboard_has_key(struct libinput_device *device, uint32_t code)
 {
@@ -669,7 +719,7 @@ struct libinput *libinput_udev_create_context(const struct libinput_interface *i
     if (!udev) {
         return nullptr;
     }
-    return new libinput;
+    return s_nextContext ? s_nextContext.release() : new libinput;
 }
 
 void libinput_log_set_priority(struct libinput *libinput, enum libinput_log_priority priority)
@@ -700,17 +750,32 @@ int libinput_udev_assign_seat(struct libinput *libinput, const char *seat_id)
 
 int libinput_get_fd(struct libinput *libinput)
 {
-    return -1;
+    return libinput->fd;
 }
 
 int libinput_dispatch(struct libinput *libinput)
 {
+    const std::lock_guard lock(libinput->eventMutex);
+    eventfd_t value;
+    int result;
+    do {
+        result = eventfd_read(libinput->fd, &value);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0 && errno != EAGAIN) {
+        return -errno;
+    }
     return 0;
 }
 
 struct libinput_event *libinput_get_event(struct libinput *libinput)
 {
-    return nullptr;
+    const std::lock_guard lock(libinput->eventMutex);
+    if (libinput->events.empty()) {
+        return nullptr;
+    }
+    auto event = std::move(libinput->events.front());
+    libinput->events.pop_front();
+    return event.release();
 }
 
 void libinput_suspend(struct libinput *libinput)

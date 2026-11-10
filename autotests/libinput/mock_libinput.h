@@ -17,6 +17,10 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
+#include <deque>
+#include <memory>
+#include <mutex>
 
 struct libinput_device
 {
@@ -169,9 +173,24 @@ struct libinput_event_switch : libinput_event
 
 struct libinput
 {
+    libinput();
+    ~libinput();
+
     int refCount = 1;
     QByteArray seat;
     int assignSeatRetVal = 0;
+    int fd = -1;
+    std::mutex eventMutex;
+    std::deque<std::unique_ptr<libinput_event>> events;
 };
+
+// The next context creation on this thread takes ownership of the prepared context.
+// Tests can seed it before Connection::setup() starts dispatching on its worker.
+void mockLibinputSetNextContext(std::unique_ptr<libinput> context);
+
+// Transfers ownership and wakes the context's real pollable fd. The caller must
+// keep the context and native device alive; enqueueing and dispatch are thread-safe.
+void mockLibinputEnqueueEvent(libinput *context, std::unique_ptr<libinput_event> event);
+std::size_t mockLibinputPendingEventCount(libinput *context);
 
 #endif

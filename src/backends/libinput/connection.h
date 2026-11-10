@@ -56,6 +56,7 @@ public:
     void updateScreens();
     void deactivate();
     void processEvents();
+    void startProcessingEvents();
 
     QList<Device *> devices() const;
     QStringList devicesSysNames() const;
@@ -81,11 +82,14 @@ private:
     void applyDeviceConfig(Device *device);
     void applyScreenToDevice(Device *device);
     void doSetup();
+    Device *createDevice(Event *event);
     TabletTool *getOrCreateTool(libinput_tablet_tool *tool);
 
     std::unique_ptr<QSocketNotifier> m_notifier;
     QRecursiveMutex m_mutex;
     std::deque<std::unique_ptr<Event>> m_eventQueue;
+    bool m_inputReady = false;
+    bool m_processingEvents = false;
     QList<Device *> m_devices;
     QList<TabletTool *> m_tools;
     KSharedConfigPtr m_config;

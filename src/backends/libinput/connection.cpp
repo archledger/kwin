@@ -29,6 +29,7 @@
 
 #include <QDBusConnection>
 #include <QMutexLocker>
+#include <QScopedValueRollback>
 #include <QSocketNotifier>
 
 #include <cmath>
@@ -261,18 +262,58 @@ TabletTool *Connection::getOrCreateTool(libinput_tablet_tool *handle)
     return tool;
 }
 
+void Connection::startProcessingEvents()
+{
+    QMutexLocker locker(&m_mutex);
+    if (m_inputReady) {
+        return;
+    }
+    m_inputReady = true;
+    processEvents();
+}
+
+Device *Connection::createDevice(Event *event)
+{
+    auto device = new Device(event->nativeDevice());
+    device->moveToThread(thread());
+    m_devices << device;
+    return device;
+}
+
 void Connection::processEvents()
 {
     QMutexLocker locker(&m_mutex);
+    if (m_processingEvents) {
+        return;
+    }
+    QScopedValueRollback processing(m_processingEvents, true);
+    if (!m_inputReady) {
+        // Startup needs capabilities before input consumers and Workspace exist.
+        // Keep the add records as barriers for the normal replay/coalescing pass.
+        for (size_t i = 0; i < m_eventQueue.size(); i++) {
+            auto *event = m_eventQueue[i].get();
+            if (event->type() == LIBINPUT_EVENT_DEVICE_ADDED && !event->device()) {
+                auto device = createDevice(event);
+                applyDeviceConfig(device);
+                Q_EMIT deviceAdded(device);
+            }
+        }
+        if (!m_inputReady) {
+            return;
+        }
+    }
     while (m_eventQueue.size() != 0) {
         std::unique_ptr<Event> event = std::move(m_eventQueue.front());
         m_eventQueue.pop_front();
         switch (event->type()) {
         case LIBINPUT_EVENT_DEVICE_ADDED: {
-            auto device = new Device(event->nativeDevice());
-            device->moveToThread(thread());
-            m_devices << device;
+            auto device = event->device();
+            const bool announce = !device;
+            if (announce) {
+                device = createDevice(event.get());
+            }
 
+            // Output-related settings require an initialized Workspace too.
             applyDeviceConfig(device);
             applyScreenToDevice(device);
 
@@ -284,7 +325,9 @@ void Connection::processEvents()
                 }
             });
 
-            Q_EMIT deviceAdded(device);
+            if (announce) {
+                Q_EMIT deviceAdded(device);
+            }
             break;
         }
         case LIBINPUT_EVENT_DEVICE_REMOVED: {
@@ -621,6 +664,9 @@ void Connection::processEvents()
 void Connection::updateScreens()
 {
     QMutexLocker locker(&m_mutex);
+    if (!m_inputReady) {
+        return;
+    }
     for (auto device : std::as_const(m_devices)) {
         applyScreenToDevice(device);
     }
@@ -719,12 +765,17 @@ void Connection::applyDeviceConfig(Device *device)
 
     // pass configuration to Device
     device->setConfig(m_config->group(QStringLiteral("Libinput")).group(QString::number(device->vendor())).group(QString::number(device->product())).group(device->name()));
-    device->loadConfiguration();
+    if (m_inputReady) {
+        device->loadConfiguration();
+    } else {
+        device->loadConfigurationWithoutOutputMapping();
+    }
 }
 
 void Connection::slotKGlobalSettingsNotifyChange(int type, int arg)
 {
     if (type == 3 /**SettingsChanged**/ && arg == 0 /** SETTINGS_MOUSE */) {
+        QMutexLocker locker(&m_mutex);
         m_config->reparseConfiguration();
         for (auto it = m_devices.constBegin(), end = m_devices.constEnd(); it != end; ++it) {
             if ((*it)->isPointer()) {
