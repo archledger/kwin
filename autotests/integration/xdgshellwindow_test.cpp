@@ -13221,6 +13221,8 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization_data()
     QTest::newRow("fullscreen-and-maximize-pending") << int(MaximizeFull) << false << false << 36;
     QTest::newRow("fullscreen-old-content") << int(MaximizeRestore) << false << false << 37;
     QTest::newRow("fullscreen-named-output-cleared") << int(MaximizeRestore) << true << false << 38;
+    QTest::newRow("fullscreen-superseded-after-exit-write") << int(MaximizeFull) << false << false << 39;
+    QTest::newRow("fullscreen-superseded-before-normalize") << int(MaximizeRestore) << false << false << 40;
 }
 
 void TestXdgShellWindow::testMaximizeRestoreNormalization()
@@ -13388,6 +13390,11 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             xdg->m_requestedMaximizeRevision += 2;
         } else if (scenario == 10) {
             xdg->m_fullScreenIntentRevision += 2;
+        } else if (scenario == 40) {
+            // The client holds the newer intent before normalization starts; the real writer's
+            // revisions supersede the claimed attempt's captured state.
+            shell->unset_fullscreen();
+            QVERIFY(Test::waylandSync());
         }
         bool callback = false;
         QObject context;
@@ -13414,7 +13421,10 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
                 const auto nested = window->requestTransientRestore(std::move(duplicate));
                 QCOMPARE(nested.result.outcome, Outcome::Refused);
                 QCOMPARE(window->geometryRequestGeneration(), generationBefore);
-            } else if (scenario == 7) {
+            } else if (scenario == 7 || scenario == 39) {
+                // Scenario 39 fires here after the fullscreen exit's writes and publication: the
+                // cancellation supersedes the attempt mid-normalization, before the maximize
+                // write, keeping the already-published fullscreen exit.
                 window->cancelTransientRequest();
             } else if (scenario == 11) {
                 provider.reset();
@@ -13484,7 +13494,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         }
         auto result = window->requestTransientRestore(std::move(claim));
         const bool superseded = scenario == 7 || scenario == 8 || scenario == 9 || scenario == 10 || scenario == 11 || scenario == 12
-            || scenario == 23 || scenario == 27 || scenario == 28 || scenario == 29 || scenario == 30;
+            || scenario == 23 || scenario == 27 || scenario == 28 || scenario == 29 || scenario == 30 || scenario == 39 || scenario == 40;
         QCOMPARE(result.result.outcome, superseded ? Outcome::Superseded : Outcome::AppliedCurrent);
         QCOMPARE(window->m_transientOwnership->restoreAttempt->stage, Window::TransientRestoreStage::Returned);
         QCOMPARE(window->m_transientOwnership->floating, original);
@@ -13494,6 +13504,13 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             QCOMPARE(result.requestGeneration, 0u);
             QCOMPARE(window->geometryRequestGeneration(), generationBefore);
             QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+            if (scenario == 39) {
+                // The fullscreen exit's write stands published; the maximize write never happened.
+                QVERIFY(!window->isRequestedFullScreen());
+                QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+                QVERIFY(!configure.isEmpty() || configure.wait());
+                QVERIFY(!(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Fullscreen));
+            }
         } else {
             QCOMPARE(result.requestGeneration, generationBefore + 1);
             QCOMPARE(window->moveResizeGeometry(), original);
@@ -13589,7 +13606,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
                 }
             }
         }
-        if (scenario == 6 || scenario == 7 || scenario == 11 || scenario == 12 || scenario == 15 || scenario == 27) {
+        if (scenario == 6 || scenario == 7 || scenario == 11 || scenario == 12 || scenario == 15 || scenario == 27 || scenario == 39) {
             QVERIFY(callback);
         }
         if (scenario == 8 || scenario == 28 || scenario == 29 || scenario == 30) {
