@@ -2095,6 +2095,8 @@ private:
         const QStringList activities;
         const bool normalizeMaximize;
         const bool normalizeFullScreen;
+        // A configure-less (published) restoration waits for the client's next plain commit.
+        bool publishedWithoutConfigure = false;
         // Backend state only: captured values, no record/stack references or retained Window.
         std::function<bool()> stateIsCurrent;
         bool cancelled = false;

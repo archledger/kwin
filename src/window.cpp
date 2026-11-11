@@ -5448,6 +5448,16 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
         }
         request.result.outcome = AssignmentStepOutcome::Superseded;
         request.result.checkpoint.reset();
+        return request;
+    }
+    if (request.dispatch == AssignmentRequestDispatch::Published && m_transientOwnership
+        && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+        && m_transientOwnership->restoreAttempt->sequence == sequence) {
+        // A configure-less restoration (its target's snapped client size matches the current
+        // buffer, a position-only move) publishes the geometry synchronously: no configure
+        // carries the restoration origin, so no acknowledged commit can ever complete it. The
+        // client's next plain commit settles the landed frame and is that shape's boundary.
+        m_transientOwnership->restoreAttempt->publishedWithoutConfigure = true;
     }
     return request;
 }
@@ -5466,7 +5476,14 @@ bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
         || !origin.geometryGeneration || origin.geometryGeneration != m_geometryRequestGeneration
         || origin != m_geometryRequestOrigin
         || !transientRestoreRequestIsCurrent(origin.ownershipGeneration, origin.restoreSequence)) {
-        return false;
+        // The configure-less shape's boundary: a published restoration has no configure to
+        // acknowledge, so the client's next commit - whatever it acknowledges or carries -
+        // settles its landed frame; the currency checks above carry all the safety.
+        if (!m_transientOwnership->restoreAttempt->publishedWithoutConfigure
+            || m_transientOwnership->restoreAttempt->stage != TransientRestoreStage::Returned
+            || !transientRestoreRequestIsCurrent(m_transientOwnership->generation, m_transientOwnership->restoreAttempt->sequence)) {
+            return false;
+        }
     }
     const auto generation = origin.ownershipGeneration;
     // The currency predicate already guarantees a live writer holding the restoring reservation.
