@@ -13215,6 +13215,10 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization_data()
     QTest::newRow("decoration-replaced-after-mode-write") << int(MaximizeFull) << true << true << 29;
     QTest::newRow("decoration-border-snapshot-disagrees") << int(MaximizeFull) << true << true << 30;
     QTest::newRow("pending-decoration-refused") << int(MaximizeFull) << true << true << 31;
+    QTest::newRow("fullscreen-pending") << int(MaximizeRestore) << false << false << 32;
+    QTest::newRow("fullscreen-committed") << int(MaximizeRestore) << true << false << 33;
+    QTest::newRow("fullscreen-ssd-returning-decoration") << int(MaximizeRestore) << true << true << 34;
+    QTest::newRow("fullscreen-constraint-refused") << int(MaximizeRestore) << true << false << 35;
 }
 
 void TestXdgShellWindow::testMaximizeRestoreNormalization()
@@ -13292,6 +13296,27 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         }
         configure.clear();
     }
+    const bool fullScreenRow = scenario >= 32 && scenario <= 35;
+    if (fullScreenRow) {
+        window->setFullScreen(true);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), owner);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        const quint32 oldFullScreenSerial = configure.last().at(0).value<quint32>();
+        const QSize oldFullScreenContent = toplevelConfigure.last().at(0).value<QSize>();
+        QVERIFY(window->isRequestedFullScreen());
+        if (committed) {
+            shell->xdgSurface()->ack_configure(oldFullScreenSerial);
+            Test::render(surface.get(), oldFullScreenContent, Qt::blue);
+            QVERIFY(Test::waylandSync());
+            QVERIFY(window->isFullScreen());
+        }
+        configure.clear();
+        if (scenario == 35) {
+            // A's client extent cannot satisfy the constraints the restore must respect: the
+            // claim refuses before any mutation, geometry or mode write.
+            static_cast<XdgToplevelWindow *>(window)->m_minimumSize = QSizeF(400, 400);
+        }
+    }
     if (scenario == 1) {
         window->maximize(MaximizeRestore);
         QVERIFY(!configure.isEmpty() || configure.wait());
@@ -13333,7 +13358,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
     auto held = window->makeTileAssignmentCheckpoint();
     QPointer<Window> guard(window);
     auto claim = (scenario == 2 || scenario == 21) ? window->claimTransientRestore(owner) : window->claimTransientRestoreWithMaximizeNormalization(owner);
-    const bool refused = scenario == 2 || scenario == 3 || scenario == 4 || scenario == 5 || scenario == 14 || (scenario >= 18 && scenario <= 21) || scenario == 31;
+    const bool refused = scenario == 2 || scenario == 3 || scenario == 4 || scenario == 5 || scenario == 14 || (scenario >= 18 && scenario <= 21) || scenario == 31 || scenario == 35;
     if (scenario == 18 || scenario == 21) {
         // Exercise the real output-intent writer even though requested fullscreen is already
         // false. At saturation, the write cannot advance the revision and must not be trusted.
@@ -13460,6 +13485,9 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             QCOMPARE(result.requestGeneration, generationBefore + 1);
             QCOMPARE(window->moveResizeGeometry(), original);
             QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+            if (fullScreenRow) {
+                QVERIFY(!window->isRequestedFullScreen());
+            }
             QCOMPARE(about.count(), modeBefore == MaximizeRestore ? 0 : 1);
             QVERIFY(!configure.isEmpty() || configure.wait());
             const auto serial = configure.last().at(0).value<quint32>();
@@ -13510,6 +13538,16 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             } else {
                 QCOMPARE(window->frameGeometry(), original);
                 QCOMPARE(window->maximizeMode(), MaximizeRestore);
+                if (fullScreenRow) {
+                    QVERIFY(!window->isFullScreen());
+                    QVERIFY(!(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Fullscreen));
+                    if (scenario == 34) {
+                        // The returning server decoration's borders are part of the exact frame:
+                        // A is restored as the frame, not recaptured from the managed extent.
+                        QVERIFY(window->isDecorated());
+                        QCOMPARE(window->decoration()->currentState()->borders(), originalBorders);
+                    }
+                }
             }
         }
         if (scenario == 6 || scenario == 7 || scenario == 11 || scenario == 12 || scenario == 15 || scenario == 27) {
