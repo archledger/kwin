@@ -13186,7 +13186,6 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization_data()
     QTest::newRow("requested-restore-committed-maximize") << int(MaximizeFull) << true << false << 1;
     QTest::newRow("normal-noop") << int(MaximizeRestore) << false << false << 0;
     QTest::newRow("normal-claim-remains-narrow") << int(MaximizeFull) << false << false << 2;
-    QTest::newRow("fullscreen-refused") << int(MaximizeRestore) << false << false << 3;
     QTest::newRow("borderless-refused") << int(MaximizeFull) << false << true << 4;
     QTest::newRow("mode-headroom-refused") << int(MaximizeFull) << false << false << 5;
     QTest::newRow("duplicate-during-normalization") << int(MaximizeFull) << false << false << 6;
@@ -13323,9 +13322,6 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
         QCOMPARE(window->maximizeMode(), MaximizeFull);
         configure.clear();
-    } else if (scenario == 3) {
-        window->setFullScreen(true);
-        QVERIFY(window->isRequestedFullScreen());
     } else if (scenario == 14) {
         window->setNextTargetScale(3.0);
     } else if (scenario == 31) {
@@ -13358,7 +13354,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
     auto held = window->makeTileAssignmentCheckpoint();
     QPointer<Window> guard(window);
     auto claim = (scenario == 2 || scenario == 21) ? window->claimTransientRestore(owner) : window->claimTransientRestoreWithMaximizeNormalization(owner);
-    const bool refused = scenario == 2 || scenario == 3 || scenario == 4 || scenario == 5 || scenario == 14 || (scenario >= 18 && scenario <= 21) || scenario == 31 || scenario == 35;
+    const bool refused = scenario == 2 || scenario == 4 || scenario == 5 || scenario == 14 || (scenario >= 18 && scenario <= 21) || scenario == 31 || scenario == 35;
     if (scenario == 18 || scenario == 21) {
         // Exercise the real output-intent writer even though requested fullscreen is already
         // false. At saturation, the write cannot advance the revision and must not be trusted.

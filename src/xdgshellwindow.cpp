@@ -607,9 +607,13 @@ bool XdgToplevelWindow::isRequestedFullScreen() const
 
 bool XdgToplevelWindow::isMovable() const
 {
-    if (isRequestedFullScreen()) {
-        return false;
-    }
+    return !isRequestedFullScreen() && isMovableWithoutFullScreen();
+}
+
+bool XdgToplevelWindow::isMovableWithoutFullScreen() const
+{
+    // The tail of isMovable() without the requested-fullscreen refusal: a restore attempt that
+    // normalizes fullscreen out judges movability for the state after its mode write.
     if (isSpecialWindow() && !isSplash() && !isToolbar()) {
         return false;
     }
@@ -638,9 +642,13 @@ bool XdgToplevelWindow::isMovableAcrossScreens() const
 
 bool XdgToplevelWindow::isResizable() const
 {
-    if (isRequestedFullScreen()) {
-        return false;
-    }
+    return !isRequestedFullScreen() && isResizableWithoutFullScreen();
+}
+
+bool XdgToplevelWindow::isResizableWithoutFullScreen() const
+{
+    // The tail of isResizable() without the requested-fullscreen refusal; see
+    // isMovableWithoutFullScreen().
     if (isSpecialWindow() && !isAppletPopup()) {
         return false;
     }
@@ -920,8 +928,11 @@ bool XdgToplevelWindow::canStartTransientRestoreRequest(const RectF &target) con
     // the preferred one (a bottom-right resize) anchors the target's top-left like the default, so
     // it relocates nothing and is not refused.
     const bool noPendingGravity = m_configureGravity == preferredConfigureGravity();
-    if (m_transientOwnership && m_transientOwnership->restoreAttempt && m_transientOwnership->restoreAttempt->normalizeMaximize) {
-        return noPendingGravity && !isFullScreen() && !isRequestedFullScreen()
+    if (m_transientOwnership && m_transientOwnership->restoreAttempt
+        && (m_transientOwnership->restoreAttempt->normalizeMaximize || m_transientOwnership->restoreAttempt->normalizeFullScreen)) {
+        // The attempt's mode writes clear requested fullscreen and maximize; the committed states
+        // follow with the client's acknowledgement, so only the requested state is refused here.
+        return noPendingGravity && !isRequestedFullScreen()
             && requestedMaximizeMode() == MaximizeRestore && isNormalWindow() && isMovable() && isResizable()
             && !isInteractiveMoveResize() && !isElectricBorderMaximizing() && isTransientRestoreFrameFeasible(target);
     }
@@ -998,9 +1009,15 @@ std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const R
     const QPointer<LogicalOutput> output = moveResizeOutput();
     const auto outputScale = output ? output->scale() : 0;
     const auto borders = decoration ? decoration->nextState()->borders() : QMarginsF();
+    // A fullscreen-capable attempt judges movability and resizability for the state after its
+    // mode write; every re-seal after that write captures false here and uses the plain
+    // predicates again.
+    const bool fullScreenExit = m_isRequestedFullScreen;
     return [this, target, stateCurrent, decoration, hadDecoration, policy, minimumHint, maximumHint, ruleMinimum, ruleMaximum,
-            minimum, maximum, scale, output, outputScale, borders, geometryReady]() {
-        if (!stateCurrent() || isFullScreen() || isRequestedFullScreen() || !isNormalWindow() || !isMovable() || !isResizable()
+            minimum, maximum, scale, output, outputScale, borders, geometryReady, fullScreenExit]() {
+        if (!stateCurrent() || !isNormalWindow()
+            || (fullScreenExit ? !isMovableWithoutFullScreen() : !isMovable())
+            || (fullScreenExit ? !isResizableWithoutFullScreen() : !isResizable())
             || isInteractiveMoveResize() || isElectricBorderMaximizing() || m_configureGravity != preferredConfigureGravity()
             || options->borderlessMaximizedWindows() || rules()->checkMaximize(MaximizeRestore) != MaximizeRestore
             || decorationPolicy() != policy || rules()->checkDecorationPolicy(policy) != policy
@@ -1011,9 +1028,11 @@ std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const R
             return false;
         }
         if (!geometryReady) {
+            // Requested fullscreen is the state a fullscreen-capable attempt normalizes away; its
+            // writers' revisions are bound above, and the ready check below requires it cleared.
             return true;
         }
-        if (requestedMaximizeMode() != MaximizeRestore || minSize() != minimum || maxSize() != maximum) {
+        if (isRequestedFullScreen() || requestedMaximizeMode() != MaximizeRestore || minSize() != minimum || maxSize() != maximum) {
             return false;
         }
         if (decoration) {
@@ -1031,8 +1050,10 @@ std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const R
 Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
 {
     const auto exhausted = std::numeric_limits<quint64>::max();
+    const bool normalizeFullScreen = m_isRequestedFullScreen;
     if (!transientOwnershipIsCurrent(generation) || changeMaximizeRecursion
         || (m_requestedMaximizeMode != MaximizeRestore && m_requestedMaximizeRevision >= exhausted - 1)
+        || (normalizeFullScreen && (m_requestedFullScreenRevision >= exhausted - 1 || m_fullScreenIntentRevision >= exhausted - 2))
         || m_geometryRequestGeneration >= exhausted - 1 || m_geometryUpdateGeneration >= exhausted - 1
         || m_placementContinuationRevision >= exhausted - assignmentPlacementBudget
         || decoration() != m_nextDecoration.get()) {
@@ -1043,17 +1064,22 @@ Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximi
     if (!state || !state()) {
         return {};
     }
-    if (!m_nextDecoration || m_requestedMaximizeMode == MaximizeRestore) {
+    // While fullscreen or maximized a server-side window's decoration is not the one A will use,
+    // so only the necessary extent checks run; the exact frame feasibility is sealed once the
+    // attempt's own decoration configuration has settled. A fullscreen window may have no
+    // decoration right now and still get one back on exit, as the owned fullscreen plan reads it.
+    const bool decorationChanges = normalizeFullScreen && preferredDecorationMode(false) == DecorationMode::Server;
+    if (!decorationChanges && (!m_nextDecoration || m_requestedMaximizeMode == MaximizeRestore)) {
         if (!isTransientRestoreFrameFeasible(target)) {
             return {};
         }
     } else if (!isFiniteExtent(target) || target.width() < minSize().width() || target.height() < minSize().height()
                || snapToPixels(target.size(), nextTargetScale()) != target.size()) {
-        // Maximized borders are not the borders that A will use. These are only necessary
+        // Maximized or fullscreen borders are not the borders that A will use. These are only necessary
         // checks; exact frame/client feasibility follows the same-decoration response.
         return {};
     }
-    return claimTransientRestoreWithState(generation, true, std::move(state));
+    return claimTransientRestoreWithState(generation, true, normalizeFullScreen, std::move(state));
 }
 
 Window::AssignmentStepResult XdgToplevelWindow::normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence)
@@ -1077,6 +1103,31 @@ Window::AssignmentStepResult XdgToplevelWindow::normalizeTransientRestore(Assign
         continuation.outcome = AssignmentStepOutcome::Superseded;
         continuation.checkpoint.reset();
     };
+    if (m_transientOwnership->restoreAttempt->normalizeFullScreen && isRequestedFullScreen()) {
+        // The fullscreen exit under the explicit attempt, bounded like the owned exit: the
+        // requested-state write with its own publication obligation, then the decoration
+        // configuration (plugin code; the returning decoration is created or reconfigured here).
+        // Each boundary re-seals the captured state and revalidates; a newer intent found at a
+        // boundary supersedes without legacy fallthrough.
+        writeRequestedFullScreen(false);
+        const auto fullScreenRevision = m_requestedFullScreenRevision;
+        const auto publishFullScreen = qScopeGuard([this, fullScreenRevision]() {
+            if (!isDeleted() && m_requestedFullScreenRevision == fullScreenRevision) {
+                doSetFullScreen();
+            }
+        });
+        m_transientOwnership->restoreAttempt->stateIsCurrent = transientRestoreStateConstraint(target, true, false);
+        if (!current()) {
+            supersede();
+            return continuation;
+        }
+        configureDecoration();
+        m_transientOwnership->restoreAttempt->stateIsCurrent = transientRestoreStateConstraint(target, true, false);
+        if (!current()) {
+            supersede();
+            return continuation;
+        }
+    }
     if (oldMode != MaximizeRestore) {
         Q_EMIT maximizedAboutToChange(MaximizeRestore);
         if (!current()) {

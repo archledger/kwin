@@ -196,6 +196,8 @@ public:
     bool isMovableAcrossScreens() const override;
     bool isMovable() const override;
     bool isResizable() const override;
+    bool isMovableWithoutFullScreen() const;
+    bool isResizableWithoutFullScreen() const;
     bool isCloseable() const override;
     bool isFullScreenable() const override;
     bool isMaximizable() const override;
