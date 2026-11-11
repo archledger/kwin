@@ -13218,6 +13218,8 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization_data()
     QTest::newRow("fullscreen-committed") << int(MaximizeRestore) << true << false << 33;
     QTest::newRow("fullscreen-ssd-returning-decoration") << int(MaximizeRestore) << true << true << 34;
     QTest::newRow("fullscreen-constraint-refused") << int(MaximizeRestore) << true << false << 35;
+    QTest::newRow("fullscreen-and-maximize-pending") << int(MaximizeFull) << false << false << 36;
+    QTest::newRow("fullscreen-old-content") << int(MaximizeRestore) << false << false << 37;
 }
 
 void TestXdgShellWindow::testMaximizeRestoreNormalization()
@@ -13281,6 +13283,8 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
     const auto owner = window->ownedTransientPlacementGeneration();
     quint32 oldMaximizeSerial = 0;
     QSize oldMaximizeContent;
+    quint32 oldFullScreenSerial = 0;
+    QSize oldFullScreenContent;
     if (mode != int(MaximizeRestore)) {
         window->maximize(MaximizeMode(mode));
         QCOMPARE(window->ownedTransientPlacementGeneration(), owner);
@@ -13295,13 +13299,13 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         }
         configure.clear();
     }
-    const bool fullScreenRow = scenario >= 32 && scenario <= 35;
+    const bool fullScreenRow = scenario >= 32 && scenario <= 37;
     if (fullScreenRow) {
         window->setFullScreen(true);
         QCOMPARE(window->ownedTransientPlacementGeneration(), owner);
         QVERIFY(!configure.isEmpty() || configure.wait());
-        const quint32 oldFullScreenSerial = configure.last().at(0).value<quint32>();
-        const QSize oldFullScreenContent = toplevelConfigure.last().at(0).value<QSize>();
+        oldFullScreenSerial = configure.last().at(0).value<quint32>();
+        oldFullScreenContent = toplevelConfigure.last().at(0).value<QSize>();
         QVERIFY(window->isRequestedFullScreen());
         if (committed) {
             shell->xdgSurface()->ack_configure(oldFullScreenSerial);
@@ -13503,6 +13507,27 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
                 QCOMPARE(window->frameGeometry().size().toSize(), oldMaximizeContent);
                 QCOMPARE(window->pos(), committedOrigin);
                 QCOMPARE(window->maximizeMode(), MaximizeFull);
+                QCOMPARE(window->output(), manager->output());
+                QCOMPARE(window->moveResizeGeometry(), original);
+                QVERIFY(window->transientRestoreRequestIsCurrent(owner, sequence));
+            } else if (scenario == 37) {
+                // The old fullscreen configure may deliver its content and committed state, but
+                // it must not regain placement authority over the pending restore.
+                const auto committedOrigin = window->pos();
+                bool foundOldConfigure = false;
+                for (auto event : std::as_const(xdg->m_configureEvents)) {
+                    if (event->serial == oldFullScreenSerial) {
+                        QVERIFY(event->bounds.topLeft() != committedOrigin);
+                        foundOldConfigure = true;
+                    }
+                }
+                QVERIFY(foundOldConfigure);
+                shell->xdgSurface()->ack_configure(oldFullScreenSerial);
+                Test::render(surface.get(), oldFullScreenContent, Qt::blue);
+                QVERIFY(Test::waylandSync());
+                QCOMPARE(window->frameGeometry().size().toSize(), oldFullScreenContent);
+                QCOMPARE(window->pos(), committedOrigin);
+                QCOMPARE(window->isFullScreen(), true);
                 QCOMPARE(window->output(), manager->output());
                 QCOMPARE(window->moveResizeGeometry(), original);
                 QVERIFY(window->transientRestoreRequestIsCurrent(owner, sequence));
