@@ -8091,7 +8091,10 @@ void TestXdgShellWindow::testRestoreCompletion()
         QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
     }
     if (scenario == 1) {
-        // No acknowledgement at all: nothing completes.
+        // No acknowledgement at all: nothing completes, and the dispatch alone never could.
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(writer.isReserved(id));
         return;
     }
     shell->xdgSurface()->ack_configure(restoreSerial);
@@ -13183,10 +13186,10 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     if (scenario == 23) {
         window->finishInteractiveMoveResize(false);
     }
-    // Rows 5 and 11 commit the current restoration's own configure with placement authority:
-    // that qualifying commit completes the restoration and clears the record with its
-    // reservation (testRestoreCompletion owns the boundary's contract). Every other row keeps
-    // the pending record asserted below.
+    // Rows 5, 6, 7 and 11 commit the current restoration's own configure with placement
+    // authority at the shared block: that qualifying commit completes the restoration and
+    // clears the record with its reservation (testRestoreCompletion owns the boundary's
+    // contract). Every other row keeps the pending record asserted below.
     const bool completedByQualifyingCommit = scenario == 5 || scenario == 6 || scenario == 7 || scenario == 11;
     QCOMPARE(bool(window->m_transientOwnership), !completedByQualifyingCommit);
     if (!completedByQualifyingCommit) {

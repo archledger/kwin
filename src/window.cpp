@@ -5469,6 +5469,7 @@ bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
         return false;
     }
     const auto generation = origin.ownershipGeneration;
+    // The currency predicate already guarantees a live writer holding the restoring reservation.
     if (const auto writer = m_transientOwnership->writer) {
         if (writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
             // The reservation's own validation refused: nothing is cleared, the boundary did
@@ -5480,7 +5481,10 @@ bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
     const auto lifetime = qScopeGuard([this]() {
         unref();
     });
-    disconnect(m_transientOwnership->closeCleanup);
+    // Unlike a no-request finalization, the completion installed a restore watermark that must
+    // keep suppressing stale provider events until this window is destroyed; the close cleanup
+    // stays connected so the writer forgets the tracked record (and releases the key for a new
+    // window) exactly then.
     m_transientOwnership.reset();
     return true;
 }
