@@ -1390,6 +1390,16 @@ public:
      */
     quint64 ownedTransientPlacementGeneration() const;
     /**
+     * Whether any transient-ownership record lives on this window (owned, restoring or
+     * suppressed). The placement tracker's ownership-aware capture filter: while a record
+     * lives, the window's geometry and modes are the owner's automatic placement, not the
+     * user's, so the tracker keeps the last user placement instead of recording it.
+     */
+    bool hasTransientOwnershipRecord() const
+    {
+        return m_transientOwnership != nullptr;
+    }
+    /**
      * The explicit untile-or-restore action's consumption. Only an owned record may claim one
      * qualified restoration attempt; a record already Restoring (an attempt or a release in
      * flight) consumes the action without another attempt or legacy fallthrough; an unsupported
