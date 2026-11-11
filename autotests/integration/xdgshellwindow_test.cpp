@@ -415,6 +415,8 @@ private Q_SLOTS:
     void testRestoreCompletion();
     void testRestorationStateContract_data();
     void testRestorationStateContract();
+    void testOwnedCommandIntentMatrix_data();
+    void testOwnedCommandIntentMatrix();
     void testOwnedFullScreenLegacy_data();
     void testOwnedFullScreenLegacy();
     void testOwnedFullScreenSupersession_data();
@@ -8348,6 +8350,196 @@ void TestXdgShellWindow::testRestorationStateContract()
         window->destroyWindow();
     }
     QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testOwnedCommandIntentMatrix_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("maximize-op-returns-to-managed") << 0;
+    QTest::newRow("restore-op-same-state-restores-a") << 1;
+    QTest::newRow("slot-maximize-managed") << 2;
+    QTest::newRow("slot-restore-completes") << 3;
+    QTest::newRow("titlebar-button-managed") << 4;
+    QTest::newRow("manual-move-detaches-without-restore") << 5;
+    QTest::newRow("quick-tile-precedes-no-stale-restore") << 6;
+    QTest::newRow("constraint-change-wins-safe-release") << 7;
+}
+
+void TestXdgShellWindow::testOwnedCommandIntentMatrix()
+{
+    // NT05: the command-intent matrix on identical owned state. An ordinary maximize command -
+    // through the dispatch, the shortcut slot, or the titlebar button - toggles the window on
+    // its managed rectangle and keeps the ownership; the explicit restore command on the same
+    // state restores the captured floating frame and completes. A manual move or a quick tile
+    // takes precedence, revokes detach-only, and no later stale restoration replays the
+    // automatic rectangle. A constraint that changes during an owned transition wins through
+    // the safe release.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.command-intent"));
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+    const bool decorated = scenario == 4;
+    if (decorated) {
+        decoration = Test::createXdgToplevelDecorationV1(shell.get());
+        decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    }
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    const QSize clientSize = decorated ? QSize(320, 240) : QSize(200, 100);
+    Test::render(surface.get(), clientSize, Qt::red);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), clientSize, Qt::red);
+    QVERIFY(Test::waylandSync());
+    const RectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.command-intent");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(original), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    auto controller = std::make_unique<TransientTileController>();
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller->createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller->tile()->windowGeometry();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller->admit(controller->generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->m_transientOwnership);
+    const auto generation = window->m_transientOwnership->generation;
+    // Where the settled owner lives: the managed placement as this window frames it (borders,
+    // work-area offset and all). The ordinary-toggle arms return exactly here.
+    const RectF settled = window->frameGeometry();
+    configure.clear();
+    const auto owned = [&]() {
+        return window->m_transientOwnership && window->m_transientOwnership->phase == Window::TransientOwnershipPhase::Owned
+            && window->ownedTransientPlacementGeneration() == generation && window->requestedTile() == controller->tile();
+    };
+
+    if (scenario == 0 || scenario == 2 || scenario == 4 || scenario == 7) {
+        // The ordinary maximize command on the owned window: the managed rectangle keeps the
+        // maximized axes' extents, the un-maximize returns to it, and the ownership stands.
+        if (scenario == 2) {
+            workspace()->slotWindowMaximize();
+        } else if (scenario == 4) {
+            window->decoration()->requestToggleMaximization(Qt::LeftButton);
+            QVERIFY(QTest::qWaitFor([&]() { return window->requestedMaximizeMode() == MaximizeFull; }));
+        } else {
+            workspace()->performWindowOperation(window, Options::MaximizeOp);
+        }
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeFull);
+        QVERIFY(owned());
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        configure.clear();
+        if (scenario == 7) {
+            // A constraint that cannot honor the managed extents wins through the safe
+            // release: the exit takes the legacy path to the floating frame.
+            static_cast<XdgToplevelWindow *>(window)->m_minimumSize = QSizeF(4000, 4000);
+        }
+        if (scenario == 2) {
+            workspace()->slotWindowMaximize();
+        } else if (scenario == 4) {
+            window->decoration()->requestToggleMaximization(Qt::LeftButton);
+            QVERIFY(QTest::qWaitFor([&]() { return window->requestedMaximizeMode() == MaximizeRestore; }));
+        } else {
+            workspace()->performWindowOperation(window, Options::MaximizeOp);
+        }
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::yellow);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+        if (scenario == 7) {
+            QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
+        } else {
+            QVERIFY(owned());
+            QCOMPARE(QRectF(window->frameGeometry()), QRectF(settled));
+        }
+        return;
+    }
+    if (scenario == 1 || scenario == 3) {
+        // The explicit restore command on the identical state restores A and completes.
+        if (scenario == 3) {
+            workspace()->slotWindowRestore();
+        } else {
+            workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+        }
+        QVERIFY(!window->isDeleted());
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(original));
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), original.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(QRectF(window->frameGeometry()), QRectF(original));
+        QVERIFY(!window->m_transientOwnership);
+        QVERIFY(!writer.isReserved(id));
+        return;
+    }
+    if (scenario == 5) {
+        // A plain manual move on the stably owned window revokes detach-only: no restoration
+        // attempt, no geometry request toward A, and the placement record keeps A.
+        const QPointF moved(90, 120);
+        window->move(moved);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->pos(), moved);
+        QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
+        if (window->m_transientOwnership) {
+            QVERIFY(!window->m_transientOwnership->restoreAttempt);
+        }
+        QCOMPARE(QRectF(window->geometryRestore()), QRectF(original));
+        QCOMPARE(QRectF(writer.snapshot().entries.value(key)), QRectF(original));
+        return;
+    }
+    if (scenario == 6) {
+        // A quick tile takes precedence over the transient placement: the ownership revokes,
+        // the quick tile's geometry stands, and no later stale restoration replays the
+        // automatic rectangle over it.
+        window->setQuickTileModeAtCurrentPosition(QuickTileFlag::Right);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::magenta);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->requestedQuickTileMode(), QuickTileMode(QuickTileFlag::Right));
+        QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
+        if (window->m_transientOwnership) {
+            QVERIFY(!window->m_transientOwnership->restoreAttempt);
+        }
+        const auto quickTiled = window->frameGeometry();
+        QVERIFY(QRectF(quickTiled) != QRectF(managed));
+        // Un-quick-tile: the window returns to its own saved floating size at its own
+        // position, never to the transient tile's automatic rectangle.
+        window->setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), original.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->frameGeometry().size().toSize(), original.size().toSize());
+        QVERIFY(QRectF(window->frameGeometry()) != QRectF(managed));
+        if (window->m_transientOwnership) {
+            QVERIFY(!window->m_transientOwnership->restoreAttempt);
+        }
+        return;
+    }
 }
 
 void TestXdgShellWindow::testOwnedFullScreenLegacy_data()
