@@ -13125,11 +13125,14 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
         if (scenario == 7) {
             shell->xdgSurface()->ack_configure(std::numeric_limits<quint32>::max());
         }
-        // The client's own resizes, no ACK. Without placement authority (rows 7 and 24: no current
-        // content origin) the content lands where the window is. With it (rows 6 and 9) the frame
-        // follows 6.8's rule for a client's own resize: the spontaneous gravity on the previous
-        // frame (the centre for an ordinary window), confined like any committed frame.
-        const bool spontaneous = scenario == 6 || scenario == 9;
+        // The client's own resizes, no ACK. Rows 6 and 24 have no current content origin for
+        // them - row 6's last acknowledged configure is still the completed restoration's, whose
+        // origin keeps the commit content-only and the content lands where the window is - while
+        // row 7's unknown acknowledgement resets the origin, so the completed window's own resize
+        // follows 6.8's rule: the spontaneous gravity on the previous frame (the centre for an
+        // ordinary window), confined like any committed frame. Row 9 is the same rule while the
+        // restoration is still pending.
+        const bool spontaneous = scenario == 7 || scenario == 9;
         const auto spontaneousOrigin = [&](const RectF &previous) {
             RectF frame = xdg->m_spontaneousGravity.apply(RectF(previous.topLeft(), QSizeF(content)), previous);
             if (!xdg->m_isUnrestricted) {
@@ -13150,7 +13153,7 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
             // nothing confines it horizontally here, so it grows by half the width to the left.
             QCOMPARE(expectedOrigin.x(), previous.x() - (content.width() - previous.width()) / 2.0);
         }
-        if (scenario == 9) {
+        if (scenario == 9 || scenario == 7) {
             expectedRequested = RectF(expectedOrigin, content);
         }
         QCOMPARE(window->pos(), expectedOrigin);
@@ -13167,7 +13170,7 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
             // nothing confines it horizontally here, so it grows by half the width to the left.
             QCOMPARE(expectedOrigin.x(), previous.x() - (content.width() - previous.width()) / 2.0);
         }
-        if (scenario == 9) {
+        if (scenario == 9 || scenario == 7) {
             expectedRequested = RectF(expectedOrigin, content);
         }
         QCOMPARE(window->pos(), expectedOrigin);
@@ -13184,7 +13187,7 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     // that qualifying commit completes the restoration and clears the record with its
     // reservation (testRestoreCompletion owns the boundary's contract). Every other row keeps
     // the pending record asserted below.
-    const bool completedByQualifyingCommit = scenario == 5 || scenario == 11;
+    const bool completedByQualifyingCommit = scenario == 5 || scenario == 6 || scenario == 7 || scenario == 11;
     QCOMPARE(bool(window->m_transientOwnership), !completedByQualifyingCommit);
     if (!completedByQualifyingCommit) {
         QCOMPARE(window->m_transientOwnership->generation, owner);
