@@ -413,6 +413,8 @@ private Q_SLOTS:
     void testUntileOrRestoreConsumption();
     void testRestoreCompletion_data();
     void testRestoreCompletion();
+    void testRestorationStateContract_data();
+    void testRestorationStateContract();
     void testOwnedFullScreenLegacy_data();
     void testOwnedFullScreenLegacy();
     void testOwnedFullScreenSupersession_data();
@@ -8212,6 +8214,135 @@ void TestXdgShellWindow::testRestoreCompletion()
         return;
     }
     QPointer<Window> guard(window);
+    if (guard && !guard->isDeleted()) {
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+    }
+    QTRY_VERIFY(!guard);
+}
+
+void TestXdgShellWindow::testRestorationStateContract_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("state-and-completion-lifecycle") << 0;
+    QTest::newRow("published-state-shape") << 1;
+    QTest::newRow("never-ack-pending-no-signal") << 2;
+    QTest::newRow("cancelled-holds-pending-no-signal") << 3;
+    QTest::newRow("reload-refused-state-unchanged") << 4;
+}
+
+void TestXdgShellWindow::testRestorationStateContract()
+{
+    // NT04's export row: the read-only state/completion contract. The state query reflects the
+    // native record only - no protocol logging, no timeout - and the completion signal fires
+    // exactly at the boundary with the restored frame; nothing else emits it. A suppressed
+    // (cancelled) record still holds the window as pending, and a later controller cannot
+    // reload the window into a new ownership while a restoration is in flight.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.restoration-contract"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    using State = Window::TransientRestorationState;
+    QCOMPARE(window->transientRestorationState(), State::NotRestoring);
+    QSignalSpy completed(window, &Window::transientRestorationCompleted);
+    const bool positionOnly = scenario == 1;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.restoration-contract");
+    QVERIFY(writer.trackWindow(id, key));
+    auto controller = std::make_unique<TransientTileController>();
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller->createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller->tile()->windowGeometry();
+    if (positionOnly) {
+        Test::render(surface.get(), managed.size().toSize(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->frameGeometry().size().toSize(), managed.size().toSize());
+    }
+    const RectF floating = window->frameGeometry();
+    QCOMPARE(writer.record(token, 1, {id, floating, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller->admit(controller->generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->m_transientOwnership);
+    QCOMPARE(window->transientRestorationState(), State::NotRestoring);
+    configure.clear();
+    if (scenario == 4) {
+        // A second controller cannot load the window into a new ownership while its
+        // restoration is in flight; the state and the record stand.
+        auto claimPre = window->claimTransientRestoreWithMaximizeNormalization(window->ownedTransientPlacementGeneration());
+        QCOMPARE(claimPre.continuation.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+        auto requestPre = window->requestTransientRestore(std::move(claimPre));
+        QCOMPARE(requestPre.result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+        QCOMPARE(window->transientRestorationState(), requestPre.dispatch == Window::AssignmentRequestDispatch::Published ? State::RestoringPublished : State::RestoringPending);
+        controller.reset();
+        TransientTileController second;
+        QCOMPARE(second.createTree(manager, desktop, RectF(0.5, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        // The live restoring record refuses the reload whichever admission arm rejects it; the
+        // state and the record stand.
+        QVERIFY(second.admit(second.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision) != TransientTileController::Result::Accepted);
+        QCOMPARE(window->transientRestorationState(), State::RestoringPending);
+        QVERIFY(window->m_transientOwnership);
+        return;
+    }
+    auto claim = window->claimTransientRestoreWithMaximizeNormalization(window->ownedTransientPlacementGeneration());
+    QCOMPARE(claim.continuation.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QCOMPARE(window->transientRestorationState(), State::RestoringPending);
+    auto result = window->requestTransientRestore(std::move(claim));
+    QCOMPARE(result.result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    const bool published = result.dispatch == Window::AssignmentRequestDispatch::Published;
+    QCOMPARE(window->transientRestorationState(), published ? State::RestoringPublished : State::RestoringPending);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    const quint32 restoreSerial = configure.last().at(0).value<quint32>();
+    if (scenario == 3) {
+        window->cancelTransientRequest();
+        QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+        QCOMPARE(window->transientRestorationState(), State::RestoringPending);
+    }
+    if (scenario == 2) {
+        // No acknowledgement: the state holds and nothing emits.
+        QCOMPARE(window->transientRestorationState(), published ? State::RestoringPublished : State::RestoringPending);
+        QCOMPARE(completed.count(), 0);
+        return;
+    }
+    if (!published) {
+        shell->xdgSurface()->ack_configure(restoreSerial);
+        Test::render(surface.get(), floating.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+    } else {
+        Test::render(surface.get(), managed.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+    }
+    if (scenario == 3) {
+        // A cancelled attempt's late acknowledgement completes nothing: the suppressed record
+        // still holds the window as pending.
+        QCOMPARE(window->transientRestorationState(), State::RestoringPending);
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(window->m_transientOwnership);
+    } else {
+        QCOMPARE(window->transientRestorationState(), State::NotRestoring);
+        QCOMPARE(completed.count(), 1);
+        QCOMPARE(completed.first().at(0).value<QRectF>(), QRectF(floating));
+        QVERIFY(!window->m_transientOwnership);
+    }
+    QPointer<Window> guard(window);
+    result.result.checkpoint.reset();
     if (guard && !guard->isDeleted()) {
         window->setSkipCloseAnimation(true);
         window->destroyWindow();

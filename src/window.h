@@ -1404,6 +1404,20 @@ public:
         NoStart,
     };
     TransientRestoreConsumption consumeExplicitUntileOrRestore();
+    /**
+     * NT04's read-only state/completion contract. The state query reflects the native record
+     * only - no protocol logging and no timeout participates - for the placement policy that
+     * must leave a restoring window alone. A suppressed (cancelled) record still holds its
+     * window as pending; a configure-less published restoration is its own state awaiting the
+     * client's next commit. The completion signal fires exactly at the boundary with the
+     * restored frame; cancellation, supersession and close never emit it.
+     */
+    enum class TransientRestorationState {
+        NotRestoring,
+        RestoringPending,
+        RestoringPublished,
+    };
+    TransientRestorationState transientRestorationState() const;
 
     void handleCustomQuickTileShortcut(QuickTileMode mode);
 
@@ -1774,6 +1788,7 @@ Q_SIGNALS:
     void lockScreenOverlayChanged();
     void readyForPaintingChanged();
     void maximizeGeometryRestoreChanged();
+    void transientRestorationCompleted(const QRectF &restoredFrame);
     void fullscreenGeometryRestoreChanged();
     void offscreenRenderingChanged();
     void targetScaleChanged();
