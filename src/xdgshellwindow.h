@@ -326,6 +326,8 @@ private:
     void writeRequestedMaximizeMode(MaximizeMode mode);
     TransientRestoreClaim claimTransientRestoreWithMaximizeNormalization(quint64 generation) override;
     std::function<bool()> transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const override;
+    bool isMovableWithoutFullScreen() const;
+    bool isResizableWithoutFullScreen() const;
     AssignmentStepResult normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence) override;
     bool isTransientRestoreFrameFeasible(const RectF &target) const;
     // Advanced by every requested-fullscreen write, the state the client is told; the intent
