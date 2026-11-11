@@ -2076,16 +2076,18 @@ private:
     };
     struct TransientRestoreAttempt
     {
-        TransientRestoreAttempt(quint64 sequence, QStringList activities, bool normalizeMaximize, std::function<bool()> stateIsCurrent)
+        TransientRestoreAttempt(quint64 sequence, QStringList activities, bool normalizeMaximize, bool normalizeFullScreen, std::function<bool()> stateIsCurrent)
             : sequence(sequence)
             , activities(std::move(activities))
             , normalizeMaximize(normalizeMaximize)
+            , normalizeFullScreen(normalizeFullScreen)
             , stateIsCurrent(std::move(stateIsCurrent))
         {
         }
         const quint64 sequence;
         const QStringList activities;
         const bool normalizeMaximize;
+        const bool normalizeFullScreen;
         // Backend state only: captured values, no record/stack references or retained Window.
         std::function<bool()> stateIsCurrent;
         bool cancelled = false;
@@ -2175,7 +2177,7 @@ private:
     // AppliedCurrent qualifies the claim/release continuation, not restoration completion.
     [[nodiscard]] TransientRestoreClaim claimTransientRestore(quint64 generation);
     [[nodiscard]] virtual TransientRestoreClaim claimTransientRestoreWithMaximizeNormalization(quint64 generation);
-    TransientRestoreClaim claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, std::function<bool()> stateIsCurrent);
+    TransientRestoreClaim claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, bool normalizeFullScreen, std::function<bool()> stateIsCurrent);
     virtual std::function<bool()> transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const;
     virtual AssignmentStepResult normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence);
     // Consumes the original claim continuation, not a newly sampled fence. A matching request

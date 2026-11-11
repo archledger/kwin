@@ -5219,7 +5219,7 @@ Window::TransientRestoreClaim Window::claimTransientRestore(quint64 generation)
     if (!m_transientOwnership || !isTransientTileTargetFeasible(m_transientOwnership->floating)) {
         return {};
     }
-    return claimTransientRestoreWithState(generation, false, transientRestoreStateConstraint(m_transientOwnership->floating, false, true));
+    return claimTransientRestoreWithState(generation, false, false, transientRestoreStateConstraint(m_transientOwnership->floating, false, true));
 }
 
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
@@ -5232,7 +5232,7 @@ std::function<bool()> Window::transientRestoreStateConstraint(const RectF &targe
     return {};
 }
 
-Window::TransientRestoreClaim Window::claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, std::function<bool()> stateIsCurrent)
+Window::TransientRestoreClaim Window::claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, bool normalizeFullScreen, std::function<bool()> stateIsCurrent)
 {
     TransientRestoreClaim claim;
     const auto exhausted = std::numeric_limits<quint64>::max();
@@ -5252,7 +5252,7 @@ Window::TransientRestoreClaim Window::claimTransientRestoreWithState(quint64 gen
     claim.windowId = internalId();
     claim.ownershipGeneration = generation;
     claim.sequence = ++m_transientRestoreSequence;
-    m_transientOwnership->restoreAttempt.emplace(claim.sequence, activities(), normalizeMaximize, std::move(stateIsCurrent));
+    m_transientOwnership->restoreAttempt.emplace(claim.sequence, activities(), normalizeMaximize, normalizeFullScreen, std::move(stateIsCurrent));
     claim.continuation.outcome = AssignmentStepOutcome::Superseded;
     // The claim is published before any detach notification. Do not retain a reference into the
     // record across this call: callbacks can close the Window or invalidate its writer/context.
@@ -5366,7 +5366,8 @@ bool Window::transientRestoreRequestIsCurrent(quint64 generation, quint64 sequen
 Window::AssignmentStepResult Window::normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence)
 {
     if (continuation.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(continuation)
-        || !transientRestoreOperationIsCurrent(generation, sequence) || m_transientOwnership->restoreAttempt->normalizeMaximize) {
+        || !transientRestoreOperationIsCurrent(generation, sequence)
+        || m_transientOwnership->restoreAttempt->normalizeMaximize || m_transientOwnership->restoreAttempt->normalizeFullScreen) {
         continuation.outcome = AssignmentStepOutcome::Superseded;
         continuation.checkpoint.reset();
     }
