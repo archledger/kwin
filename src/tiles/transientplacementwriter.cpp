@@ -423,6 +423,29 @@ TransientPlacementWriter::Result TransientPlacementWriter::beginRestore(const QU
     return Result::Accepted;
 }
 
+TransientPlacementWriter::Result TransientPlacementWriter::completeRestore(const QUuid &window, const QString &generation)
+{
+    if (m_busy) {
+        return Result::Busy;
+    }
+    const auto tracked = m_windows.constFind(window);
+    if (tracked == m_windows.constEnd()) {
+        return Result::UnknownWindow;
+    }
+    quint64 eventSequence = tracked->eventSequence;
+    const auto reservation = m_reservations.constFind(tracked->key);
+    if (reservation != m_reservations.constEnd() && reservation->deferred
+        && reservation->deferred->eventSequence > eventSequence) {
+        eventSequence = reservation->deferred->eventSequence;
+    }
+    if (eventSequence == 0) {
+        // No tracked event yet: the watermark starts at the first sequence a later record can
+        // exceed, not at zero (which completeRestore refuses).
+        eventSequence = 1;
+    }
+    return completeRestore(window, generation, eventSequence);
+}
+
 TransientPlacementWriter::Result TransientPlacementWriter::completeRestore(const QUuid &window, const QString &generation, quint64 eventSequence)
 {
     if (m_busy) {
