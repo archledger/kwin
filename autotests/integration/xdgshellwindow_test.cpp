@@ -7995,6 +7995,8 @@ void TestXdgShellWindow::testUntileOrRestoreConsumption()
         QVERIFY(window->m_transientOwnership->restoreAttempt);
         QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
         QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+        // The retained record with its cancelled attempt keeps consuming later presses.
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreInFlight);
     }
     QVERIFY(writer.isReserved(id));
 }

@@ -1153,6 +1153,10 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation 
             if (window->isDeleted()) {
                 return;
             }
+            // The action's effect is the consumed restoration; the addressed window is still
+            // raised and focused, as the release path this replaced did.
+            raiseWindow(window);
+            requestFocus(window);
             break;
         }
         // Un-fullscreen takes priority

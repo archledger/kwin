@@ -4520,19 +4520,6 @@ quint64 Window::ownedTransientPlacementGeneration() const
     return m_transientOwnership->generation;
 }
 
-bool Window::releaseOwnedPlacement()
-{
-    if (!ownedTransientPlacementGeneration()) {
-        return false;
-    }
-    ref();
-    const auto lifetime = qScopeGuard([this]() {
-        unref();
-    });
-    setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
-    return !isDeleted() && !ownedTransientPlacementGeneration();
-}
-
 QuickTileMode Window::requestedQuickTileMode() const
 {
     if (m_requestedTile) {
@@ -5242,8 +5229,12 @@ Window::TransientRestoreConsumption Window::consumeExplicitUntileOrRestore()
     });
     auto claim = claimTransientRestoreWithMaximizeNormalization(m_transientOwnership->generation);
     if (claim.continuation.outcome != AssignmentStepOutcome::AppliedCurrent) {
-        // Unsupported before mutation: the action reports no start; the ownership, the geometry
-        // and every mode stand unchanged.
+        // A refusal before any mutation leaves everything unchanged: no start. A claim that
+        // lost its authority after the revoke prefix (the attempt exists, the record is
+        // Restoring) is a stop whose writes stand, not a clean no-start.
+        if (m_transientOwnership && m_transientOwnership->restoreAttempt) {
+            return TransientRestoreConsumption::RestoreStopped;
+        }
         return TransientRestoreConsumption::NoStart;
     }
     const auto request = requestTransientRestore(std::move(claim));
