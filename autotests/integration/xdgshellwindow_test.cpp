@@ -8014,6 +8014,8 @@ void TestXdgShellWindow::testRestoreCompletion_data()
     QTest::newRow("cancelled-attempt-never-completes") << 3;
     QTest::newRow("barrier-released-after-completion") << 4;
     QTest::newRow("published-position-only-completes") << 5;
+    QTest::newRow("completes-after-controller-destroyed") << 6;
+    QTest::newRow("key-released-for-second-window") << 7;
 }
 
 void TestXdgShellWindow::testRestoreCompletion()
@@ -8044,11 +8046,11 @@ void TestXdgShellWindow::testRestoreCompletion()
     const auto id = window->internalId();
     const auto key = QStringLiteral("org.example.restore-completion");
     QVERIFY(writer.trackWindow(id, key));
-    TransientTileController controller;
+    auto controller = std::make_unique<TransientTileController>();
     auto manager = workspace()->tileManager(window->moveResizeOutput());
     auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
-    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
-    const auto managed = controller.tile()->windowGeometry();
+    QCOMPARE(controller->createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller->tile()->windowGeometry();
     if (positionOnly) {
         // The client itself grows to the managed size (a plain buffer attach, no configure), so
         // its true floating frame already has the tile's size and the restoration back to it
@@ -8061,7 +8063,7 @@ void TestXdgShellWindow::testRestoreCompletion()
     QCOMPARE(writer.record(token, 1, {id, floating, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
     auto state = writer.snapshot();
     configure.clear();
-    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QCOMPARE(controller->admit(controller->generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
     if (!configure.isEmpty() || configure.wait()) {
         shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
         Test::render(surface.get(), managed.size().toSize(), Qt::blue);
@@ -8111,6 +8113,13 @@ void TestXdgShellWindow::testRestoreCompletion()
     QCOMPARE(QRectF(window->moveResizeGeometry()), original);
     QVERIFY(!configure.isEmpty() || configure.wait());
     const quint32 restoreSerial = configure.last().at(0).value<quint32>();
+    if (scenario == 6 || scenario == 7) {
+        // The tree that owned the admission is gone before the acknowledgement: the record is
+        // Window-held and the claim detached the controller, so neither the acknowledgement nor
+        // the completion needs the tree, and the completed window's destruction releases the
+        // placement key for the next window of the same app.
+        controller.reset();
+    }
     if (scenario == 2) {
         // An older configure (the admission tile configure's serial is long consumed; use the
         // maximize configure replayed through the event list as rows 16/37 do) acknowledged and
@@ -8138,7 +8147,7 @@ void TestXdgShellWindow::testRestoreCompletion()
     shell->xdgSurface()->ack_configure(restoreSerial);
     Test::render(surface.get(), original.size().toSize(), Qt::green);
     QVERIFY(Test::waylandSync());
-    if (scenario == 0 || scenario == 4) {
+    if (scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7) {
         // The qualifying commit completed the restoration: the record cleared and the writer's
         // restoring reservation completed with it.
         QVERIFY(!window->m_transientOwnership);
@@ -8167,6 +8176,41 @@ void TestXdgShellWindow::testRestoreCompletion()
         }
     }
     result.result.checkpoint.reset();
+    if (scenario == 7) {
+        // The completed window's destruction releases the placement key: a second window of the
+        // same app acquires its own ownership afterwards.
+        QPointer<Window> first(window);
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+        QTRY_VERIFY(!first);
+        QVERIFY(!writer.isReserved(id));
+
+        std::unique_ptr<KWayland::Client::Surface> surface2(Test::createSurface());
+        std::unique_ptr<Test::XdgToplevel> shell2(Test::createXdgToplevelSurface(surface2.get()));
+        shell2->set_app_id(key);
+        QSignalSpy configure2(shell2->xdgSurface(), &Test::XdgSurface::configureRequested);
+        Window *second = Test::renderAndWaitForShown(surface2.get(), QSize(200, 100), Qt::red);
+        QVERIFY(second);
+        QVERIFY(!configure2.isEmpty() || configure2.wait());
+        shell2->xdgSurface()->ack_configure(configure2.last().at(0).value<quint32>());
+        Test::render(surface2.get(), QSize(200, 100), Qt::red);
+        QVERIFY(Test::waylandSync());
+        const auto id2 = second->internalId();
+        QVERIFY(writer.trackWindow(id2, key));
+        QCOMPARE(writer.record(token, 3, {id2, QRectF(second->frameGeometry()), 3, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+        auto state2 = writer.snapshot();
+        TransientTileController secondController;
+        QCOMPARE(secondController.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+        const auto managed2 = secondController.tile()->windowGeometry();
+        QCOMPARE(secondController.admit(secondController.generation(), second, &writer, token, key, state2.providerRevision, state2.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(!configure2.isEmpty() || configure2.wait());
+        shell2->xdgSurface()->ack_configure(configure2.last().at(0).value<quint32>());
+        Test::render(surface2.get(), managed2.size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(second->m_transientOwnership);
+        QVERIFY(writer.isReserved(id2));
+        return;
+    }
     QPointer<Window> guard(window);
     if (guard && !guard->isDeleted()) {
         window->setSkipCloseAnimation(true);
