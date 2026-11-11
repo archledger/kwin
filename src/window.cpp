@@ -5366,7 +5366,8 @@ bool Window::transientRestoreRequestIsCurrent(quint64 generation, quint64 sequen
 Window::AssignmentStepResult Window::normalizeTransientRestore(AssignmentStepResult continuation, quint64 generation, quint64 sequence)
 {
     if (continuation.outcome != AssignmentStepOutcome::AppliedCurrent || !assignmentResultIsCurrent(continuation)
-        || !transientRestoreOperationIsCurrent(generation, sequence) || m_transientOwnership->restoreAttempt->normalizeMaximize) {
+        || !transientRestoreOperationIsCurrent(generation, sequence)
+        || m_transientOwnership->restoreAttempt->normalizeMaximize || m_transientOwnership->restoreAttempt->normalizeFullScreen) {
         continuation.outcome = AssignmentStepOutcome::Superseded;
         continuation.checkpoint.reset();
     }

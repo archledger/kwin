@@ -1054,6 +1054,9 @@ Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximi
     if (!transientOwnershipIsCurrent(generation) || changeMaximizeRecursion
         || (m_requestedMaximizeMode != MaximizeRestore && m_requestedMaximizeRevision >= exhausted - 1)
         || (normalizeFullScreen && (m_requestedFullScreenRevision >= exhausted - 1 || m_fullScreenIntentRevision >= exhausted - 2))
+        // A rule keeping the window fullscreen leaves nothing to restore; the owned release
+        // refuses the same exit, and a window that cannot go fullscreen again cannot own one.
+        || (normalizeFullScreen && (!isFullScreenable() || rules()->checkFullScreen(false)))
         || m_geometryRequestGeneration >= exhausted - 1 || m_geometryUpdateGeneration >= exhausted - 1
         || m_placementContinuationRevision >= exhausted - assignmentPlacementBudget
         || decoration() != m_nextDecoration.get()) {
@@ -1067,8 +1070,11 @@ Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximi
     // While fullscreen or maximized a server-side window's decoration is not the one A will use,
     // so only the necessary extent checks run; the exact frame feasibility is sealed once the
     // attempt's own decoration configuration has settled. A fullscreen window may have no
-    // decoration right now and still get one back on exit, as the owned fullscreen plan reads it.
-    const bool decorationChanges = normalizeFullScreen && preferredDecorationMode(false) == DecorationMode::Server;
+    // decoration right now and still get one back on exit (a server or shadow decoration carries
+    // borders; none and client decorations do not), as the owned fullscreen plan reads it.
+    const auto exitDecorationMode = preferredDecorationMode(false);
+    const bool decorationChanges = normalizeFullScreen
+        && (exitDecorationMode == DecorationMode::Server || exitDecorationMode == DecorationMode::Shadow);
     if (!decorationChanges && (!m_nextDecoration || m_requestedMaximizeMode == MaximizeRestore)) {
         if (!isTransientRestoreFrameFeasible(target)) {
             return {};
@@ -1122,6 +1128,14 @@ Window::AssignmentStepResult XdgToplevelWindow::normalizeTransientRestore(Assign
             return continuation;
         }
         configureDecoration();
+        m_transientOwnership->restoreAttempt->stateIsCurrent = transientRestoreStateConstraint(target, true, false);
+        if (!current()) {
+            supersede();
+            return continuation;
+        }
+        // The exit's requested output no longer applies; the owned and legacy exits clear it the
+        // same way, and the intent headroom reserved at the claim covers this second write.
+        writeFullScreenRequestedOutput(nullptr);
         m_transientOwnership->restoreAttempt->stateIsCurrent = transientRestoreStateConstraint(target, true, false);
         if (!current()) {
             supersede();

@@ -13220,6 +13220,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization_data()
     QTest::newRow("fullscreen-constraint-refused") << int(MaximizeRestore) << true << false << 35;
     QTest::newRow("fullscreen-and-maximize-pending") << int(MaximizeFull) << false << false << 36;
     QTest::newRow("fullscreen-old-content") << int(MaximizeRestore) << false << false << 37;
+    QTest::newRow("fullscreen-named-output-cleared") << int(MaximizeRestore) << true << false << 38;
 }
 
 void TestXdgShellWindow::testMaximizeRestoreNormalization()
@@ -13299,9 +13300,16 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         }
         configure.clear();
     }
-    const bool fullScreenRow = scenario >= 32 && scenario <= 37;
+    const bool fullScreenRow = scenario >= 32 && scenario <= 38;
     if (fullScreenRow) {
-        window->setFullScreen(true);
+        if (scenario == 38) {
+            // The client names the output the ownership lives on: the admitted combination, which
+            // records the requested output the exit under the explicit attempt must clear.
+            const auto outputs = workspace()->outputs();
+            shell->set_fullscreen(*Test::waylandOutput(outputs[0]->name()));
+        } else {
+            window->setFullScreen(true);
+        }
         QCOMPARE(window->ownedTransientPlacementGeneration(), owner);
         QVERIFY(!configure.isEmpty() || configure.wait());
         oldFullScreenSerial = configure.last().at(0).value<quint32>();
@@ -13391,6 +13399,11 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             callback = true;
             QCOMPARE(window->m_transientOwnership->restoreAttempt->stage, Window::TransientRestoreStage::Normalizing);
             QCOMPARE(window->m_transientOwnership->restoreAttempt->requestGeneration, 0u);
+            if (scenario == 36) {
+                // The fullscreen exit runs before the maximize write: its requested state is
+                // already clear when the maximize boundary fires.
+                QVERIFY(!window->isRequestedFullScreen());
+            }
             if (scenario == 6) {
                 Window::TransientRestoreClaim duplicate;
                 duplicate.windowId = id;
@@ -13487,6 +13500,11 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
             QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
             if (fullScreenRow) {
                 QVERIFY(!window->isRequestedFullScreen());
+                if (scenario == 38) {
+                    // The named output does not survive the exit; the owned and legacy exits
+                    // clear it too.
+                    QVERIFY(!xdg->m_fullScreenRequestedOutput);
+                }
             }
             QCOMPARE(about.count(), modeBefore == MaximizeRestore ? 0 : 1);
             QVERIFY(!configure.isEmpty() || configure.wait());
