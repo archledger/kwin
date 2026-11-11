@@ -201,6 +201,10 @@ void XdgSurfaceWindow::handleCommit()
     if (!current()) {
         return;
     }
+    // The acknowledged configure of the live restoration, now committed, is the native
+    // completion boundary; every other origin is a no-op inside (an unacknowledged commit, a
+    // superseded configure's late acknowledgement, a cancelled attempt).
+    completeTransientRestoration(m_lastContentOrigin);
     auto completedContent = std::move(m_pendingContentState);
     retired.push_back(std::move(m_lastAcknowledgedConfigure));
     dispose();

@@ -5448,8 +5448,62 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
         }
         request.result.outcome = AssignmentStepOutcome::Superseded;
         request.result.checkpoint.reset();
+        return request;
+    }
+    if (request.dispatch == AssignmentRequestDispatch::Published && m_transientOwnership
+        && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+        && m_transientOwnership->restoreAttempt->sequence == sequence) {
+        // A configure-less restoration (its target's snapped client size matches the current
+        // buffer, a position-only move) publishes the geometry synchronously: no configure
+        // carries the restoration origin, so no acknowledged commit can ever complete it. The
+        // client's next plain commit settles the landed frame and is that shape's boundary.
+        m_transientOwnership->restoreAttempt->publishedWithoutConfigure = true;
     }
     return request;
+}
+
+bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
+{
+    // NT04's native completion boundary: only the live restoration's own acknowledged and
+    // committed configure completes it. The origin's generation, ownership and sequence must all
+    // be current; a cancelled or superseded attempt, or an older configure's late
+    // acknowledgement, never finalizes anything. ACK alone, equal geometry or elapsed time are
+    // not the boundary (docs/NT03-RESTORATION-SPEC.md, "Completion boundary").
+    if (isDeleted() || !m_transientOwnership || !m_transientOwnership->restoreAttempt) {
+        return false;
+    }
+    if (origin.kind != GeometryRequestOrigin::Kind::Restoration
+        || !origin.geometryGeneration || origin.geometryGeneration != m_geometryRequestGeneration
+        || origin != m_geometryRequestOrigin
+        || !transientRestoreRequestIsCurrent(origin.ownershipGeneration, origin.restoreSequence)) {
+        // The configure-less shape's boundary: a published restoration has no configure to
+        // acknowledge, so the client's next commit - whatever it acknowledges or carries -
+        // settles its landed frame; the currency checks above carry all the safety.
+        if (!m_transientOwnership->restoreAttempt->publishedWithoutConfigure
+            || m_transientOwnership->restoreAttempt->stage != TransientRestoreStage::Returned
+            || !transientRestoreRequestIsCurrent(m_transientOwnership->generation, m_transientOwnership->restoreAttempt->sequence)) {
+            return false;
+        }
+    }
+    const auto generation = origin.ownershipGeneration;
+    // The currency predicate already guarantees a live writer holding the restoring reservation.
+    if (const auto writer = m_transientOwnership->writer) {
+        if (writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+            // The reservation's own validation refused: nothing is cleared, the boundary did
+            // not happen, and a later qualifying commit can complete again.
+            return false;
+        }
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // Unlike a no-request finalization, the completion installed a restore watermark that must
+    // keep suppressing stale provider events until this window is destroyed; the close cleanup
+    // stays connected so the writer forgets the tracked record (and releases the key for a new
+    // window) exactly then.
+    m_transientOwnership.reset();
+    return true;
 }
 
 bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)
