@@ -13302,7 +13302,7 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         }
         configure.clear();
     }
-    const bool fullScreenRow = scenario >= 32 && scenario <= 38;
+    const bool fullScreenRow = scenario >= 32 && scenario <= 40;
     if (fullScreenRow) {
         if (scenario == 38) {
             // The client names the output the ownership lives on: the admitted combination, which
@@ -13502,7 +13502,12 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         QCOMPARE(window->fullscreenGeometryRestore(), mutableFullscreen);
         if (superseded) {
             QCOMPARE(result.requestGeneration, 0u);
-            QCOMPARE(window->geometryRequestGeneration(), generationBefore);
+            if (scenario != 40) {
+                QCOMPARE(window->geometryRequestGeneration(), generationBefore);
+            }
+            // Scenario 40's client unfullscreen is itself the newer intent: its own legacy exit
+            // may request geometry; the superseded attempt dispatched nothing (generation 0
+            // above), which is what the row proves.
             QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
             if (scenario == 39) {
                 // The fullscreen exit's write stands published; the maximize write never happened.
