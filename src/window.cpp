@@ -5465,6 +5465,18 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
     return request;
 }
 
+Window::TransientRestorationState Window::transientRestorationState() const
+{
+    if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {
+        return TransientRestorationState::NotRestoring;
+    }
+    if (m_transientOwnership->restoreAttempt->publishedWithoutConfigure
+        && m_transientOwnership->restoreAttempt->stage == TransientRestoreStage::Returned) {
+        return TransientRestorationState::RestoringPublished;
+    }
+    return TransientRestorationState::RestoringPending;
+}
+
 bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
 {
     // NT04's native completion boundary: only the live restoration's own acknowledged and
@@ -5505,7 +5517,9 @@ bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
     // keep suppressing stale provider events until this window is destroyed; the close cleanup
     // stays connected so the writer forgets the tracked record (and releases the key for a new
     // window) exactly then.
+    const RectF restored = m_transientOwnership->floating;
     m_transientOwnership.reset();
+    Q_EMIT transientRestorationCompleted(QRectF(restored));
     return true;
 }
 
