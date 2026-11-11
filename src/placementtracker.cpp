@@ -33,6 +33,18 @@ PlacementTracker::WindowData PlacementTracker::dataForWindow(Window *window) con
     };
 }
 
+// The ownership-aware capture filter (docs/NT03-RESTORATION-SPEC.md's automatic-vs-user
+// distinction): while any transient-ownership record lives on the window, its geometry and
+// mode changes are the owner's automatic placement. The tracker keeps the last user placement
+// instead, so a layout flip replays the floating frame, never the automatic tile rectangle.
+// The restore-field savers stay unfiltered: the ownership writes the floating frame there
+// deliberately. The interaction counter only moves on user intent, which revokes ownership
+// first, so it needs no filter.
+static bool trackedPlacementIsAutomatic(const Window *window)
+{
+    return window->hasTransientOwnershipRecord();
+}
+
 void PlacementTracker::add(Window *window)
 {
     if (window->isUnmanaged() || window->isAppletPopup() || window->isSpecialWindow()) {
@@ -59,8 +71,10 @@ void PlacementTracker::add(Window *window)
     connect(window, &Window::fullscreenGeometryRestoreChanged, this, [this, window]() {
         saveFullscreenGeometryRestore(window);
     });
-    WindowData data = dataForWindow(window);
-    m_data[m_currentKey][window] = data;
+    if (!trackedPlacementIsAutomatic(window)) {
+        WindowData data = dataForWindow(window);
+        m_data[m_currentKey][window] = data;
+    }
     m_savedWindows.push_back(window);
 }
 
@@ -87,6 +101,8 @@ void PlacementTracker::restore(const QString &key)
     inhibit();
     for (const auto window : std::as_const(m_savedWindows)) {
         const auto it = dataMap.find(window);
+        if (it == dataMap.end()) {
+        }
         if (it != dataMap.end()) {
             const WindowData &newData = it.value();
 
@@ -134,7 +150,9 @@ void PlacementTracker::restore(const QString &key)
             }
         }
         // ensure data in current map is always up to date
-        dataMap[window] = dataForWindow(window);
+        if (!trackedPlacementIsAutomatic(window)) {
+            dataMap[window] = dataForWindow(window);
+        }
     }
     uninhibit();
     m_currentKey = key;
@@ -147,7 +165,7 @@ void PlacementTracker::init(const QString &key)
 
 void PlacementTracker::saveGeometry(Window *window)
 {
-    if (m_inhibitCount == 0) {
+    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window)) {
         auto &data = m_data[m_currentKey][window];
         data.geometry = window->moveResizeGeometry();
         data.outputUuid = window->moveResizeOutput()->uuid();
@@ -163,7 +181,7 @@ void PlacementTracker::saveInteractionCounter(Window *window)
 
 void PlacementTracker::saveMaximize(Window *window)
 {
-    if (m_inhibitCount == 0) {
+    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window)) {
         auto &data = m_data[m_currentKey][window];
         data.maximize = window->maximizeMode();
     }
@@ -171,7 +189,7 @@ void PlacementTracker::saveMaximize(Window *window)
 
 void PlacementTracker::saveQuickTile(Window *window)
 {
-    if (m_inhibitCount == 0) {
+    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window)) {
         auto &data = m_data[m_currentKey][window];
         data.quickTile = window->quickTileMode();
     }
@@ -179,7 +197,7 @@ void PlacementTracker::saveQuickTile(Window *window)
 
 void PlacementTracker::saveFullscreen(Window *window)
 {
-    if (m_inhibitCount == 0) {
+    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window)) {
         auto &data = m_data[m_currentKey][window];
         data.fullscreen = window->isFullScreen();
     }

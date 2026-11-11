@@ -14,6 +14,8 @@
 #include "outputconfigurationstore.h"
 #include "pointer_input.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transientplacementwriter.h"
+#include "tiles/transienttilecontroller.h"
 #include "utils/orientationsensor.h"
 #include "wayland_server.h"
 #include "window.h"
@@ -122,6 +124,8 @@ private Q_SLOTS:
     void testMaximizedWindowRestoredAfterEnablingOutput();
     void testFullScreenWindowRestoredAfterEnablingOutput();
     void testQuickTiledWindowRestoredAfterEnablingOutput();
+    void testTransientOwnedWindowRestoredAfterEnablingOutput_data();
+    void testTransientOwnedWindowRestoredAfterEnablingOutput();
     void testQuickTileUntileWindowRestoredAfterEnablingOutput();
     void testCustomTiledWindowRestoredAfterEnablingOutput_data();
     void testCustomTiledWindowRestoredAfterEnablingOutput();
@@ -676,6 +680,118 @@ void OutputChangesTest::testQuickTiledWindowRestoredAfterEnablingOutput()
     QCOMPARE(window->quickTileMode(), QuickTileFlag::Right);
     QCOMPARE(window->requestedQuickTileMode(), QuickTileFlag::Right);
     QCOMPARE(window->geometryRestore(), RectF(1280 + 50, 100, 100, 50));
+}
+
+void OutputChangesTest::testTransientOwnedWindowRestoredAfterEnablingOutput_data()
+{
+    QTest::addColumn<bool>("restorationPending");
+    QTest::newRow("settled-owned") << false;
+    QTest::newRow("restoration-pending") << true;
+}
+
+void OutputChangesTest::testTransientOwnedWindowRestoredAfterEnablingOutput()
+{
+    // NT06A: a transient-owned window's automatic tile geometry is not the user's placement.
+    // An output-layout away-and-back must replay the floating frame A - the geometry the
+    // window had before the ownership - never the automatic tile rectangle, whether the client
+    // is settled in the tile or a restoration is in flight.
+    QFETCH(bool, restorationPending);
+    const auto outputs = kwinApp()->outputBackend()->outputs();
+
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    shellSurface->set_app_id(QStringLiteral("org.example.owned-away-back"));
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    QSignalSpy toplevelConfigureRequestedSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+    QSignalSpy surfaceConfigureRequestedSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+
+    // The floating frame A on the right output (moved before any configure is acknowledged,
+    // as the stock away-and-back rows do).
+    window->move(QPointF(1280 + 50, 100));
+    QCOMPARE(window->output()->backendOutput(), outputs[1]);
+    const RectF floatingA = RectF(1280 + 50, 100, 100, 50);
+    QCOMPARE(window->frameGeometry(), floatingA);
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(Test::waylandSync());
+
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    KWin::TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.owned-away-back");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(floatingA), 1, KWin::TransientPlacementWriter::Origin::Manual}), KWin::TransientPlacementWriter::Result::Accepted);
+    KWin::TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0.5, 0, 0.5, 1)), KWin::TransientTileController::Result::Accepted);
+    const auto managed = controller.tile()->windowGeometry();
+    QVERIFY(managed.width() > 0 && managed.height() > 0);
+    auto state = writer.snapshot();
+    surfaceConfigureRequestedSpy.clear();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), KWin::TransientTileController::Result::Accepted);
+    QVERIFY(surfaceConfigureRequestedSpy.wait());
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::cyan);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), managed);
+    QVERIFY(window->ownedTransientPlacementGeneration() != 0u);
+    surfaceConfigureRequestedSpy.clear();
+
+    if (restorationPending) {
+        // The explicit restore is dispatched and its configure is still unacknowledged.
+        workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), QRectF(floatingA));
+        QVERIFY(surfaceConfigureRequestedSpy.wait());
+        surfaceConfigureRequestedSpy.clear();
+    }
+
+    // Disable the right output: the ownership releases and the window migrates left.
+    OutputConfiguration config1;
+    {
+        auto changeSet = config1.changeSet(outputs[1]);
+        changeSet->enabled = false;
+    }
+    QVERIFY(workspace()->applyOutputConfiguration(config1));
+    if (!surfaceConfigureRequestedSpy.isEmpty() || surfaceConfigureRequestedSpy.wait()) {
+        shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+    }
+    QCOMPARE(window->output()->backendOutput(), outputs[0]);
+    // The public routing query: zero once the ownership no longer holds the placement.
+    QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+
+    // Enable the right output again: the replay returns the floating frame A, never the tile.
+    OutputConfiguration config2;
+    {
+        auto changeSet = config2.changeSet(outputs[1]);
+        changeSet->enabled = true;
+    }
+    QVERIFY(workspace()->applyOutputConfiguration(config2));
+    // The replay's geometry may queue behind the migration's coalesced configures; the frame
+    // follows once the client has acknowledged everything pending.
+    for (int i = 0; i < 4 && window->frameGeometry() != floatingA; ++i) {
+        if (!surfaceConfigureRequestedSpy.isEmpty() || surfaceConfigureRequestedSpy.wait(1000)) {
+            shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
+            Test::render(surface.get(), floatingA.size().toSize(), Qt::green);
+            QVERIFY(Test::waylandSync());
+        } else {
+            break;
+        }
+    }
+    // A position-only replay publishes without a configure; the output follows the frame on
+    // the event loop.
+    QTRY_COMPARE(window->output()->backendOutput(), outputs[1]);
+    QCOMPARE(window->frameGeometry(), floatingA);
+    QCOMPARE(window->quickTileMode(), QuickTileFlag::None);
+    QCOMPARE(window->requestedQuickTileMode(), QuickTileMode(QuickTileFlag::None));
+    QCOMPARE(window->geometryRestore(), floatingA);
 }
 
 void OutputChangesTest::testQuickTileUntileWindowRestoredAfterEnablingOutput()
