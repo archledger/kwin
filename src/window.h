@@ -1390,6 +1390,20 @@ public:
      */
     quint64 ownedTransientPlacementGeneration() const;
     /**
+     * The explicit untile-or-restore action's consumption. Only an owned record may claim one
+     * qualified restoration attempt; a record already Restoring (an attempt or a release in
+     * flight) consumes the action without another attempt or legacy fallthrough; an unsupported
+     * state consumes it with no start. NotOwned leaves the ordinary action path to the caller.
+     */
+    enum class TransientRestoreConsumption {
+        NotOwned,
+        RestoreStarted,
+        RestoreStopped,
+        RestoreInFlight,
+        NoStart,
+    };
+    TransientRestoreConsumption consumeExplicitUntileOrRestore();
+    /**
      * The explicit untile-or-restore action on an owned window. A backend with an owned
      * fullscreen path leaves a requested fullscreen state, acknowledged or still pending, as the
      * owner first and releases the ownership only if that exit completed as the current intent;
@@ -2176,6 +2190,7 @@ private:
     // the Window externally; the ownership record never stores its own lifetime checkpoint.
     // AppliedCurrent qualifies the claim/release continuation, not restoration completion.
     [[nodiscard]] TransientRestoreClaim claimTransientRestore(quint64 generation);
+    // The explicit action's consumption, declared publicly beside releaseOwnedPlacement().
     [[nodiscard]] virtual TransientRestoreClaim claimTransientRestoreWithMaximizeNormalization(quint64 generation);
     TransientRestoreClaim claimTransientRestoreWithState(quint64 generation, bool normalizeMaximize, bool normalizeFullScreen, std::function<bool()> stateIsCurrent);
     virtual std::function<bool()> transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const;

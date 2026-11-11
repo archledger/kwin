@@ -5222,6 +5222,37 @@ Window::TransientRestoreClaim Window::claimTransientRestore(quint64 generation)
     return claimTransientRestoreWithState(generation, false, false, transientRestoreStateConstraint(m_transientOwnership->floating, false, true));
 }
 
+Window::TransientRestoreConsumption Window::consumeExplicitUntileOrRestore()
+{
+    if (!m_transientOwnership) {
+        return TransientRestoreConsumption::NotOwned;
+    }
+    if (m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
+        // A restoration or release already in flight consumes the action; the ordinary ladder
+        // never runs for a record that owns or is releasing the placement.
+        return TransientRestoreConsumption::RestoreInFlight;
+    }
+    if (m_transientOwnership->phase != TransientOwnershipPhase::Owned || m_transientOwnership->restoreAttempt) {
+        return m_transientOwnership->restoreAttempt ? TransientRestoreConsumption::RestoreInFlight
+                                                    : TransientRestoreConsumption::NotOwned;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    auto claim = claimTransientRestoreWithMaximizeNormalization(m_transientOwnership->generation);
+    if (claim.continuation.outcome != AssignmentStepOutcome::AppliedCurrent) {
+        // Unsupported before mutation: the action reports no start; the ownership, the geometry
+        // and every mode stand unchanged.
+        return TransientRestoreConsumption::NoStart;
+    }
+    const auto request = requestTransientRestore(std::move(claim));
+    if (request.result.outcome == AssignmentStepOutcome::AppliedCurrent) {
+        return TransientRestoreConsumption::RestoreStarted;
+    }
+    return TransientRestoreConsumption::RestoreStopped;
+}
+
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
 {
     return {};

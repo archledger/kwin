@@ -1140,23 +1140,23 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation 
         raiseWindow(window);
         requestFocus(window);
         break;
-    case Options::UntileOrRestoreOp:
-        if (window->ownedTransientPlacementGeneration()) {
-            // An owned window keeps its placement authority through an ordinary fullscreen exit;
-            // this explicit action has the owning layer leave a requested fullscreen state,
-            // acknowledged or still pending, as the owner and release in one step, only while that
-            // exit is still the current intent; a handler's newer intent is not cancelled.
-            window->ref();
-            const auto lifetime = qScopeGuard([window]() {
-                window->unref();
-            });
-            window->releaseOwnedPlacement();
+    case Options::UntileOrRestoreOp: {
+        // An owned or restoring window consumes the explicit action as one qualified restoration
+        // attempt (an in-flight record consumes it without another attempt); the ordinary ladder
+        // below never runs for it. The window is held through the consumption: its callbacks can
+        // close it.
+        window->ref();
+        const auto lifetime = qScopeGuard([window]() {
+            window->unref();
+        });
+        if (window->consumeExplicitUntileOrRestore() != Window::TransientRestoreConsumption::NotOwned) {
             if (window->isDeleted()) {
                 return;
             }
+            break;
         }
         // Un-fullscreen takes priority
-        else if (window->isFullScreen()) {
+        if (window->isFullScreen()) {
             window->setFullScreen(false);
         }
         // Un-tile if tiled
@@ -1170,6 +1170,7 @@ void Workspace::performWindowOperation(Window *window, Options::WindowOperation 
         raiseWindow(window);
         requestFocus(window);
         break;
+    }
     case Options::MinimizeOp:
         window->setMinimized(true);
         break;
