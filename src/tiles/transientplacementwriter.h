@@ -137,6 +137,9 @@ public:
     bool ownsRestoringReservation(const QUuid &window, const QString &generation) const;
     Result beginRestore(const QUuid &window, const QString &generation);
     Result completeRestore(const QUuid &window, const QString &generation, quint64 eventSequence);
+    // The completion's watermark is the newest sequence the writer has seen for the window (any
+    // deferred record included); callers cannot know it, so the arithmetic stays here.
+    Result completeRestore(const QUuid &window, const QString &generation);
     bool isReserved(const QUuid &window) const;
     Snapshot snapshot() const;
     bool flush();

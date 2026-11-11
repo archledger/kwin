@@ -5452,6 +5452,39 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
     return request;
 }
 
+bool Window::completeTransientRestoration(const GeometryRequestOrigin &origin)
+{
+    // NT04's native completion boundary: only the live restoration's own acknowledged and
+    // committed configure completes it. The origin's generation, ownership and sequence must all
+    // be current; a cancelled or superseded attempt, or an older configure's late
+    // acknowledgement, never finalizes anything. ACK alone, equal geometry or elapsed time are
+    // not the boundary (docs/NT03-RESTORATION-SPEC.md, "Completion boundary").
+    if (isDeleted() || !m_transientOwnership || !m_transientOwnership->restoreAttempt) {
+        return false;
+    }
+    if (origin.kind != GeometryRequestOrigin::Kind::Restoration
+        || !origin.geometryGeneration || origin.geometryGeneration != m_geometryRequestGeneration
+        || origin != m_geometryRequestOrigin
+        || !transientRestoreRequestIsCurrent(origin.ownershipGeneration, origin.restoreSequence)) {
+        return false;
+    }
+    const auto generation = origin.ownershipGeneration;
+    if (const auto writer = m_transientOwnership->writer) {
+        if (writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+            // The reservation's own validation refused: nothing is cleared, the boundary did
+            // not happen, and a later qualifying commit can complete again.
+            return false;
+        }
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    disconnect(m_transientOwnership->closeCleanup);
+    m_transientOwnership.reset();
+    return true;
+}
+
 bool Window::revokeTransientOwnership(quint64 generation, AssignmentStepResult *guarded)
 {
     if (!m_transientOwnership || m_transientOwnership->generation != generation) {

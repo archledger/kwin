@@ -411,6 +411,8 @@ private Q_SLOTS:
     void testOwnedFullScreen();
     void testUntileOrRestoreConsumption_data();
     void testUntileOrRestoreConsumption();
+    void testRestoreCompletion_data();
+    void testRestoreCompletion();
     void testOwnedFullScreenLegacy_data();
     void testOwnedFullScreenLegacy();
     void testOwnedFullScreenSupersession_data();
@@ -7998,7 +8000,138 @@ void TestXdgShellWindow::testUntileOrRestoreConsumption()
         // The retained record with its cancelled attempt keeps consuming later presses.
         QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreInFlight);
     }
-    QVERIFY(writer.isReserved(id));
+    // Only the duplicate row's client commits the restoration's configure; the no-start and
+    // stopped rows never do, so their reservations stay.
+    QCOMPARE(writer.isReserved(id), scenario == 2 || scenario == 3);
+}
+
+void TestXdgShellWindow::testRestoreCompletion_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("completes-on-qualifying-commit") << 0;
+    QTest::newRow("never-ack-stays-pending") << 1;
+    QTest::newRow("superseded-configure-never-completes") << 2;
+    QTest::newRow("cancelled-attempt-never-completes") << 3;
+    QTest::newRow("barrier-released-after-completion") << 4;
+}
+
+void TestXdgShellWindow::testRestoreCompletion()
+{
+    // NT04: the native completion boundary. The acknowledged configure of the live restoration,
+    // committed by the client, is the only completion: the record clears and the writer's
+    // restoring reservation completes. A superseded configure's late acknowledgement, a
+    // cancelled attempt's configure, or no acknowledgement at all never completes anything.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.restore-completion"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.restore-completion");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(original), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller.tile()->windowGeometry();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->m_transientOwnership);
+    configure.clear();
+    // The restore under test: the plain claim on the settled tiled window, dispatched.
+    window->maximize(MaximizeFull);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::cyan);
+    QVERIFY(Test::waylandSync());
+    configure.clear();
+    auto claim = window->claimTransientRestoreWithMaximizeNormalization(window->ownedTransientPlacementGeneration());
+    QCOMPARE(claim.continuation.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    const auto owner = claim.ownershipGeneration;
+    const auto sequence = claim.sequence;
+    auto result = window->requestTransientRestore(std::move(claim));
+    QCOMPARE(result.result.outcome, Window::AssignmentStepOutcome::AppliedCurrent);
+    QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    const quint32 restoreSerial = configure.last().at(0).value<quint32>();
+    if (scenario == 2) {
+        // An older configure (the admission tile configure's serial is long consumed; use the
+        // maximize configure replayed through the event list as rows 16/37 do) acknowledged and
+        // committed after the restore dispatch: content commits, placement authority does not
+        // return, and the restoration never completes on it.
+        // The maximize configure is not retained here; instead re-request geometry through the
+        // ordinary path to mint a superseding serial before acknowledging the restore's own.
+        window->maximize(MaximizeFull);
+        QVERIFY(Test::waylandSync());
+        configure.clear();
+    }
+    if (scenario == 3) {
+        // The attempt is cancelled after the dispatch; its configure's late acknowledgement
+        // must not complete anything.
+        window->cancelTransientRequest();
+        QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+    }
+    if (scenario == 1) {
+        // No acknowledgement at all: nothing completes.
+        return;
+    }
+    shell->xdgSurface()->ack_configure(restoreSerial);
+    Test::render(surface.get(), original.size().toSize(), Qt::green);
+    QVERIFY(Test::waylandSync());
+    if (scenario == 0 || scenario == 4) {
+        // The qualifying commit completed the restoration: the record cleared and the writer's
+        // restoring reservation completed with it.
+        QVERIFY(!window->m_transientOwnership);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+        QVERIFY(!writer.isReserved(id));
+        QVERIFY(!writer.ownsReservation(id, QString::number(owner)));
+        QCOMPARE(QRectF(window->frameGeometry()), original);
+        QCOMPARE(window->maximizeMode(), MaximizeRestore);
+    } else {
+        QVERIFY(window->m_transientOwnership);
+        QVERIFY(writer.isReserved(id));
+    }
+    if (scenario == 4) {
+        // The completed key accepts a fresh manual record again: the per-key barrier the
+        // reservation held is released, and the stale pre-restore frame is not what lands.
+        const QRectF later(40, 40, 220, 120);
+        QCOMPARE(writer.record(token, 2, {id, QRectF(later), 2, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+        QCOMPARE(QRectF(writer.snapshot().entries.value(key)), later);
+    }
+    if (scenario != 1) {
+        // Drain whatever configure is pending before the teardown close.
+        if (!configure.isEmpty() || configure.wait()) {
+            shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+            Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::magenta);
+            QVERIFY(Test::waylandSync());
+        }
+    }
+    result.result.checkpoint.reset();
+    QPointer<Window> guard(window);
+    if (guard && !guard->isDeleted()) {
+        window->setSkipCloseAnimation(true);
+        window->destroyWindow();
+    }
+    QTRY_VERIFY(!guard);
 }
 
 void TestXdgShellWindow::testOwnedFullScreenLegacy_data()
@@ -12528,9 +12661,14 @@ void TestXdgShellWindow::testTransientConfigurePublication()
     Test::render(surface.get(), original.size().toSize(), Qt::green);
     QVERIFY(Test::waylandSync());
     QVERIFY(entered);
-    QVERIFY(window->m_transientOwnership);
-    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
-    QVERIFY(writer.isReserved(id));
+    // The manual-intent rows supersede the restoration, keeping the pending record; the pure
+    // reentry does not, so its qualifying commit completes the restoration here.
+    const bool completedByCommit = scenario == 2;
+    QCOMPARE(bool(window->m_transientOwnership), !completedByCommit);
+    if (!completedByCommit) {
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    }
+    QCOMPARE(writer.isReserved(id), !completedByCommit);
     if (scenario == 3) {
         QVERIFY(window->isDeleted());
     } else if (scenario == 0) {
@@ -13042,12 +13180,21 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     if (scenario == 23) {
         window->finishInteractiveMoveResize(false);
     }
-    QVERIFY(window->m_transientOwnership);
-    QCOMPARE(window->m_transientOwnership->generation, owner);
-    QCOMPARE(window->m_transientOwnership->floating, original);
-    QVERIFY(writer.isReserved(id));
-    if (scenario != 15) {
-        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    // Rows 5 and 11 commit the current restoration's own configure with placement authority:
+    // that qualifying commit completes the restoration and clears the record with its
+    // reservation (testRestoreCompletion owns the boundary's contract). Every other row keeps
+    // the pending record asserted below.
+    const bool completedByQualifyingCommit = scenario == 5 || scenario == 11;
+    QCOMPARE(bool(window->m_transientOwnership), !completedByQualifyingCommit);
+    if (!completedByQualifyingCommit) {
+        QCOMPARE(window->m_transientOwnership->generation, owner);
+        QCOMPARE(window->m_transientOwnership->floating, original);
+        QVERIFY(writer.isReserved(id));
+        if (scenario != 15) {
+            QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        }
+    } else {
+        QVERIFY(!writer.isReserved(id));
     }
     QPointer<Window> guard(window);
     request.result.checkpoint.reset();
@@ -13779,7 +13926,10 @@ void TestXdgShellWindow::testMaximizeRestoreNormalization()
         if (scenario == 22 || scenario == 23 || scenario == 30) {
             QVERIFY(borderResponse);
         }
-        QVERIFY(writer.isReserved(id));
+        // The reservation survives every non-completing row: superseded attempts (nothing or a
+        // cancelled prefix), and the success rows whose newer intent invalidated the request
+        // before its commit. Only a clean qualifying commit clears it.
+        QCOMPARE(writer.isReserved(id), superseded || scenario == 24 || scenario == 25 || scenario == 26);
         result.result.checkpoint.reset();
     }
     claim.continuation.checkpoint.reset();
@@ -14187,17 +14337,25 @@ void TestXdgShellWindow::testTransientRestoreRequest()
             QCOMPARE(window->moveResizeGeometry().topLeft(), QPointF(70, 80));
             QVERIFY(window->geometryRequestGeneration() != result.requestGeneration);
         }
-        QCOMPARE(window->m_transientOwnership->restoreAttempt->requestGeneration, result.requestGeneration);
-        QVERIFY(window->m_transientOwnership->restoreAttempt->requestConsumed());
+        if (window->m_transientOwnership) {
+            QCOMPARE(window->m_transientOwnership->restoreAttempt->requestGeneration, result.requestGeneration);
+            QVERIFY(window->m_transientOwnership->restoreAttempt->requestConsumed());
+        }
     }
-    QVERIFY(window->m_transientOwnership);
-    QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
-    QVERIFY(!window->m_transientOwnership->restoreAttempt->requesting());
-    QCOMPARE(window->m_transientOwnership->generation, owner);
-    QCOMPARE(window->m_transientOwnership->restoreAttempt->sequence, sequence);
-    QCOMPARE(window->m_transientOwnership->floating, original);
+    // A scenario whose client acknowledged and committed the restoration's own configure
+    // completed it: the record and its reservation are cleared (testRestoreCompletion owns
+    // that contract). Every other shape keeps the pending record asserted below.
+    if (window->m_transientOwnership) {
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(!window->m_transientOwnership->restoreAttempt->requesting());
+        QCOMPARE(window->m_transientOwnership->generation, owner);
+        QCOMPARE(window->m_transientOwnership->restoreAttempt->sequence, sequence);
+        QCOMPARE(window->m_transientOwnership->floating, original);
+    }
     if (writer) {
-        QVERIFY(writer->isReserved(id));
+        // A scenario that committed the restoration's own configure completed it: the record
+        // and its reservation cleared together; every other shape keeps the reservation.
+        QCOMPARE(bool(writer->isReserved(id)), bool(window->m_transientOwnership));
     }
     result.result.checkpoint.reset();
     claim.continuation.checkpoint.reset();

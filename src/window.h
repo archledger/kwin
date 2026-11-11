@@ -2191,6 +2191,9 @@ private:
     // Consumes the original claim continuation, not a newly sampled fence. A matching request
     // is attempted at most once; a duplicate cannot cancel the original. No completion is implied.
     [[nodiscard]] AssignmentGeometryRequest requestTransientRestore(TransientRestoreClaim claim);
+    // NT04: complete the restoration on its own acknowledged and committed configure. True only
+    // when the boundary qualified and the record with its reservation was cleared.
+    [[nodiscard]] bool completeTransientRestoration(const GeometryRequestOrigin &origin);
     bool transientRestoreRequestIsCurrent(quint64 generation, quint64 sequence) const;
     bool transientRestoreOperationIsCurrent(quint64 generation, quint64 sequence) const;
     bool transientRestoreClaimIsCurrent(const TransientRestoreClaim &claim) const;
