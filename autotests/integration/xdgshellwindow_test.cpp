@@ -409,6 +409,8 @@ private Q_SLOTS:
     void testOwnedMaximizeDecorated();
     void testOwnedFullScreen_data();
     void testOwnedFullScreen();
+    void testUntileOrRestoreConsumption_data();
+    void testUntileOrRestoreConsumption();
     void testOwnedFullScreenLegacy_data();
     void testOwnedFullScreenLegacy();
     void testOwnedFullScreenSupersession_data();
@@ -7031,7 +7033,8 @@ void TestXdgShellWindow::testOwnedMaximize()
     QCOMPARE(window->tile(), leaf);
     QCOMPARE(restoreChanged.count(), 0);
     QCOMPARE(requestedTileChanged.count(), 0);
-    // The explicit untile-or-restore action still releases through the existing routing.
+    // The explicit untile-or-restore action consumes as one qualified restoration: the ownership
+    // is revoked into the restoring record and the captured floating frame is requested.
     workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
     QVERIFY(!window->requestedTile());
     QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
@@ -7657,9 +7660,9 @@ void TestXdgShellWindow::testOwnedFullScreen()
     QCOMPARE(requestedTileChanged.count(), 0);
     QCOMPARE(window->requestedMaximizeMode(), maximizeMode);
     if (scenario == 11) {
-        // The explicit action while the entry is still unacknowledged: the owning layer leaves the
-        // pending entry as the owner and releases in the same step. The stale entry configure,
-        // acknowledged later, commits no association; the newer placement lands with its own.
+        // The explicit action while the entry is still unacknowledged consumes as one qualified
+        // restoration: the exit write supersedes the pending entry, A is requested, and the stale
+        // entry configure acknowledged later commits its state without placement authority.
         QVERIFY(!configure.isEmpty() || configure.wait());
         const quint32 stale = configure.last().at(0).value<quint32>();
         const QSize staleSize = toplevelConfigure.last().at(0).value<QSize>();
@@ -7667,7 +7670,10 @@ void TestXdgShellWindow::testOwnedFullScreen()
         configure.clear();
         workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
         QVERIFY(!window->isRequestedFullScreen());
-        QCOMPARE(QRectF(window->moveResizeGeometry()), target);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
         QVERIFY(!window->requestedTile());
         QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
         QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
@@ -7683,11 +7689,12 @@ void TestXdgShellWindow::testOwnedFullScreen()
         QVERIFY(!window->isRequestedFullScreen());
         QVERIFY(!window->tile());
         QVERIFY(!window->requestedTile());
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
         shell->xdgSurface()->ack_configure(newer);
-        Test::render(surface.get(), target.size().toSize(), Qt::yellow);
+        Test::render(surface.get(), original.size().toSize(), Qt::yellow);
         QVERIFY(Test::waylandSync());
         QVERIFY(!window->isFullScreen());
-        QCOMPARE(QRectF(window->frameGeometry()), target);
+        QCOMPARE(QRectF(window->frameGeometry()), original);
         QVERIFY(!window->tile());
         QVERIFY(!window->requestedTile());
         QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
@@ -7753,8 +7760,9 @@ void TestXdgShellWindow::testOwnedFullScreen()
         return;
     }
     if (scenario == 10) {
-        // The exit's callback asks for fullscreen again (a newer owned entry): the explicit action
-        // does not release, because the exit it asked for is no longer the requested state.
+        // A newer fullscreen entry fired during the dispatched restoration supersedes the attempt
+        // after its prefix: the exit's writes stand published, the record keeps its restoring
+        // protection, and the ownership is not resurrected for the newer intent.
         QObject context;
         bool intervened = false;
         connect(window, &Window::requestedGeometryChanged, &context, [&]() {
@@ -7763,19 +7771,22 @@ void TestXdgShellWindow::testOwnedFullScreen()
                 window->setFullScreen(true);
             }
         });
+        configure.clear();
         workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
         QVERIFY(intervened);
         QVERIFY(window->isRequestedFullScreen());
-        QVERIFY(owned());
-        QCOMPARE(window->ownedTransientPlacementGeneration(), generation);
-        QCOMPARE(QRectF(window->moveResizeGeometry()), area);
-        QCOMPARE(QRectF(window->fullscreenGeometryRestore()), target);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+        QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
         return;
     }
     if (scenario == 12) {
-        // The exit's callback runs a newer owned round trip that ends not fullscreen: equal final
-        // values prove nothing, and the explicit action releases only an exit that completed as the
-        // current intent, so the newer operation survives with its ownership.
+        // The dispatched restoration's callback runs a newer round trip that ends not fullscreen:
+        // equal final values prove nothing, the newer intents supersede the attempt after its
+        // prefix, and the record keeps its restoring protection without resurrecting ownership.
         QObject context;
         bool intervened = false;
         connect(window, &Window::requestedGeometryChanged, &context, [&]() {
@@ -7785,29 +7796,43 @@ void TestXdgShellWindow::testOwnedFullScreen()
                 window->setFullScreen(false);
             }
         });
+        configure.clear();
         workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
         QVERIFY(intervened);
         QVERIFY(!window->isRequestedFullScreen());
-        QVERIFY(owned());
-        QCOMPARE(window->ownedTransientPlacementGeneration(), generation);
-        QCOMPARE(QRectF(window->moveResizeGeometry()), target);
-        QCOMPARE(window->requestedTile(), leaf);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+        QVERIFY(!window->requestedTile());
         return;
     }
     if (scenario == 7) {
-        // The explicit untile-or-restore action releases on its first press: the owned exit to the
-        // managed rectangle and the release happen in one dispatch.
+        // The explicit untile-or-restore action is consumed as one qualified restoration: the
+        // fullscreen exit is published and the captured floating frame A is requested; the
+        // ownership is revoked into the restoring record and the ordinary ladder never runs.
         configure.clear();
         workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
         QVERIFY(!window->isRequestedFullScreen());
-        QCOMPARE(QRectF(window->moveResizeGeometry()), target);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
         QVERIFY(!window->requestedTile());
         QVERIFY(!writer.ownsReservation(id, QString::number(generation)));
-        QVERIFY(!window->m_transientOwnership || window->m_transientOwnership->phase != Window::TransientOwnershipPhase::Owned);
         QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
         QCOMPARE(QRectF(window->geometryRestore()), original);
         QCOMPARE(writer.snapshot().entries.value(key), original);
         QCOMPARE(QRectF(window->fullscreenGeometryRestore()), target);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        const quint32 restoreSerial = configure.last().at(0).value<quint32>();
+        QVERIFY(!(toplevelConfigure.last().at(1).value<Test::XdgToplevel::States>() & Test::XdgToplevel::State::Fullscreen));
+        shell->xdgSurface()->ack_configure(restoreSerial);
+        Test::render(surface.get(), original.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(!window->isFullScreen());
+        QCOMPARE(QRectF(window->frameGeometry()), original);
         return;
     }
     const RectF replaced(30, 30, 200, 100);
@@ -7845,6 +7870,135 @@ void TestXdgShellWindow::testOwnedFullScreen()
     QCOMPARE(restoreChanged.count(), 0);
     QCOMPARE(requestedTileChanged.count(), 0);
     QCOMPARE(fullScreenChanged.count(), 2);
+}
+
+void TestXdgShellWindow::testUntileOrRestoreConsumption_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("no-record-keeps-ladder") << 0;
+    QTest::newRow("duplicate-during-flight-consumed") << 1;
+    QTest::newRow("unsupported-consumed-no-start") << 2;
+    QTest::newRow("newer-intent-stops-after-prefix") << 3;
+}
+
+void TestXdgShellWindow::testUntileOrRestoreConsumption()
+{
+    // NT03.6: the explicit untile-or-restore action's consumption. A record without ownership
+    // keeps the ordinary ladder; an owned record claims exactly one qualified restoration; a
+    // duplicate while the restoration is in flight is consumed without another attempt or
+    // legacy fallthrough; an unsupported state is consumed with no start.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.untile-consume"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF original = window->frameGeometry();
+    auto xdg = static_cast<XdgToplevelWindow *>(window);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.untile-consume");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(original), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller.tile()->windowGeometry();
+    auto state = writer.snapshot();
+    configure.clear();
+    if (scenario != 0) {
+        QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(window->m_transientOwnership);
+        configure.clear();
+    }
+    using Consumption = Window::TransientRestoreConsumption;
+    if (scenario == 0) {
+        // Without a live ownership record the consumption reports NotOwned and the ordinary
+        // ladder runs: a maximized window un-maximizes to its restore geometry.
+        window->maximize(MaximizeFull);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->maximizeMode(), MaximizeFull);
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::NotOwned);
+        workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+        // The ordinary ladder ran: the un-maximize is requested. Its commit behaviour is the
+        // stock suite's subject, not this row's.
+        QCOMPARE(window->requestedMaximizeMode(), MaximizeRestore);
+        return;
+    }
+    if (scenario == 2) {
+        // A constraint A cannot satisfy makes the claim refuse before any mutation: the action
+        // is consumed with no start, the ownership stands and the ladder never runs.
+        xdg->m_minimumSize = QSizeF(400, 400);
+        const auto generationBefore = window->geometryRequestGeneration();
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::NoStart);
+        workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+        QVERIFY(!window->m_transientOwnership->restoreAttempt);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), window->m_transientOwnership->generation);
+        QVERIFY(window->requestedTile());
+        QCOMPARE(window->geometryRequestGeneration(), generationBefore);
+        QVERIFY(configure.isEmpty());
+        xdg->m_minimumSize = QSizeF();
+    } else if (scenario == 1) {
+        // The first press starts the restoration; a duplicate while it is in flight is consumed
+        // without a second attempt, a second generation or any ladder effect.
+        const auto generationBefore = window->geometryRequestGeneration();
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreStarted);
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        const auto sequence = window->m_transientOwnership->restoreAttempt->sequence;
+        QCOMPARE(window->geometryRequestGeneration(), generationBefore + 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        configure.clear();
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreInFlight);
+        workspace()->performWindowOperation(window, Options::UntileOrRestoreOp);
+        QCOMPARE(window->m_transientOwnership->restoreAttempt->sequence, sequence);
+        QCOMPARE(window->geometryRequestGeneration(), generationBefore + 1);
+        QCOMPARE(QRectF(window->moveResizeGeometry()), original);
+        QVERIFY(configure.isEmpty());
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+        Test::render(surface.get(), original.size().toSize(), Qt::green);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(QRectF(window->frameGeometry()), original);
+    } else if (scenario == 3) {
+        // A newer fullscreen entry fired during the dispatched restoration stops it after its
+        // prefix: the writes stand, the record keeps its restoring protection.
+        QObject context;
+        bool intervened = false;
+        connect(window, &Window::requestedGeometryChanged, &context, [&]() {
+            if (!intervened) {
+                intervened = true;
+                window->setFullScreen(true);
+            }
+        });
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreStopped);
+        QVERIFY(intervened);
+        QVERIFY(window->isRequestedFullScreen());
+        QVERIFY(window->m_transientOwnership->restoreAttempt);
+        QVERIFY(window->m_transientOwnership->restoreAttempt->cancelled);
+        QCOMPARE(window->ownedTransientPlacementGeneration(), 0u);
+        // The retained record with its cancelled attempt keeps consuming later presses.
+        QCOMPARE(window->consumeExplicitUntileOrRestore(), Consumption::RestoreInFlight);
+    }
+    QVERIFY(writer.isReserved(id));
 }
 
 void TestXdgShellWindow::testOwnedFullScreenLegacy_data()

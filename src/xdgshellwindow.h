@@ -212,7 +212,6 @@ public:
     void takeFocus() override;
     bool wantsInput() const override;
     void setFullScreen(bool set) override;
-    bool releaseOwnedPlacement() override;
     void closeWindow() override;
     void maximize(MaximizeMode mode, const RectF &restore = RectF()) override;
 

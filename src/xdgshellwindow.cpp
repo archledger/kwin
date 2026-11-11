@@ -2509,40 +2509,6 @@ XdgToplevelWindow::OwnedFullScreenOutcome XdgToplevelWindow::applyFullScreen(boo
     return OwnedFullScreenOutcome::Legacy;
 }
 
-bool XdgToplevelWindow::releaseOwnedPlacement()
-{
-    const quint64 owned = ownedTransientPlacementGeneration();
-    if (!owned) {
-        return false;
-    }
-    ref();
-    const auto lifetime = qScopeGuard([this]() {
-        unref();
-    });
-    if (m_isRequestedFullScreen) {
-        // A requested fullscreen state, acknowledged or still pending, is left as the owner first;
-        // the release follows only if that exit completed as the current intent, so a handler's
-        // newer state write, even one ending not fullscreen, is not cancelled. A legacy exit
-        // releases on its own; a rule keeping the window fullscreen leaves nothing to restore.
-        if (!isFullScreenable() || rules()->checkFullScreen(false)) {
-            return false;
-        }
-        switch (applyFullScreen(false)) {
-        case OwnedFullScreenOutcome::Legacy:
-            return !isDeleted() && !ownedTransientPlacementGeneration();
-        case OwnedFullScreenOutcome::Stopped:
-            return false;
-        case OwnedFullScreenOutcome::Applied:
-            break;
-        }
-        if (isDeleted() || ownedTransientPlacementGeneration() != owned) {
-            return false;
-        }
-    }
-    setQuickTileModeAtCurrentPosition(QuickTileFlag::None);
-    return !isDeleted() && !ownedTransientPlacementGeneration();
-}
-
 void XdgToplevelWindow::finishFullScreenLegacy(bool set)
 {
     if (set) {
