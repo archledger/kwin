@@ -192,6 +192,9 @@ private:
     quint64 m_providerRevision = 0;
     quint64 m_mapRevision = 0;
     quint64 m_persistedRevision = 0;
+    // True once a flush attempt has covered the map as it stands: an attempt that failed must
+    // not be retried from the destructor, while a change no attempt covered yet may be.
+    bool m_flushAttempted = false;
     bool m_readable = true;
     bool m_busy = false;
     QTimer m_flushTimer;
