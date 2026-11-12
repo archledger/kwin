@@ -18,6 +18,7 @@
 #include "tiles/tilemanager.h"
 #include "virtualdesktops.h"
 #include "window.h"
+#include "tiles/transientplacementwriter.h"
 #include "workspace.h"
 #if KWIN_BUILD_ACTIVITIES
 #include "activities.h"
@@ -493,7 +494,17 @@ KWin::TileManager *WorkspaceWrapper::tilingForScreen(LogicalOutput *output) cons
     if (tileManager) {
         QJSEngine::setObjectOwnership(tileManager, QJSEngine::CppOwnership);
     }
+
     return tileManager;
+}
+
+TransientPlacementWriter *WorkspaceWrapper::placementWriter() const
+{
+    auto writer = workspace()->placementWriter();
+    if (writer) {
+        QJSEngine::setObjectOwnership(writer, QJSEngine::CppOwnership);
+    }
+    return writer;
 }
 
 Tile *WorkspaceWrapper::rootTile(LogicalOutput *output, VirtualDesktop *desktop) const
