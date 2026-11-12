@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VERSION "6.8.2") # Handled by release scripts
+set(PROJECT_VERSION "6.8.4") # Handled by release scripts
 project(KWin VERSION ${PROJECT_VERSION})
 
 set(CMAKE_C_STANDARD 99)
@@ -282,7 +282,7 @@ if (KWIN_BUILD_X11)
     set_package_properties(Xwayland PROPERTIES
         URL "https://x.org"
         DESCRIPTION "Xwayland X server"
-        TYPE RUNTIME
+        TYPE REQUIRED
         PURPOSE "Needed for running kwin_wayland"
     )
 
