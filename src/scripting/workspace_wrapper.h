@@ -28,6 +28,7 @@ namespace KWin
 class Tile;
 class TileManager;
 class TransientPlacementWriter;
+class TransientTilingApi;
 class Window;
 class LogicalOutput;
 class VirtualDesktop;
@@ -406,6 +407,15 @@ public:
      * submission natively.
      */
     Q_INVOKABLE KWin::TransientPlacementWriter *placementWriter() const;
+
+    /**
+     * \qmlmethod TransientTilingApi Workspace::transientTiling()
+     * The QML-facing facade for the transient tiling system: the writer's provider
+     * registration, tracking and record submission, and the controller's tile
+     * creation, admission and release — all with QML-friendly arguments. The
+     * provider token is opaque text; no acknowledgment setter exists.
+     */
+    Q_INVOKABLE KWin::TransientTilingApi *transientTiling() const;
 
     /*!
      * \qmlmethod Tile Workspace::rootTile(LogicalOutput output, VirtualDesktop desktop)
