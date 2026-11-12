@@ -39,6 +39,8 @@
 
 #include <functional>
 #include <limits>
+#include <type_traits>
+#include <utility>
 
 Q_DECLARE_METATYPE(KWin::QuickTileMode)
 Q_DECLARE_METATYPE(KWin::MaximizeMode)
@@ -296,6 +298,35 @@ void TilesTest::transientPublicMutations_data()
     QTest::newRow("destroy-child") << 9;
 }
 
+namespace
+{
+
+// Plasma/6.8 resizes toward an absolute root point while master resizes by a
+// delta vector; a transient tile refuses both, which is what the row below pins.
+// Dispatch on the available overload; each spelling is only instantiated in
+// builds that provide it.
+template<typename TileType, typename = void>
+struct ResizeFromGravityTakesDelta : std::false_type
+{
+};
+
+template<typename TileType>
+struct ResizeFromGravityTakesDelta<TileType, std::void_t<decltype(std::declval<TileType *>()->resizeFromGravity(Gravity::BottomRight, std::declval<QPointF>()))>> : std::true_type
+{
+};
+
+template<bool TakesDelta, typename TileType>
+void resizeFromPublicGravity(TileType *tile)
+{
+    if constexpr (TakesDelta) {
+        tile->resizeFromGravity(Gravity::BottomRight, QPointF(900, 700));
+    } else {
+        tile->resizeFromGravity(Gravity::BottomRight, 900, 700);
+    }
+}
+
+}
+
 void TilesTest::transientPublicMutations()
 {
     QFETCH(int, operation);
@@ -341,7 +372,7 @@ void TilesTest::transientPublicMutations()
         tile->resizeByPixels(100, Qt::RightEdge);
         break;
     case 7:
-        tile->resizeFromGravity(Gravity::BottomRight, 900, 700);
+        resizeFromPublicGravity<ResizeFromGravityTakesDelta<TransientTestTile>::value>(tile);
         break;
     case 8: {
         std::unique_ptr<TransientTestTile> created(tile->createChildAt<TransientTestTile>(RectF(0.1, 0.1, 0.2, 0.2), 0));
