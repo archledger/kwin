@@ -56,6 +56,14 @@ public:
     Q_INVOKABLE bool trackWindow(Window *window, const QString &key);
 
     /**
+     * The key the writer holds the window under, or an empty string when it does not
+     * hold it: a refused trackWindow (an earlier provider incarnation's binding) leaves
+     * the caller unable to tell which key a record would file under, and assuming one
+     * can overwrite another app's entry.
+     */
+    Q_INVOKABLE QString windowBinding(Window *window);
+
+    /**
      * Submits a placement record. The origin is 0=Manual, 1=Ordinary, 2=Restoration,
      * 3=Close. The eventSequence must be strictly increasing per window.
      */

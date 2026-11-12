@@ -124,6 +124,10 @@ public:
         return m_provider && !provider.isNull() && provider == m_providerToken && revision == m_providerRevision;
     }
     bool trackWindow(const QUuid &window, const QString &key);
+    // The key a window is bound under, or empty when it is not bound: read-only, so a
+    // reloaded provider incarnation can ask which key an earlier one left a window under
+    // instead of assuming one (a record files under the binding's key, not the caller's).
+    QString windowBinding(const QUuid &window) const;
     // Called at QObject destruction, not before the window's close callbacks.
     bool forgetWindow(const QUuid &window);
     Result record(const QUuid &provider, quint64 revision, const Update &update);
