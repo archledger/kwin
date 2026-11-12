@@ -5462,6 +5462,14 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
     return request;
 }
 
+void Window::rebaseTransientFloatingOnOutputTransfer(const RectF &fromArea, const RectF &toArea)
+{
+    if (!m_transientOwnership) {
+        return;
+    }
+    m_transientOwnership->floating = moveToArea(m_transientOwnership->floating, fromArea, toArea);
+}
+
 Window::TransientRestorationState Window::transientRestorationState() const
 {
     if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {
@@ -6029,6 +6037,10 @@ void Window::sendToOutput(LogicalOutput *newOutput)
         if (isDeleted() || m_requestedTile || geometryRequestGeneration() != generation) {
             return;
         }
+        // The released record's floating frame follows the transfer (NT06): the same area
+        // translation the window's own geometry gets below, applied once, so a later explicit
+        // restore returns to the translated floating position on the destination.
+        rebaseTransientFloatingOnOutputTransfer(oldScreenArea, screenArea);
     } else {
         Tile *newTile = destinationManager->quickTile(requestedQuickTileMode());
         if (newTile) {
