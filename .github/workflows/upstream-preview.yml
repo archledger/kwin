@@ -5,7 +5,7 @@ name: upstream master preview
 on:
   workflow_dispatch:
   schedule:
-    - cron: "47 3 * * 1"
+    - cron: "47 3 * * *"
   pull_request:
     branches: ["plasma-fusion"]
     paths:
