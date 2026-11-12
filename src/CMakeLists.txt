@@ -213,6 +213,7 @@ target_sources(kwin PRIVATE
     scripting/windowmodel.cpp
     scripting/windowthumbnailitem.cpp
     scripting/workspace_wrapper.cpp
+    scripting/transienttilingapi.cpp
     shadow.cpp
     sm.cpp
     swapchain.cpp
