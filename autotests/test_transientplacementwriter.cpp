@@ -67,6 +67,9 @@ private Q_SLOTS:
     void cancellationKeepsLatestCompetingIntent();
     void preparedPendingSurvivesTermination_data();
     void preparedPendingSurvivesTermination();
+    void orderlyUnloadKeepsUnattemptedRecord();
+    void unloadPreservesPlacementData_data();
+    void unloadPreservesPlacementData();
 };
 
 void TransientPlacementWriterTest::writesExistingPlacementFormat()
@@ -950,6 +953,119 @@ void TransientPlacementWriterTest::preparedPendingSurvivesTermination()
     QVERIFY(writer.flush());
     TransientPlacementWriter reopened(path);
     QCOMPARE(reopened.snapshot().entries.value(QStringLiteral("app")), manual);
+}
+
+void TransientPlacementWriterTest::orderlyUnloadKeepsUnattemptedRecord()
+{
+    using Result = TransientPlacementWriter::Result;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("placementrc"));
+    auto writer = std::make_unique<TransientPlacementWriter>(path);
+    QObject provider;
+    const auto token = writer->registerProvider(&provider);
+    const auto window = QUuid::createUuid();
+    QVERIFY(writer->trackWindow(window, QStringLiteral("app")));
+    const QRectF frame(73, 91, 430, 310);
+    QCOMPARE(writer->record(token, 1, {window, frame, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    QVERIFY(writer->snapshot().dirty);
+    // No flush and no timer run: an orderly compositor teardown (the writer's destruction) is the
+    // last chance this accepted record has. The legacy transport the writer replaced wrote its
+    // newest state on the script's own teardown, so losing the coalescing window's record here
+    // would make an orderly restart remember less than the transport it retires.
+    writer.reset();
+    TransientPlacementWriter reopened(path);
+    QCOMPARE(reopened.snapshot().entries.value(QStringLiteral("app")), frame);
+    QVERIFY(!reopened.snapshot().dirty);
+}
+
+void TransientPlacementWriterTest::unloadPreservesPlacementData_data()
+{
+    QTest::addColumn<bool>("orderly");
+    QTest::newRow("orderly-restart") << true;
+    QTest::newRow("interrupted-compositor") << false;
+}
+
+void TransientPlacementWriterTest::unloadPreservesPlacementData()
+{
+    // NT08's restart contract, at the writer (the only persistence boundary the native side has):
+    // a session that ends while an owner holds its reservation leaves the file with the manual
+    // floating frame P and nothing the owner did - the automatic rectangle never entered it, and
+    // the writer that reopens carries no reservation, watermark or binding from the dead session,
+    // so a newly mapped client starts from the ordinary record alone.
+    QFETCH(bool, orderly);
+    using Result = TransientPlacementWriter::Result;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("placementrc"));
+    auto writer = std::make_unique<TransientPlacementWriter>(path);
+    QObject provider;
+    const auto token = writer->registerProvider(&provider);
+    const auto owner = QUuid::createUuid();
+    const auto sibling = QUuid::createUuid();
+    const auto other = QUuid::createUuid();
+    QVERIFY(writer->trackWindow(owner, QStringLiteral("app")));
+    QVERIFY(writer->trackWindow(other, QStringLiteral("other")));
+    // P, the manual floating frame the owner was admitted from: the last flushed state.
+    const QRectF persisted(73, 91, 430, 310);
+    QCOMPARE(writer->record(token, 1, {owner, persisted, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    QVERIFY(writer->flush());
+    // The owned session: the reservation over P == A activates, the automatic rectangle the owner
+    // is moved to is refused from the owner itself, and a same-key manual move by another window
+    // of the app is held back as deferred intent - none of it may reach the map.
+    QCOMPARE(writer->reserve(token, reservation(*writer, owner, persisted)), Result::Accepted);
+    QCOMPARE(writer->activateReservation(token, owner, QStringLiteral("generation-1")), Result::Accepted);
+    QVERIFY(writer->trackWindow(sibling, QStringLiteral("app")));
+    const QRectF automatic(500, 300, 900, 600);
+    QCOMPARE(writer->record(token, 2, {owner, automatic, 2, TransientPlacementWriter::Origin::Manual}), Result::Suppressed);
+    const QRectF manualMove(200, 100, 600, 400);
+    QCOMPARE(writer->record(token, 3, {sibling, manualMove, 20, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+    // A newer record on an unrelated key, accepted but still inside the coalescing window.
+    const QRectF coalesced(11, 17, 320, 240);
+    QCOMPARE(writer->record(token, 4, {other, coalesced, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    // What a compositor interrupted at this instant would leave behind: the last flushed state
+    // only. This reads the file as the restarted compositor would, not the live writer's map.
+    {
+        TransientPlacementWriter interruptedView(path);
+        QCOMPARE(interruptedView.snapshot().entries.value(QStringLiteral("app")), persisted);
+        QVERIFY(!interruptedView.snapshot().entries.contains(QStringLiteral("other")));
+        QCOMPARE(interruptedView.snapshot().entries.size(), 1);
+    }
+    if (!orderly) {
+        // An unwritable placement file takes the teardown flush with it: the artifact stays the
+        // last flushed state, exactly the interrupted compositor's.
+        QVERIFY(QFile::rename(path, path + QStringLiteral(".saved")));
+        QVERIFY(QDir().mkdir(path));
+    }
+    writer.reset();
+    if (!orderly) {
+        QVERIFY(QDir().rmdir(path));
+        QVERIFY(QFile::rename(path + QStringLiteral(".saved"), path));
+    }
+    TransientPlacementWriter restarted(path);
+    QCOMPARE(restarted.snapshot().entries.value(QStringLiteral("app")), persisted);
+    if (orderly) {
+        // The orderly teardown kept the coalesced record the interruption loses.
+        QCOMPARE(restarted.snapshot().entries.value(QStringLiteral("other")), coalesced);
+    } else {
+        QVERIFY(!restarted.snapshot().entries.contains(QStringLiteral("other")));
+    }
+    // No owner state survived: a newly tracked window of the same app records through
+    // immediately - no reservation suppresses it and no watermark outdates it. And the
+    // automatic rectangle is not an admission snapshot: the persisted record P is the only
+    // state, so adopting over a different frame is refused exactly as P != A demands.
+    QObject replacement;
+    const auto replacementToken = restarted.registerProvider(&replacement);
+    const auto mapped = QUuid::createUuid();
+    QVERIFY(restarted.trackWindow(mapped, QStringLiteral("app")));
+    QCOMPARE(restarted.reserve(replacementToken, reservation(restarted, mapped, automatic)), Result::InvalidRecord);
+    QVERIFY(!restarted.isReserved(mapped));
+    const QRectF placed(140, 120, 500, 360);
+    QCOMPARE(restarted.record(replacementToken, 1, {mapped, placed, 2, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    QVERIFY(restarted.flush());
+    TransientPlacementWriter afterRestart(path);
+    QCOMPARE(afterRestart.snapshot().entries.value(QStringLiteral("app")), placed);
+    QCOMPARE(afterRestart.snapshot().entries.value(QStringLiteral("other")), orderly ? coalesced : QRectF());
 }
 
 } // namespace KWin
