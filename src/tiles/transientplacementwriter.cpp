@@ -115,7 +115,14 @@ TransientPlacementWriter::TransientPlacementWriter(const QString &path, QObject 
 TransientPlacementWriter::~TransientPlacementWriter()
 {
     m_flushTimer.stop();
-    // Only explicit flushes may write: KConfig's destructor must not retry a failed one.
+    // An orderly compositor teardown is the last chance a record inside the flush coalescing
+    // window has: the legacy transport this writer replaced wrote its newest state on the
+    // script's own teardown, so the pending map is persisted once here too. Only a change no
+    // attempt has covered yet may be written - a flush that already failed must not be retried
+    // from a destructor, and KConfig's own destructor never retries either.
+    if (!m_busy && !m_flushAttempted && m_mapRevision != m_persistedRevision) {
+        flushImpl();
+    }
     m_config->markAsClean();
 }
 
@@ -505,6 +512,7 @@ bool TransientPlacementWriter::applyRecord(const QString &key, const QRectF &fra
         }
         m_entries.insert(key, frame);
         ++m_mapRevision;
+        m_flushAttempted = false;
         m_flushTimer.start();
     }
     m_keyEventSequences.insert(key, eventSequence);
@@ -527,6 +535,9 @@ bool TransientPlacementWriter::flush()
 
 bool TransientPlacementWriter::flushImpl()
 {
+    // Any attempt - a failure included - covers the map as it stands: the destructor's
+    // best-effort write may carry a change no attempt covered, never a retry of a failed one.
+    m_flushAttempted = true;
     if (!m_readable || !entryIsMutable(*m_config)) {
         return false;
     }
