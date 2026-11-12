@@ -417,6 +417,8 @@ private Q_SLOTS:
     void testRestorationStateContract();
     void testOwnedCommandIntentMatrix_data();
     void testOwnedCommandIntentMatrix();
+    void testTransientContextRelease_data();
+    void testTransientContextRelease();
     void testOwnedFullScreenLegacy_data();
     void testOwnedFullScreenLegacy();
     void testOwnedFullScreenSupersession_data();
@@ -8538,6 +8540,131 @@ void TestXdgShellWindow::testOwnedCommandIntentMatrix()
         if (window->m_transientOwnership) {
             QVERIFY(!window->m_transientOwnership->restoreAttempt);
         }
+        return;
+    }
+}
+
+void TestXdgShellWindow::testTransientContextRelease_data()
+{
+    QTest::addColumn<int>("scenario");
+    QTest::newRow("desktop-removal-releases-settled") << 0;
+    QTest::newRow("output-removal-releases-settled") << 1;
+    QTest::newRow("transfer-rebases-floating-releases-once") << 2;
+}
+
+void TestXdgShellWindow::testTransientContextRelease()
+{
+    // NT06: release before context destruction. A desktop or output removal releases the
+    // settled owner while its context is alive - the record keeps the floating frame, the
+    // reservation survives as the restoration barrier. An output transfer releases exactly
+    // once, translates the saved floating frame by the same area translation the window gets,
+    // and the destination adopts nothing; a later explicit restore returns to the translated
+    // floating position on the destination.
+    QFETCH(int, scenario);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.context-release"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const RectF original = window->frameGeometry();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto key = QStringLiteral("org.example.context-release");
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(original), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    auto controller = std::make_unique<TransientTileController>();
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktops = VirtualDesktopManager::self();
+    auto firstDesktop = desktops->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller->createTree(manager, firstDesktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto managed = controller->tile()->windowGeometry();
+    auto state = writer.snapshot();
+    configure.clear();
+    QCOMPARE(controller->admit(controller->generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), managed.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->m_transientOwnership);
+    const auto generation = window->m_transientOwnership->generation;
+    configure.clear();
+
+    if (scenario == 0) {
+        // Removing the desktop the tree owns releases the settled owner while the record and
+        // its context live. The tree owns firstDesktop; grow to two and remove that one.
+        desktops->setCount(2);
+        QCOMPARE(desktops->count(), 2u);
+        const auto secondDesktop = desktops->desktops().last();
+        QCOMPARE(desktops->currentDesktop(window->moveResizeOutput()), firstDesktop);
+        desktops->setCurrent(secondDesktop);
+        desktops->removeVirtualDesktop(firstDesktop);
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(window->m_transientOwnership->generation, generation);
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), QRectF(original));
+        QVERIFY(writer.isReserved(id));
+        return;
+    }
+    if (scenario == 1) {
+        // Output removal releases the settled owner; the record keeps the floating frame and
+        // the reservation survives as the barrier.
+        const auto outputs = kwinApp()->outputBackend()->outputs();
+        OutputConfiguration config;
+        {
+            auto changeSet = config.changeSet(outputs.last());
+            changeSet->enabled = false;
+        }
+        QVERIFY(workspace()->applyOutputConfiguration(config));
+        if (!configure.isEmpty() || configure.wait()) {
+            shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+            Test::render(surface.get(), window->moveResizeGeometry().size().toSize(), Qt::cyan);
+            QVERIFY(Test::waylandSync());
+        }
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), QRectF(original));
+        QVERIFY(writer.isReserved(id));
+        return;
+    }
+    // The transfer: per-output current desktops differ, the window moves to the other output.
+    {
+        const auto outputs = workspace()->outputs();
+        desktops->setPerOutputVirtualDesktops(true);
+        desktops->setCount(2);
+        const auto desktopsList = desktops->desktops();
+        desktops->setCurrent(desktopsList.first(), outputs.first());
+        desktops->setCurrent(desktopsList.last(), outputs.last());
+        QCOMPARE(desktops->currentDesktop(outputs.first()), desktopsList.first());
+        QCOMPARE(desktops->currentDesktop(outputs.last()), desktopsList.last());
+        const RectF fromArea = workspace()->clientArea(MaximizeArea, window, outputs.first());
+        const RectF toArea = workspace()->clientArea(MaximizeArea, window, outputs.last());
+        const RectF expectedFloating = window->moveToArea(original, fromArea, toArea);
+        window->sendToOutput(outputs.last());
+        QVERIFY(Test::waylandSync());
+        // Released exactly once: the record is Restoring with the controller detached, and the
+        // destination adopted nothing (no tile, no requested tile).
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(window->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+        QCOMPARE(window->m_transientOwnership->generation, generation);
+        QVERIFY(!window->m_transientOwnership->controller);
+        QVERIFY(!window->tile());
+        QVERIFY(!window->requestedTile());
+        QVERIFY(writer.isReserved(id));
+        // The saved floating frame followed the transfer.
+        QCOMPARE(QRectF(window->m_transientOwnership->floating), QRectF(expectedFloating));
+        // A later explicit restore returns to the translated floating position.
+        auto claim = window->claimTransientRestoreWithMaximizeNormalization(window->ownedTransientPlacementGeneration());
+        QCOMPARE(claim.continuation.outcome, Window::AssignmentStepOutcome::Refused);
         return;
     }
 }
