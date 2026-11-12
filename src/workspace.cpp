@@ -55,6 +55,7 @@
 #include "scene/workspacescene.h"
 #include "tabletmodemanager.h"
 #include "tiles/tilemanager.h"
+#include "tiles/transientplacementwriter.h"
 #include "tiles/transienttilecontroller.h"
 #include "useractions.h"
 #include "utils/envvar.h"
@@ -65,6 +66,7 @@
 #include "wayland/externalbrightness_v1.h"
 #include "wayland/surface.h"
 #include "wayland_server.h"
+#include <QStandardPaths>
 #if KWIN_BUILD_X11
 #include "atoms.h"
 #include "core/brightnessdevice.h"
@@ -121,6 +123,16 @@ static void forEachLiveWindow(const QList<Window *> &windows, const Callback &ca
         });
         callback(window);
     }
+}
+
+TransientPlacementWriter *Workspace::placementWriter() const
+{
+    return m_placementWriter.get();
+}
+
+TransientTileController *Workspace::transientTileController() const
+{
+    return m_transientTileController.get();
 }
 
 Workspace::Workspace()

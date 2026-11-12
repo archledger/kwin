@@ -93,6 +93,7 @@ class OutputConfiguration;
 class RootTile;
 class TileManager;
 class TransientTileController;
+class TransientPlacementWriter;
 class OutputConfigurationStore;
 class LidSwitchTracker;
 class DpmsInputEventFilter;
@@ -243,6 +244,18 @@ public:
 
 public:
     QHash<const LogicalOutput *, Rect> previousScreenSizes() const;
+
+    /**
+     * The desktop's placement writer (docs/NATIVE-TILING-CONTRACT.md): the compositor-owned
+     * writer the paired provider registers against. Constructed with the session; null only
+     * during shutdown. The provider registers through it; no QML setter for acknowledgment.
+     */
+    TransientPlacementWriter *placementWriter() const;
+    /**
+     * The session's transient tile controller. Idle (no tree) until a qualified consumer
+     * creates one; no production tiler is enabled by its existence.
+     */
+    TransientTileController *transientTileController() const;
 
     /**
      * Returns @c true if the workspace is currently being rearranged; otherwise returns @c false.
@@ -747,6 +760,7 @@ private:
     // LogicalOutput owns its manager; callbacks may destroy it independently.
     std::map<LogicalOutput *, QPointer<TileManager>> m_tileManagers;
     std::unique_ptr<TransientTileController> m_transientTileController;
+    std::unique_ptr<TransientPlacementWriter> m_placementWriter;
     bool m_shuttingDown = false;
     bool m_updatingOutputs = false;
     bool m_outputUpdatePending = false;
