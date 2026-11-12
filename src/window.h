@@ -1428,6 +1428,14 @@ public:
         RestoringPublished,
     };
     TransientRestorationState transientRestorationState() const;
+    /**
+     * NT06: translate the saved floating frame when the window is sent to another output. The
+     * record is already released (Restoring); the frame moves by the same area translation the
+     * transfer applies to the window's own geometry, so a later explicit restore returns to the
+     * translated floating position on the destination, and the ownership is released exactly
+     * once - no destination adoption.
+     */
+    void rebaseTransientFloatingOnOutputTransfer(const RectF &fromArea, const RectF &toArea);
 
     void handleCustomQuickTileShortcut(QuickTileMode mode);
 
@@ -2153,7 +2161,7 @@ private:
         const QUuid provider;
         const quint64 providerRevision;
         const quint64 generation;
-        const RectF floating;
+        RectF floating;
         const RectF target;
         const QPointer<Tile> tile;
         const QPointer<TileManager> manager;
