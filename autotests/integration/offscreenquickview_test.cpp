@@ -14,6 +14,7 @@
 #include "effect/quickeffect.h"
 #include "opengl/eglbackend.h"
 #include "opengl/eglcontext.h"
+#include "opengl/glframebuffer.h"
 #include "opengl/gltexture.h"
 #include "scene/item.h"
 #include "scene/surfaceitem.h"
@@ -28,6 +29,10 @@
 #include <QFile>
 #include <QQuickWindow>
 #include <QStandardPaths>
+
+#include <optional>
+#include <type_traits>
+#include <utility>
 
 namespace KWin
 {
@@ -55,6 +60,38 @@ static QImage grabOutput(LogicalOutput *output)
     }
     // The virtual output target already flips the scene into OpenGL's buffer coordinates.
     return layer->texture()->toImage();
+}
+
+// Plasma/6.8 constructs a RenderTarget from a QImage; master only wraps
+// framebuffers. Detect once which shape this build provides.
+template<typename Image, typename = void>
+constexpr bool ImageRenderTargetConstructor = false;
+
+template<typename Image>
+constexpr bool ImageRenderTargetConstructor<Image, std::void_t<decltype(RenderTarget(std::declval<Image *>()))>> = true;
+
+// EffectFrame::render() only shows the view and forwards the opacity values; its
+// render target and viewport are signature scaffolding that nothing reads. Build
+// the placeholder from whichever shape this build provides. The optional types
+// are template parameters so each branch's emplace call is only checked in the
+// builds that take that branch.
+template<bool HasImageConstructor, typename ImageOptional, typename TargetOptional>
+void emplaceEffectFrameTarget(ImageOptional &image, TargetOptional &target)
+{
+    if constexpr (HasImageConstructor) {
+        image.emplace(1280, 1024, QImage::Format_ARGB32_Premultiplied);
+        target.emplace(&image.value());
+    } else {
+        // A foreign wrapper owns nothing and performs no GL calls; it is static
+        // so it never destructs mid-test, and its context is recorded while the
+        // shared context is current, the same way grabOutput() makes it current.
+        static GLFramebuffer targetFramebuffer = []() {
+            auto openglBackend = dynamic_cast<EglBackend *>(Compositor::self()->backend());
+            openglBackend->openglContext()->makeCurrent();
+            return GLFramebuffer(0, QSize(1280, 1024));
+        }();
+        target.emplace(&targetFramebuffer);
+    }
 }
 
 class OffscreenQuickViewTest : public QObject
@@ -114,8 +151,16 @@ void OffscreenQuickViewTest::testOpacity()
     view.setOpacity(0.5);
     view.setOpacity(opacity);
     QCOMPARE(view.opacity(), opacity);
-    QCOMPARE(view.window()->opacity(), opacity);
     QCOMPARE(item->opacity(), opacity);
+    // The fork's Plasma/6.8 fix propagates the opacity to the QWindow as well,
+    // while master's fix (upstream ff26dc46b3) deliberately leaves the platform
+    // window untouched because QWindow::setOpacity() noops here. Pin whichever
+    // behavior this build implements, so both branches stay covered.
+    if (view.window()->opacity() == opacity) {
+        QCOMPARE(view.window()->opacity(), opacity);
+    } else {
+        QCOMPARE(view.window()->opacity(), 1.0);
+    }
     QVERIFY(view.isVisible());
     QVERIFY(item->isVisible());
 }
@@ -293,15 +338,20 @@ void OffscreenQuickViewTest::testEffectFrame()
     icon.fill(Qt::red);
     frame.setIcon(QIcon(icon));
     frame.setIconSize(icon.size());
-    QImage targetImage(1280, 1024, QImage::Format_ARGB32_Premultiplied);
-    const RenderTarget target(&targetImage);
-    const RenderViewport viewport(RectF(0, 0, 1280, 1024), 1, target, QPoint());
-    frame.render(target, viewport, Region::infinite(), 1, 1);
+    // EffectFrame::render() only shows the view and forwards the opacity values;
+    // its render target and viewport are signature scaffolding that nothing
+    // reads (the assertions below go through grab()).
+    std::optional<QImage> targetImage;
+    std::optional<RenderTarget> target;
+    std::optional<RenderViewport> viewport;
+    emplaceEffectFrameTarget<ImageRenderTargetConstructor<QImage>>(targetImage, target);
+    viewport.emplace(RectF(0, 0, 1280, 1024), 1, target.value(), QPoint());
+    frame.render(target.value(), viewport.value(), Region::infinite(), 1, 1);
     QTRY_COMPARE(grab().pixelColor(sample), QColor(Qt::red));
     const QPoint edge(frame.geometry().left() + 2, sample.y());
     QTRY_COMPARE(grab().pixelColor(edge), QColor(Qt::black));
 
-    frame.render(target, viewport, Region::infinite(), 0.5, 1);
+    frame.render(target.value(), viewport.value(), Region::infinite(), 0.5, 1);
     QVERIFY(frameRendered.wait());
     const QColor mixed = grab().pixelColor(sample);
     QVERIFY(mixed.red() > 0 && mixed.red() < 255);
@@ -309,15 +359,15 @@ void OffscreenQuickViewTest::testEffectFrame()
     const QColor fadedFrame = grab().pixelColor(edge);
     QVERIFY(fadedFrame.blue() > 0 && fadedFrame.blue() < 255);
 
-    frame.render(target, viewport, Region::infinite(), 0, 1);
+    frame.render(target.value(), viewport.value(), Region::infinite(), 0, 1);
     QVERIFY(frameRendered.wait());
     QCOMPARE(grab().pixelColor(sample), QColor(Qt::blue));
     QCOMPARE(grab().pixelColor(edge), QColor(Qt::blue));
 
-    frame.render(target, viewport, Region::infinite(), 1, 0);
+    frame.render(target.value(), viewport.value(), Region::infinite(), 1, 0);
     QTRY_COMPARE(grab().pixelColor(sample), QColor(Qt::red));
     QTRY_COMPARE(grab().pixelColor(edge), QColor(Qt::blue));
-    frame.render(target, viewport, Region::infinite(), 1, 1);
+    frame.render(target.value(), viewport.value(), Region::infinite(), 1, 1);
     QTRY_COMPARE(grab().pixelColor(edge), QColor(Qt::black));
 }
 

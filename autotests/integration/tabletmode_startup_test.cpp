@@ -22,6 +22,9 @@
 #include <KConfigGroup>
 #include <QSignalSpy>
 
+#include <type_traits>
+#include <utility>
+
 using namespace KWin;
 
 class StartupTabletSwitch : public Test::VirtualInputDevice
@@ -44,6 +47,35 @@ public:
 
     const std::shared_ptr<libinput_device> device;
 };
+
+namespace
+{
+
+// Plasma/6.8 takes the startup profile as loose queryConfig() flags while master
+// folds them into OutputConfigurationStore::Parameters, which does not exist on
+// 6.8. Detect the supported overload once and dispatch; the Parameters spelling
+// is only instantiated in builds that provide it.
+template<typename Store, typename Outputs, typename = void>
+struct QueryConfigTakesParameters : std::false_type
+{
+};
+
+template<typename Store, typename Outputs>
+struct QueryConfigTakesParameters<Store, Outputs, std::void_t<decltype(std::declval<Store &>().queryConfig(std::declval<const Outputs &>(), std::declval<typename Store::Parameters>()))>> : std::true_type
+{
+};
+
+template<bool TakesParameters, typename Store, typename Outputs>
+auto queryStartupConfig(Store &store, const Outputs &outputs)
+{
+    if constexpr (TakesParameters) {
+        return store.queryConfig(outputs, typename Store::Parameters{});
+    } else {
+        return store.queryConfig(outputs, false, AccelerometerOrientation::Undefined, false);
+    }
+}
+
+}
 
 class TabletModeStartupTest : public QObject
 {
@@ -92,7 +124,7 @@ void TabletModeStartupTest::initTestCase()
         // workspace is still absent; a newly created virtual output has none.
         {
             OutputConfigurationStore store;
-            const auto config = store.queryConfig(outputs, false, AccelerometerOrientation::Undefined, false);
+            const auto config = queryStartupConfig<QueryConfigTakesParameters<OutputConfigurationStore, QList<BackendOutput *>>::value>(store, outputs);
             QVERIFY(config.has_value());
             outputs.constFirst()->applyChanges(config->first);
         }
