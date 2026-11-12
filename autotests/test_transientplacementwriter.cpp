@@ -33,6 +33,7 @@ class TransientPlacementWriterTest : public QObject
 
 private Q_SLOTS:
     void writesExistingPlacementFormat();
+    void windowBindingReportsTheKeyAndOnlyTheKey();
     void retiredProviderCannotWrite();
     void staleRevisionDoesNotMutate();
     void failedSaveDoesNotBlockReplacementSnapshot();
@@ -91,6 +92,39 @@ void TransientPlacementWriterTest::writesExistingPlacementFormat()
 
     TransientPlacementWriter reopened(path);
     QCOMPARE(reopened.snapshot().entries.value(QStringLiteral("app")), frame);
+}
+
+void TransientPlacementWriterTest::windowBindingReportsTheKeyAndOnlyTheKey()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+
+    // An unbound window answers an empty key, not a null-ish guess: the caller cannot
+    // confuse "not tracked yet" with "tracked under something".
+    const auto unknown = QUuid::createUuid();
+    QCOMPARE(writer.windowBinding(unknown), QString());
+
+    // A bound window answers exactly its key, also after the provider that bound it
+    // retired (the binding outlives provider incarnations - a reloaded script must be
+    // able to ask which key an earlier incarnation left a window under).
+    auto firstProvider = std::make_unique<QObject>();
+    const auto oldToken = writer.registerProvider(firstProvider.get());
+    QVERIFY(!oldToken.isNull());
+    const auto window = QUuid::createUuid();
+    QVERIFY(writer.trackWindow(window, QStringLiteral("app")));
+    QCOMPARE(writer.windowBinding(window), QStringLiteral("app"));
+    firstProvider.reset();
+
+    QObject replacement;
+    const auto newToken = writer.registerProvider(&replacement);
+    QVERIFY(!newToken.isNull());
+    QVERIFY(newToken != oldToken);
+    QCOMPARE(writer.windowBinding(window), QStringLiteral("app"));
+
+    // A refused second track (one binding per window lifetime) leaves the answer unchanged.
+    QVERIFY(!writer.trackWindow(window, QStringLiteral("other-app")));
+    QCOMPARE(writer.windowBinding(window), QStringLiteral("app"));
 }
 
 void TransientPlacementWriterTest::retiredProviderCannotWrite()

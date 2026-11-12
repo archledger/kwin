@@ -155,6 +155,12 @@ bool TransientPlacementWriter::trackWindow(const QUuid &window, const QString &k
     return true;
 }
 
+QString TransientPlacementWriter::windowBinding(const QUuid &window) const
+{
+    const auto tracked = m_windows.constFind(window);
+    return tracked == m_windows.constEnd() ? QString() : tracked->key;
+}
+
 bool TransientPlacementWriter::forgetWindow(const QUuid &window)
 {
     if (m_busy) {
