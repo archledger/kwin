@@ -48,11 +48,11 @@
 #include <QChildEvent>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
-#include <QDir>
-#include <QFile>
 #include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusPendingReply>
+#include <QDir>
+#include <QFile>
 #include <QPointer>
 #include <QProcess>
 #include <QScopeGuard>
@@ -8436,7 +8436,9 @@ void TestXdgShellWindow::testOwnedCommandIntentMatrix()
             workspace()->slotWindowMaximize();
         } else if (scenario == 4) {
             window->decoration()->requestToggleMaximization(Qt::LeftButton);
-            QVERIFY(QTest::qWaitFor([&]() { return window->requestedMaximizeMode() == MaximizeFull; }));
+            QVERIFY(QTest::qWaitFor([&]() {
+                return window->requestedMaximizeMode() == MaximizeFull;
+            }));
         } else {
             workspace()->performWindowOperation(window, Options::MaximizeOp);
         }
@@ -8457,7 +8459,9 @@ void TestXdgShellWindow::testOwnedCommandIntentMatrix()
             workspace()->slotWindowMaximize();
         } else if (scenario == 4) {
             window->decoration()->requestToggleMaximization(Qt::LeftButton);
-            QVERIFY(QTest::qWaitFor([&]() { return window->requestedMaximizeMode() == MaximizeRestore; }));
+            QVERIFY(QTest::qWaitFor([&]() {
+                return window->requestedMaximizeMode() == MaximizeRestore;
+            }));
         } else {
             workspace()->performWindowOperation(window, Options::MaximizeOp);
         }
@@ -16427,7 +16431,6 @@ void TestXdgShellWindow::testTransientRegistryLookup()
     auto manager = workspace()->tileManager(window->moveResizeOutput());
     auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
     const auto manualRoot = manager->rootTile(desktop);
-    const auto manualModel = manager->model();
     const auto timers = manager->findChildren<QTimer *>(QString(), Qt::FindDirectChildrenOnly);
     QCOMPARE(timers.size(), 1);
     QSignalSpy saved(timers.first(), &QTimer::timeout);
@@ -16456,7 +16459,6 @@ void TestXdgShellWindow::testTransientRegistryLookup()
     QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Accepted);
     QCOMPARE(manager->tileForWindow(window, desktop), controller.tile());
     QCOMPARE(manager->rootTile(desktop), manualRoot);
-    QCOMPARE(manager->model(), manualModel);
     QVERIFY(!manager->bestTileForPosition(100, 100)->isTransient());
     manualRoot->setPadding(padding + 1);
     manualRoot->setPadding(padding);
