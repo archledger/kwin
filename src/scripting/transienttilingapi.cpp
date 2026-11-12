@@ -64,8 +64,17 @@ bool TransientTilingApi::trackWindow(Window *window, const QString &key)
     return writer->trackWindow(window->internalId(), key.isEmpty() ? placementKeyForWindow(window) : key);
 }
 
+QString TransientTilingApi::windowBinding(Window *window)
+{
+    auto writer = m_workspace ? m_workspace->placementWriter() : nullptr;
+    if (!writer || !window) {
+        return QString();
+    }
+    return writer->windowBinding(window->internalId());
+}
+
 int TransientTilingApi::record(const QString &token, int revision, Window *window,
-                                const QRectF &frame, int eventSequence, int origin)
+                               const QRectF &frame, int eventSequence, int origin)
 {
     auto writer = m_workspace ? m_workspace->placementWriter() : nullptr;
     if (!writer || !window) {
@@ -95,11 +104,11 @@ QVariantMap TransientTilingApi::snapshot()
     for (auto it = snap.entries.constBegin(); it != snap.entries.constEnd(); ++it) {
         const auto &r = it.value();
         entries.insert(it.key(), QVariantMap{
-            {QStringLiteral("x"), r.x()},
-            {QStringLiteral("y"), r.y()},
-            {QStringLiteral("width"), r.width()},
-            {QStringLiteral("height"), r.height()},
-        });
+                                     {QStringLiteral("x"), r.x()},
+                                     {QStringLiteral("y"), r.y()},
+                                     {QStringLiteral("width"), r.width()},
+                                     {QStringLiteral("height"), r.height()},
+                                 });
     }
     out.insert(QStringLiteral("entries"), entries);
     out.insert(QStringLiteral("mapRevision"), static_cast<qlonglong>(snap.mapRevision));
@@ -110,7 +119,7 @@ QVariantMap TransientTilingApi::snapshot()
 // ------------------------------------------------------------------ the controller
 
 QVariantMap TransientTilingApi::createTile(LogicalOutput *output, VirtualDesktop *desktop,
-                                             const QRectF &relativeRect)
+                                           const QRectF &relativeRect)
 {
     auto controller = m_workspace ? m_workspace->transientTileController() : nullptr;
     QVariantMap out;
@@ -132,7 +141,7 @@ QVariantMap TransientTilingApi::createTile(LogicalOutput *output, VirtualDesktop
 }
 
 int TransientTilingApi::admitTile(int generation, Window *window, const QString &key,
-                                    const QString &providerToken)
+                                  const QString &providerToken)
 {
     auto controller = m_workspace ? m_workspace->transientTileController() : nullptr;
     auto writer = m_workspace ? m_workspace->placementWriter() : nullptr;
