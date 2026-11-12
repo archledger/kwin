@@ -18,6 +18,7 @@
 #include "tiles/tilemanager.h"
 #include "virtualdesktops.h"
 #include "window.h"
+#include "transienttilingapi.h"
 #include "tiles/transientplacementwriter.h"
 #include "workspace.h"
 #if KWIN_BUILD_ACTIVITIES
@@ -505,6 +506,16 @@ TransientPlacementWriter *WorkspaceWrapper::placementWriter() const
         QJSEngine::setObjectOwnership(writer, QJSEngine::CppOwnership);
     }
     return writer;
+}
+
+TransientTilingApi *WorkspaceWrapper::transientTiling() const
+{
+    static TransientTilingApi *api = nullptr;
+    if (!api) {
+        api = new TransientTilingApi(workspace());
+        QJSEngine::setObjectOwnership(api, QJSEngine::CppOwnership);
+    }
+    return api;
 }
 
 Tile *WorkspaceWrapper::rootTile(LogicalOutput *output, VirtualDesktop *desktop) const
