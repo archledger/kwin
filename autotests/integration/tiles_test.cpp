@@ -231,6 +231,7 @@ private Q_SLOTS:
     void transientControllerIgnoresRetiredNotification();
     void transientControllerRemovedDesktop_data();
     void transientControllerRemovedDesktop();
+    void transientReleaseAfterClosedRegistration();
 
 private:
     void createSimpleLayout();
@@ -4976,6 +4977,43 @@ void TilesTest::transientControllerRemovedDesktop()
     QVERIFY(attempted);
     QCOMPARE(result, Result::InvalidContext);
     QCOMPARE(changed.count(), 0);
+}
+
+void TilesTest::transientReleaseAfterClosedRegistration()
+{
+    // The orderly-unload shape at the tile-manager layer: the manager's teardown entry
+    // (prepareForRemoval, what ~Workspace's ordering reaches through ~TileManager) closes
+    // transient registration and releases the transient root while the manager's manual model
+    // stays exactly as it was - the release happens before the roots are destroyed, and no new
+    // tree can register on a manager whose registration teardown has closed. A test-local
+    // manager keeps the shared one serving the other rows.
+    using Result = TransientTileController::Result;
+    auto output = workspace()->outputs().constLast();
+    auto manager = std::make_unique<TileManager>(output);
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    RootTile *manualRoot = manager->rootTile(desktop);
+    QVERIFY(manualRoot && !manualRoot->isTransient());
+    const int manualChildren = manualRoot->childCount();
+    TransientTileController controller;
+    const RectF geometry(0, 0, 0.5, 1);
+    QSignalSpy changed(&controller, &TransientTileController::treeChanged);
+    QCOMPARE(controller.createTree(manager.get(), desktop, geometry), Result::Accepted);
+    Tile *leaf = controller.tile();
+    QVERIFY(leaf);
+    QSignalSpy removed(leaf, &Tile::windowRemoved);
+    manager->prepareForRemoval();
+    // The teardown released the tree - no member needed a removal - and left the manual model
+    // untouched; the released generation cannot be resurrected under a new registration.
+    QVERIFY(!controller.rootTile());
+    QVERIFY(!controller.tile());
+    QCOMPARE(controller.generation(), quint64(0));
+    QCOMPARE(removed.count(), 0);
+    QCOMPARE(changed.count(), 2);
+    QCOMPARE(manager->rootTile(desktop), manualRoot);
+    QCOMPARE(manualRoot->childCount(), manualChildren);
+    QCOMPARE(controller.createTree(manager.get(), desktop, geometry), Result::Busy);
+    QCOMPARE(manager->rootTile(desktop), manualRoot);
+    QCOMPARE(manualRoot->childCount(), manualChildren);
 }
 
 void TilesTest::createSimpleLayout()
