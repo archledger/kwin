@@ -27,6 +27,7 @@ namespace KWin
 // forward declarations
 class Tile;
 class TileManager;
+class TransientPlacementWriter;
 class Window;
 class LogicalOutput;
 class VirtualDesktop;
@@ -396,6 +397,15 @@ public:
      * Use rootTile()
      */
     Q_INVOKABLE KWin::TileManager *tilingForScreen(KWin::LogicalOutput *output) const;
+
+    /**
+     * \qmlmethod TransientPlacementWriter Workspace::placementWriter()
+     * The session's placement writer (docs/NATIVE-TILING-CONTRACT.md): the compositor-owned
+     * writer the paired provider registers against. The provider is a QObject; the token is
+     * opaque text to QML. No QML acknowledgment setter exists — the writer validates every
+     * submission natively.
+     */
+    Q_INVOKABLE KWin::TransientPlacementWriter *placementWriter() const;
 
     /*!
      * \qmlmethod Tile Workspace::rootTile(LogicalOutput output, VirtualDesktop desktop)
