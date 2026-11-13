@@ -297,6 +297,18 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             if (guarded) {
                 publishForAssignment(target, *guarded);
             } else {
+                // The request is resolved here, with no configure and nothing for the client to
+                // commit: what is published is the request's image on the output's pixels, and
+                // the requested geometry follows it, as it does when a configure's commit lands
+                // (synchronizeCommittedGeometry). Left at the rectangle that was asked for, it
+                // would differ from the frame until the client's next commit, and the window
+                // would read as unsettled for that long. Half a pixel must not carry the
+                // center to another output: there the request stays as it was asked. A guarded
+                // request keeps its rectangle on purpose: its caller compares the requested
+                // geometry with the rectangle it asked for (a tile's, a restoration's).
+                if (target != rect && workspace()->outputAt(target.center()) == moveResizeOutput()) {
+                    setMoveResizeGeometry(target);
+                }
                 updateGeometry(target);
             }
         } else {

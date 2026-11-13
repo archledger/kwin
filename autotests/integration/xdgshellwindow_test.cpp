@@ -396,6 +396,8 @@ private Q_SLOTS:
     void testTransientRequestFractional_data();
     void testTransientRequestFractional();
     void testTransientRequestDecorated();
+    void testConfigurelessRequestSynchronizesRequestedGeometry_data();
+    void testConfigurelessRequestSynchronizesRequestedGeometry();
     void testTransientTilingFacadeFractionalScale_data();
     void testTransientTilingFacadeFractionalScale();
     void testTransientTilingFacadeClosedSibling();
@@ -10583,17 +10585,100 @@ QByteArray frameText(const QRectF &frame)
 
 } // namespace
 
+void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry_data()
+{
+    QTest::addColumn<int>("outputs");
+    QTest::addColumn<QRectF>("request");
+    QTest::addColumn<bool>("anchored");
+    QTest::addColumn<bool>("synchronized");
+    // A 361-wide client on a 4/3 output is 481 device pixels, a 360.75-wide frame: a request
+    // for 361 asks the client for the size it has.
+    QTest::newRow("in-place") << 1 << QRectF(102, 102, 361, 240) << false << true;
+    QTest::newRow("moved") << 1 << QRectF(132, 123, 361, 240) << false << true;
+    // As during a resize from the top-left corner: the bottom-right corner stays, so the
+    // published frame's top-left is not the request's.
+    QTest::newRow("bottom-right-kept") << 1 << QRectF(132, 123, 361, 240) << true << true;
+    // The request's center belongs to the second output, its image's to the first.
+    QTest::newRow("center-on-an-output-boundary") << 2 << QRectF(1019.0625, 123, 361, 240) << false << false;
+}
+
+void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
+{
+    // An ordinary request for the client size the window already has is resolved without a
+    // configure: its image on the output's pixels is published at once, and from then on that
+    // image is the requested geometry, as after a configure's commit. Where the image's center
+    // would be on another output than the request's, the requested geometry stays as it was
+    // asked and no output changes under the request.
+    QFETCH(int, outputs);
+    QFETCH(QRectF, request);
+    QFETCH(bool, anchored);
+    QFETCH(bool, synchronized);
+    QList<Test::OutputInfo> config{Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}};
+    if (outputs == 2) {
+        config.append(Test::OutputInfo{.geometry = Rect(1200, 0, 1200, 900), .scale = 4.0 / 3.0});
+    }
+    Test::setOutputConfig(config);
+    workspace()->setActiveOutput(QPoint(100, 100));
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(361, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(361, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    auto toplevel = static_cast<XdgToplevelWindow *>(window);
+    window->move(QPointF(102, 102));
+    QCOMPARE(window->nextTargetScale(), 4.0 / 3.0);
+    const QRectF before = window->frameGeometry();
+    QVERIFY2(exactFrame(before, QRectF(102, 102, 360.75, 240)), frameText(before).constData());
+    QVERIFY(exactFrame(window->moveResizeGeometry(), before));
+    QVERIFY(!toplevel->hasPendingNativeGeometry());
+    if (anchored) {
+        toplevel->m_configureGravity = Gravity::TopLeft;
+    }
+    const QRectF image(request.topLeft(), before.size());
+    QCOMPARE(workspace()->outputAt(image.center()) == workspace()->outputAt(request.center()), synchronized);
+
+    window->moveResize(request);
+    QVERIFY(!toplevel->hasPendingNativeGeometry());
+    const QRectF frame = window->frameGeometry();
+    QCOMPARE(frame.size(), before.size());
+    if (anchored) {
+        QCOMPARE(frame.x() + frame.width(), request.x() + request.width());
+        QCOMPARE(frame.y() + frame.height(), request.y() + request.height());
+        QVERIFY(frame.x() != request.x());
+    } else {
+        QVERIFY2(exactFrame(frame, image), frameText(frame).constData());
+    }
+    if (synchronized) {
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
+        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(frame.center()));
+    } else {
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), request), frameText(window->moveResizeGeometry()).constData());
+        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(request.center()));
+        QVERIFY(window->moveResizeOutput() != workspace()->outputAt(frame.center()));
+    }
+}
+
 void TestXdgShellWindow::testTransientTilingFacadeFractionalScale_data()
 {
     QTest::addColumn<bool>("decorated");
     QTest::addColumn<QSize>("client");
     QTest::addColumn<QRectF>("floating");
+    QTest::addColumn<QRectF>("request");
     // The output's pixel is 0.75 logical pixels. A title bar a decoration snapped to it (50.25,
     // 67 device pixels) over a 241-high client is a whole 291-high frame over a fractional client
     // (240.75); a 361-wide client is 481 device pixels, a 360.75-wide frame.
-    QTest::newRow("title-bar") << true << QSize(360, 241) << QRectF(102, 102, 360, 291);
-    QTest::newRow("fractional-frame") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240);
-    QTest::newRow("title-bar-fractional-frame") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25);
+    QTest::newRow("title-bar") << true << QSize(360, 241) << QRectF(102, 102, 360, 291) << QRectF();
+    QTest::newRow("fractional-frame") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF();
+    QTest::newRow("title-bar-fractional-frame") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF();
+    // A script places the window first, in whole pixels: the image of the frame it has, where
+    // it is or elsewhere. The client's size is already that one, so no configure follows.
+    QTest::newRow("whole-pixel-request") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(102, 102, 361, 290);
+    QTest::newRow("whole-pixel-move") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(132, 123, 361, 290);
+    QTest::newRow("whole-pixel-move-without-a-title-bar") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF(132, 123, 361, 240);
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
@@ -10604,6 +10689,7 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
     QFETCH(bool, decorated);
     QFETCH(QSize, client);
     QFETCH(QRectF, floating);
+    QFETCH(QRectF, request);
     Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}});
     workspace()->setActiveOutput(QPoint(100, 100));
     const TilingFacade facade;
@@ -10659,6 +10745,18 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
     window->move(floating.topLeft());
     QCOMPARE(window->nextTargetScale(), 4.0 / 3.0);
     QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+    if (!request.isNull()) {
+        // The request needs nothing from the client: its image on the output's pixels is
+        // published at once and is the window's requested geometry from then on, as it is
+        // when a configure's commit lands. On the ThinkPad the requested geometry stayed the
+        // whole-pixel rectangle, a quarter pixel from the frame, and the window was refused
+        // as unsettled (Ineligible) until its next commit.
+        window->moveResize(request);
+        floating.moveTopLeft(request.topLeft());
+        QVERIFY(!static_cast<XdgToplevelWindow *>(window)->hasPendingNativeGeometry());
+        QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), floating), frameText(window->moveResizeGeometry()).constData());
+    }
 
     QObject provider;
     const QString token = facade.registerProvider(&provider);
