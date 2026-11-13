@@ -11402,6 +11402,7 @@ enum ReleasedBy {
     MovedByHand,
     MovedByHandThenByARequest,
     MovedByARequest,
+    MovedByARequestThenHeldStill,
     RecheckedByTheWorkspace,
     SentToAnotherOutput,
     SentToAnOutputOfAnotherScale,
@@ -11423,6 +11424,10 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
     QTest::newRow("moved-by-hand-then-by-a-request") << int(MovedByHandThenByARequest) << 1.0 << QSize(200, 100);
     // A script's request, or the compositor's own: not the user's hand.
     QTest::newRow("moved-by-a-request") << int(MovedByARequest) << 1.0 << QSize(200, 100);
+    // The same, and then the user takes the window and lets it go where it is (a press on
+    // the title bar held and released, the keyboard move ended at once): an interactive
+    // operation that moved nothing chose no place.
+    QTest::newRow("moved-by-a-request-then-held-still") << int(MovedByARequestThenHeldStill) << 1.0 << QSize(200, 100);
     // The workspace re-checks every window's position when the work area changes (a panel, a
     // strut, an output's size), and asks a tiled one for its tile's rectangle.
     QTest::newRow("re-checked-by-the-workspace") << int(RecheckedByTheWorkspace) << 1.0 << QSize(200, 100);
@@ -11599,6 +11604,23 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     case MovedByARequest:
         master->moveResize(QRectF(300, 200, 260, 180));
         break;
+    case MovedByARequestThenHeldStill: {
+        master->moveResize(QRectF(300, 200, 260, 180));
+        QTRY_VERIFY(!facade.hasTree());
+        QVERIFY(answerAll());
+        const RectF standing = master->frameGeometry();
+        QSignalSpy stepped(master, &Window::interactiveMoveResizeStepped);
+        QSignalSpy finished(master, &Window::interactiveMoveResizeFinished);
+        workspace()->slotWindowMove();
+        QCOMPARE(workspace()->moveResizeWindow(), master);
+        QVERIFY(master->isInteractiveMove());
+        master->keyPressEvent(Qt::Key_Enter);
+        QCOMPARE(finished.count(), 1);
+        QCOMPARE(stepped.count(), 0);
+        QVERIFY(!master->isInteractiveMove());
+        QCOMPARE(master->frameGeometry(), standing);
+        break;
+    }
     case RecheckedByTheWorkspace:
         // What Workspace::rearrange() calls for every window: a tiled one is asked for its
         // tile's rectangle with a public request, which releases the master.

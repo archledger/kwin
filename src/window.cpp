@@ -1090,6 +1090,7 @@ bool Window::startInteractiveMoveResize()
     m_interactiveMoveResize.initialMaximizeMode = requestedMaximizeMode();
     m_interactiveMoveResize.initialQuickTileMode = requestedQuickTileMode();
     m_interactiveMoveResize.initialGeometryRestore = geometryRestore();
+    m_interactiveMoveResize.stepped = false;
 
     updateElectricGeometryRestore();
     performDelayedRaise();
@@ -1141,10 +1142,12 @@ void Window::finishInteractiveMoveResize(bool cancel)
     workspace()->outline()->hide();
 
     m_interactiveMoveResize.counter++;
-    if (!cancel && m_transientOwnership && m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
+    if (!cancel && m_interactiveMoveResize.stepped && m_transientOwnership
+        && m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
         // The operation's own first request released the record; where it ended is the place
         // the user chose, for as long as no later request moves the window. A cancelled one
-        // put the window back.
+        // put the window back, and one that moved nothing (a press held and released on a
+        // window an earlier release left on an automatic rectangle) chose no place.
         m_transientOwnership->placedByUser = m_geometryRequestGeneration;
     }
     Q_EMIT interactiveMoveResizeFinished();
@@ -1241,6 +1244,7 @@ void Window::updateInteractiveMoveResize(const QPointF &global, Qt::KeyboardModi
                 }
             }
 
+            m_interactiveMoveResize.stepped = true;
             doInteractiveResizeSync(nextMoveResizeGeom);
             Q_EMIT interactiveMoveResizeStepped(nextMoveResizeGeom);
         }
@@ -1272,6 +1276,7 @@ void Window::updateInteractiveMoveResize(const QPointF &global, Qt::KeyboardModi
                 }
             }
 
+            m_interactiveMoveResize.stepped = true;
             move(nextMoveResizeGeom.topLeft());
             Q_EMIT interactiveMoveResizeStepped(nextMoveResizeGeom);
         }

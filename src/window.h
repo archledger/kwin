@@ -2222,7 +2222,8 @@ private:
         bool committed = false;
         // A released record's window was moved or resized by the user's own interactive
         // operation, which ended without being cancelled: the window's geometry request
-        // generation at that end. While it is still the window's, where the window stands is
+        // generation at that end. An operation that moved nothing leaves no mark. While the
+        // generation is still the window's, where the window stands is
         // the user's placement, not an automatic rectangle; any later request (the
         // workspace's re-check, a script's) makes the evidence stale
         // (settleReleasedTransientOwnership).
@@ -2797,6 +2798,9 @@ protected:
         RectF initialScreenArea;
         QTimer *delayedTimer = nullptr;
         uint32_t counter = 0;
+        // Whether the operation has moved or resized the window: one that started and ended
+        // where the window stood (a press on the title bar held and released) chose no place.
+        bool stepped = false;
         MaximizeMode initialMaximizeMode;
         QuickTileMode initialQuickTileMode;
     } m_interactiveMoveResize;
