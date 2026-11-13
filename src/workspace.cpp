@@ -180,6 +180,12 @@ Workspace::Workspace()
     // actual initialization happens in init()
     VirtualDesktopManager::create(this);
     m_transientTileController = std::make_unique<TransientTileController>();
+    // The writer owns the placement memory's file (the same plasmafusion-placementrc the
+    // legacy transport reads, so records carry over) and its flush discipline. Workspace
+    // is its host: without this construction the facade answers nothing and the native
+    // path - the provider's records and the tiler - stays disabled at runtime.
+    m_placementWriter = std::make_unique<TransientPlacementWriter>(
+        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/plasmafusion-placementrc"));
     m_outputUpdateTimer.setSingleShot(true);
     m_outputUpdateTimer.setInterval(0);
     connect(&m_outputUpdateTimer, &QTimer::timeout, this, &Workspace::updateOutputs);
