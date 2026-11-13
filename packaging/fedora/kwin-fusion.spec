@@ -1,6 +1,9 @@
 Name:    kwin
 Version: 6.8.2
-Release: 3%{?dist}.pf3
+# The fork's sequence number on this upstream version: the source is the tag
+# v%%{version}-pf%%{pf}. build-fork-rpm.sh passes the tag's own number.
+%{!?pf:%global pf 3}
+Release: 3%{?dist}.pf%{pf}
 Summary: KDE Window manager (the Plasma Fusion fork)
 
 License: BSD-2-Clause AND BSD-3-Clause AND CC0-1.0 AND GPL-2.0-only AND GPL-2.0-or-later AND GPL-3.0-only AND GPL-3.0-or-later AND LGPL-2.0-only AND LGPL-2.0-or-later AND LGPL-2.1-only AND LGPL-2.1-or-later AND LGPL-3.0-only AND (GPL-2.0-only OR GPL-3.0-only) AND (LGPL-2.1-only OR LGPL-3.0-only) AND MIT
@@ -9,7 +12,7 @@ URL:     https://invent.kde.org/plasma/kwin
 %global plasma_version %(echo %{version} | cut -d. -f1-3)
 
 # The fork's source: the tagged archive from GitHub, not KDE's download
-Source0: https://github.com/archledger/kwin/archive/v%{version}-pf3/%{name}-v%{version}-pf3.tar.gz
+Source0: https://github.com/archledger/kwin/archive/v%{version}-pf%{pf}/%{name}-v%{version}-pf%{pf}.tar.gz
 # Source1 removed: the fork signs git tags, not tarball archives
 
 # macros
@@ -17,9 +20,10 @@ Source10: macros.kwin.in
 
 ## upstream patches
 
-# compositor: handle possibly missing render device
-# https://invent.kde.org/plasma/kwin/-/commit/c9d720793bbcef9483ab290673032d39441c0e6f
-Patch0:  c9d720793bbcef9483ab290673032d39441c0e6f.patch
+# Fedora's kwin-6.8.2-3 carries "compositor: handle possibly missing render device"
+# (https://invent.kde.org/plasma/kwin/-/commit/c9d720793bbcef9483ab290673032d39441c0e6f) as a
+# patch. The fork's 6.8.2 line has that commit in its source (the stable import), so it is not
+# applied here a second time.
 
 ## proposed patches
 
@@ -206,7 +210,8 @@ BuildArch:      noarch
 
 
 %prep
-%autosetup -p1
+# GitHub's archive of the tag v6.8.2-pfN unpacks to kwin-6.8.2-pfN.
+%autosetup -p1 -n %{name}-%{version}-pf%{pf}
 
 
 %conf
@@ -297,7 +302,7 @@ sed -i \
 
 
 %changelog
-* Wed Nov 12 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 6.8.2-3.pf3
+* Thu Nov 12 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 6.8.2-3.pf3
 - The Plasma Fusion fork of KWin 6.8.2 (the full profile's pinned compositor)
 - The native transient tiling sequence: guarded ownership, exact-A restoration,
   the completion boundary, the command-intent matrix, the capture filter,
