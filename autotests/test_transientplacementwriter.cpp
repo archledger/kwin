@@ -38,6 +38,7 @@ private Q_SLOTS:
     void staleRevisionDoesNotMutate();
     void failedSaveDoesNotBlockReplacementSnapshot();
     void reservationRequiresExactPersistedFrame();
+    void memoryFrameIsTheProvidersWholePixelImage();
     void deferredManualWinnerSurvivesCompletion();
     void failedFlushIsNotRetriedByDestructor();
     void failedReservationDoesNotHoldKey();
@@ -220,6 +221,43 @@ void TransientPlacementWriterTest::reservationRequiresExactPersistedFrame()
     TransientPlacementWriter reopened(path);
     QCOMPARE(reopened.snapshot().entries.value(QStringLiteral("app")), frame);
     QCOMPARE(writer.reserve(token, reservation(writer, window, frame)), TransientPlacementWriter::Result::Busy);
+}
+
+void TransientPlacementWriterTest::memoryFrameIsTheProvidersWholePixelImage()
+{
+    // The provider records Math.round of each of x, y, width and height, and a reservation is
+    // made with this image of the window's floating frame: the two must agree on every value,
+    // a half and a negative half included (Math.round goes up, std::round away from zero).
+    const auto image = [](qreal value) {
+        return TransientPlacementWriter::memoryFrame(QRectF(value, 0, 100, 100)).x();
+    };
+    QCOMPARE(image(560.25), 560.0);
+    QCOMPARE(image(560.75), 561.0);
+    QCOMPARE(image(433.5), 434.0);
+    QCOMPARE(image(-19.25), -19.0);
+    QCOMPARE(image(-19.5), -19.0);
+    QCOMPARE(image(-19.75), -20.0);
+    QCOMPARE(image(0.49999999999999994), 0.0);
+    QCOMPARE(image(660), 660.0);
+    const QRectF frame = TransientPlacementWriter::memoryFrame(QRectF(23.240408626116903, 69.34469779451757, 560.25, 521.25));
+    QCOMPARE(frame.x(), 23.0);
+    QCOMPARE(frame.y(), 69.0);
+    QCOMPARE(frame.width(), 560.0);
+    QCOMPARE(frame.height(), 521.0);
+
+    // A fractional frame is still not a record, and its image is one a reservation accepts.
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto window = QUuid::createUuid();
+    QVERIFY(writer.trackWindow(window, QStringLiteral("app")));
+    const QRectF floating(660, 120, 560.25, 521.25);
+    QCOMPARE(writer.record(token, 1, {window, floating, 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::InvalidRecord);
+    QCOMPARE(writer.record(token, 1, {window, TransientPlacementWriter::memoryFrame(floating), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    QCOMPARE(writer.reserve(token, reservation(writer, window, floating)), TransientPlacementWriter::Result::InvalidRecord);
+    QCOMPARE(writer.reserve(token, reservation(writer, window, TransientPlacementWriter::memoryFrame(floating))), TransientPlacementWriter::Result::Accepted);
 }
 
 void TransientPlacementWriterTest::deferredManualWinnerSurvivesCompletion()
