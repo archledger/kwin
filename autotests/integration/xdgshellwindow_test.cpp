@@ -19,6 +19,9 @@
 #include "effect/effecthandler.h"
 #include "pointer_input.h"
 #include "rules.h"
+#include "scripting/scripting.h"
+#include "scripting/transienttilingapi.h"
+#include "scripting/workspace_wrapper.h"
 #include "tiles/customtile.h"
 #include "tiles/tilemanager.h"
 #include "tiles/transientplacementwriter.h"
@@ -393,6 +396,16 @@ private Q_SLOTS:
     void testTransientRequestFractional_data();
     void testTransientRequestFractional();
     void testTransientRequestDecorated();
+    void testConfigurelessRequestSynchronizesRequestedGeometry_data();
+    void testConfigurelessRequestSynchronizesRequestedGeometry();
+    void testTransientTilingFacadeFractionalScale_data();
+    void testTransientTilingFacadeFractionalScale();
+    void testTransientTilingFacadeClosedSibling();
+    void testTransientTilingFacadeMasterClosed();
+    void testTransientTilingFacadeKeyConflict();
+    void testTransientTilingFacadeProviderKeepsRecording_data();
+    void testTransientTilingFacadeProviderKeepsRecording();
+    void testControllerProviderRecordDuringApplication();
     void testTransientRequestRequestedRevocation_data();
     void testTransientRequestRequestedRevocation();
     void testOwnedRequestAuthority_data();
@@ -10442,6 +10455,668 @@ void TestXdgShellWindow::testTransientRequestDecorated()
     QCOMPARE(window->moveResizeGeometry(), tile.windowGeometry());
 }
 
+namespace
+{
+
+// The scripting facade as a script reaches it: Workspace.transientTiling() on the scripting
+// wrapper, every method called by name through the meta-object. The unit suites construct the
+// writer and the controller directly and the script suites mock this object, so a method a
+// script cannot call, a missing one, or a refusal that only the real Workspace wiring produces
+// shows up nowhere else before hardware.
+struct TilingFacade
+{
+    TilingFacade()
+    {
+        QObject *wrapper = workspace()->scripting() ? workspace()->scripting()->workspaceWrapper() : nullptr;
+        const int index = wrapper ? wrapper->metaObject()->indexOfMethod("transientTiling()") : -1;
+        if (index >= 0) {
+            TransientTilingApi *facade = nullptr;
+            void *arguments[] = {&facade};
+            wrapper->qt_metacall(QMetaObject::InvokeMetaMethod, index, arguments);
+            api = facade;
+        }
+    }
+
+    QString registerProvider(QObject *provider) const
+    {
+        QString token;
+        QMetaObject::invokeMethod(api, "registerProvider", Q_RETURN_ARG(QString, token), Q_ARG(QObject *, provider));
+        return token;
+    }
+
+    bool trackWindow(Window *window) const
+    {
+        bool tracked = false;
+        QMetaObject::invokeMethod(api, "trackWindow", Q_RETURN_ARG(bool, tracked), Q_ARG(Window *, window), Q_ARG(QString, QString()));
+        return tracked;
+    }
+
+    int record(const QString &token, int revision, Window *window, const QRectF &frame, int sequence) const
+    {
+        int result = notCallable;
+        QMetaObject::invokeMethod(api, "record", Q_RETURN_ARG(int, result), Q_ARG(QString, token), Q_ARG(int, revision),
+                                  Q_ARG(Window *, window), Q_ARG(QRectF, frame), Q_ARG(int, sequence), Q_ARG(int, 0));
+        return result;
+    }
+
+    QVariantMap createTile(LogicalOutput *output, VirtualDesktop *desktop, const QRectF &relative) const
+    {
+        QVariantMap tree;
+        QMetaObject::invokeMethod(api, "createTile", Q_RETURN_ARG(QVariantMap, tree), Q_ARG(LogicalOutput *, output),
+                                  Q_ARG(VirtualDesktop *, desktop), Q_ARG(QRectF, relative));
+        return tree;
+    }
+
+    int admitTile(int generation, Window *window, const QString &token) const
+    {
+        int result = notCallable;
+        QMetaObject::invokeMethod(api, "admitTile", Q_RETURN_ARG(int, result), Q_ARG(int, generation), Q_ARG(Window *, window),
+                                  Q_ARG(QString, QString()), Q_ARG(QString, token));
+        return result;
+    }
+
+    int releaseTile(int generation) const
+    {
+        int result = notCallable;
+        QMetaObject::invokeMethod(api, "releaseTile", Q_RETURN_ARG(int, result), Q_ARG(int, generation));
+        return result;
+    }
+
+    bool restoreWindow(Window *window) const
+    {
+        return QMetaObject::invokeMethod(api, "restoreWindow", Q_ARG(Window *, window));
+    }
+
+    QRectF masterWindowRect() const
+    {
+        QRectF rect;
+        QMetaObject::invokeMethod(api, "masterWindowRect", Q_RETURN_ARG(QRectF, rect));
+        return rect;
+    }
+
+    bool hasTree() const
+    {
+        bool tree = false;
+        QMetaObject::invokeMethod(api, "hasTree", Q_RETURN_ARG(bool, tree));
+        return tree;
+    }
+
+    int generation() const
+    {
+        int generation = notCallable;
+        QMetaObject::invokeMethod(api, "generation", Q_RETURN_ARG(int, generation));
+        return generation;
+    }
+
+    QRectF entry(const QString &key) const
+    {
+        QVariantMap snapshot;
+        QMetaObject::invokeMethod(api, "snapshot", Q_RETURN_ARG(QVariantMap, snapshot));
+        const QVariantMap rect = snapshot.value(QStringLiteral("entries")).toMap().value(key).toMap();
+        return QRectF(rect.value(QStringLiteral("x")).toDouble(), rect.value(QStringLiteral("y")).toDouble(),
+                      rect.value(QStringLiteral("width")).toDouble(), rect.value(QStringLiteral("height")).toDouble());
+    }
+
+    static constexpr int notCallable = -100;
+    QObject *api = nullptr;
+};
+
+// The provider's record rule: the placement script's Math.round on each of x, y, width and
+// height. The memory holds whole logical pixels.
+QRectF scriptRecord(const QRectF &frame)
+{
+    const auto round = [](qreal value) {
+        return std::floor(value + 0.5);
+    };
+    return QRectF(round(frame.x()), round(frame.y()), round(frame.width()), round(frame.height()));
+}
+
+// QRectF's equality is fuzzy; a restored or tiled frame is an exact contract.
+bool exactFrame(const QRectF &left, const QRectF &right)
+{
+    return left.x() == right.x() && left.y() == right.y() && left.width() == right.width() && left.height() == right.height();
+}
+
+QByteArray frameText(const QRectF &frame)
+{
+    return QByteArray::number(frame.x(), 'g', 17) + ',' + QByteArray::number(frame.y(), 'g', 17) + ' '
+        + QByteArray::number(frame.width(), 'g', 17) + 'x' + QByteArray::number(frame.height(), 'g', 17);
+}
+
+} // namespace
+
+void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry_data()
+{
+    QTest::addColumn<int>("outputs");
+    QTest::addColumn<QRectF>("request");
+    QTest::addColumn<bool>("anchored");
+    QTest::addColumn<bool>("synchronized");
+    // A 361-wide client on a 4/3 output is 481 device pixels, a 360.75-wide frame: a request
+    // for 361 asks the client for the size it has.
+    QTest::newRow("in-place") << 1 << QRectF(102, 102, 361, 240) << false << true;
+    QTest::newRow("moved") << 1 << QRectF(132, 123, 361, 240) << false << true;
+    // As during a resize from the top-left corner: the bottom-right corner stays, so the
+    // published frame's top-left is not the request's.
+    QTest::newRow("bottom-right-kept") << 1 << QRectF(132, 123, 361, 240) << true << true;
+    // The request's center belongs to the second output, its image's to the first.
+    QTest::newRow("center-on-an-output-boundary") << 2 << QRectF(1019.0625, 123, 361, 240) << false << false;
+}
+
+void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
+{
+    // An ordinary request for the client size the window already has is resolved without a
+    // configure: its image on the output's pixels is published at once, and from then on that
+    // image is the requested geometry, as after a configure's commit. Where the image's center
+    // would be on another output than the request's, the requested geometry stays as it was
+    // asked and no output changes under the request.
+    QFETCH(int, outputs);
+    QFETCH(QRectF, request);
+    QFETCH(bool, anchored);
+    QFETCH(bool, synchronized);
+    QList<Test::OutputInfo> config{Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}};
+    if (outputs == 2) {
+        config.append(Test::OutputInfo{.geometry = Rect(1200, 0, 1200, 900), .scale = 4.0 / 3.0});
+    }
+    Test::setOutputConfig(config);
+    workspace()->setActiveOutput(QPoint(100, 100));
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(361, 240), Qt::blue);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(361, 240), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    auto toplevel = static_cast<XdgToplevelWindow *>(window);
+    window->move(QPointF(102, 102));
+    QCOMPARE(window->nextTargetScale(), 4.0 / 3.0);
+    const QRectF before = window->frameGeometry();
+    QVERIFY2(exactFrame(before, QRectF(102, 102, 360.75, 240)), frameText(before).constData());
+    QVERIFY(exactFrame(window->moveResizeGeometry(), before));
+    QVERIFY(!toplevel->hasPendingNativeGeometry());
+    if (anchored) {
+        toplevel->m_configureGravity = Gravity::TopLeft;
+    }
+    const QRectF image(request.topLeft(), before.size());
+    QCOMPARE(workspace()->outputAt(image.center()) == workspace()->outputAt(request.center()), synchronized);
+
+    window->moveResize(request);
+    QVERIFY(!toplevel->hasPendingNativeGeometry());
+    const QRectF frame = window->frameGeometry();
+    QCOMPARE(frame.size(), before.size());
+    if (anchored) {
+        QCOMPARE(frame.x() + frame.width(), request.x() + request.width());
+        QCOMPARE(frame.y() + frame.height(), request.y() + request.height());
+        QVERIFY(frame.x() != request.x());
+    } else {
+        QVERIFY2(exactFrame(frame, image), frameText(frame).constData());
+    }
+    if (synchronized) {
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
+        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(frame.center()));
+    } else {
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), request), frameText(window->moveResizeGeometry()).constData());
+        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(request.center()));
+        QVERIFY(window->moveResizeOutput() != workspace()->outputAt(frame.center()));
+    }
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeFractionalScale_data()
+{
+    QTest::addColumn<bool>("decorated");
+    QTest::addColumn<QSize>("client");
+    QTest::addColumn<QRectF>("floating");
+    QTest::addColumn<QRectF>("request");
+    // The output's pixel is 0.75 logical pixels. A title bar a decoration snapped to it (50.25,
+    // 67 device pixels) over a 241-high client is a whole 291-high frame over a fractional client
+    // (240.75); a 361-wide client is 481 device pixels, a 360.75-wide frame.
+    QTest::newRow("title-bar") << true << QSize(360, 241) << QRectF(102, 102, 360, 291) << QRectF();
+    QTest::newRow("fractional-frame") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF();
+    QTest::newRow("title-bar-fractional-frame") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF();
+    // A script places the window first, in whole pixels: the image of the frame it has, where
+    // it is or elsewhere. The client's size is already that one, so no configure follows.
+    QTest::newRow("whole-pixel-request") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(102, 102, 361, 290);
+    QTest::newRow("whole-pixel-move") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(132, 123, 361, 290);
+    QTest::newRow("whole-pixel-move-without-a-title-bar") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF(132, 123, 361, 240);
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
+{
+    // A whole tiling session through the facade on a 133% output: the provider's registration
+    // and record, the tree, the admission, the client's commit of the tile, the explicit restore
+    // to the exact floating frame and the tree's end, then the same window admitted again.
+    QFETCH(bool, decorated);
+    QFETCH(QSize, client);
+    QFETCH(QRectF, floating);
+    QFETCH(QRectF, request);
+    Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}});
+    workspace()->setActiveOutput(QPoint(100, 100));
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.") + QString::fromLatin1(QTest::currentDataTag());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    shell->set_app_id(key);
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+    if (decorated) {
+        decoration = Test::createXdgToplevelDecorationV1(shell.get());
+        decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    }
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    // The client's side of a configure: acknowledge the newest one and commit a buffer.
+    const auto commit = [&](const QSize &size) {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        Test::render(surface.get(), size, Qt::blue);
+        return Test::waylandSync();
+    };
+    // The same, at the size the configure asked for.
+    const auto follow = [&]() {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        return commit(toplevelConfigure.last().at(0).value<QSize>());
+    };
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Window *window = Test::renderAndWaitForShown(surface.get(), client, Qt::blue);
+    QVERIFY(window);
+    QCOMPARE(window->isDecorated(), decorated);
+    QVERIFY(commit(client));
+    if (decorated) {
+        auto state = window->nextDecoration()->nextState();
+        state->setBorders(QMarginsF(0, 50.25, 0, 0));
+        Q_EMIT window->nextDecoration()->nextStateChanged(state);
+        QVERIFY(commit(client));
+    }
+    window->move(floating.topLeft());
+    QCOMPARE(window->nextTargetScale(), 4.0 / 3.0);
+    QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+    if (!request.isNull()) {
+        // The request needs nothing from the client: its image on the output's pixels is
+        // published at once and is the window's requested geometry from then on, as it is
+        // when a configure's commit lands. On the ThinkPad the requested geometry stayed the
+        // whole-pixel rectangle, a quarter pixel from the frame, and the window was refused
+        // as unsettled (Ineligible) until its next commit.
+        window->moveResize(request);
+        floating.moveTopLeft(request.topLeft());
+        QVERIFY(!static_cast<XdgToplevelWindow *>(window)->hasPendingNativeGeometry());
+        QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), floating), frameText(window->moveResizeGeometry()).constData());
+    }
+
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(window));
+    QCOMPARE(facade.record(token, 1, window, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+    QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
+
+    auto output = window->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    // A quarter of the output: 600x450 less the tile padding, both on the output's pixel grid.
+    const QRectF quarter(0, 0, 0.5, 0.5);
+    const QRectF managed(4, 4, 594, 444);
+    const QVariantMap tree = facade.createTile(output, desktop, quarter);
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QVERIFY(tree.value(QStringLiteral("generation")).toInt() > 0);
+    QVERIFY2(exactFrame(facade.masterWindowRect(), managed), frameText(facade.masterWindowRect()).constData());
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(window->m_transientOwnership);
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(window->frameGeometry(), managed), frameText(window->frameGeometry()).constData());
+    QVERIFY(window->tile());
+    QVERIFY(window->m_transientOwnership);
+
+    // The explicit restore for this window: the Window Restore action, addressed to the window.
+    QSignalSpy treeChanged(facade.api, SIGNAL(treeChanged()));
+    QVERIFY2(facade.restoreWindow(window), "a script cannot call the facade's restoreWindow");
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+    QVERIFY(!window->tile());
+    QVERIFY(!window->m_transientOwnership);
+    // The tree existed for this window. Its end is how the script learns the window left.
+    QTRY_VERIFY(!facade.hasTree());
+    QVERIFY(!treeChanged.isEmpty());
+    QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
+
+    // Nothing of the first session is left on the window: it is admitted and restored again.
+    const QVariantMap again = facade.createTile(output, desktop, quarter);
+    QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(window->frameGeometry(), managed), frameText(window->frameGeometry()).constData());
+    QVERIFY(facade.restoreWindow(window));
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+    QVERIFY(!window->m_transientOwnership);
+    QTRY_VERIFY(!facade.hasTree());
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeClosedSibling()
+{
+    // The provider tracks every window it watches, and a key has one window at a reservation.
+    // A window that closed without ever being admitted must not stay bound: the app's next
+    // window would be refused as its own conflict for the rest of the session.
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.sibling");
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    {
+        std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+        std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+        shell->set_app_id(key);
+        QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+        Window *first = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+        QVERIFY(first);
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        Test::render(surface.get(), QSize(200, 100), Qt::red);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(facade.trackWindow(first));
+        QCOMPARE(facade.record(token, 1, first, scriptRecord(first->frameGeometry()), 1), int(TransientPlacementWriter::Result::Accepted));
+        QSignalSpy destroyed(first, &QObject::destroyed);
+        shell.reset();
+        surface.reset();
+        QVERIFY(Test::waitForWindowClosed(first));
+        QVERIFY(!destroyed.isEmpty() || destroyed.wait());
+    }
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *second = Test::renderAndWaitForShown(surface.get(), QSize(220, 120), Qt::green);
+    QVERIFY(second);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), QSize(220, 120), Qt::green);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(facade.trackWindow(second));
+    QCOMPARE(facade.record(token, 2, second, scriptRecord(second->frameGeometry()), 2), int(TransientPlacementWriter::Result::Accepted));
+    auto output = second->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), second, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(second->m_transientOwnership);
+    shell.reset();
+    surface.reset();
+    QVERIFY(Test::waitForWindowClosed(second));
+    QTRY_VERIFY(!facade.hasTree());
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeMasterClosed()
+{
+    // Closing the admitted window releases it natively and leaves a tree with no purpose. The
+    // script learns of a native teardown from treeChanged with no live tree, so the facade ends
+    // the tree its window left; without that the script's session outlives its master.
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.closed");
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(window));
+    QCOMPARE(facade.record(token, 1, window, scriptRecord(window->frameGeometry()), 1), int(TransientPlacementWriter::Result::Accepted));
+    auto output = window->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->tile());
+    QVERIFY(facade.hasTree());
+
+    QSignalSpy treeChanged(facade.api, SIGNAL(treeChanged()));
+    shell.reset();
+    surface.reset();
+    QVERIFY(Test::waitForWindowClosed(window));
+    QTRY_VERIFY(!facade.hasTree());
+    QVERIFY(!treeChanged.isEmpty());
+    QCOMPARE(facade.generation(), 0);
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeKeyConflict()
+{
+    // A second window of the master's app: the provider tracks it, the key conflicts and the
+    // native layer revokes the master. A generic revocation is detach-only. The tree ends, which
+    // is the tiler's signal, and the master stays at its tile with its record held: the explicit
+    // restore is consumed without a restoration, and the window is not admitted again.
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.conflict");
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *master = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(master);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(master));
+    QCOMPARE(facade.record(token, 1, master, scriptRecord(master->frameGeometry()), 1), int(TransientPlacementWriter::Result::Accepted));
+    auto output = master->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
+    const QRectF managed = facade.masterWindowRect();
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(master->tile());
+    QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
+
+    std::unique_ptr<KWayland::Client::Surface> siblingSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> siblingShell(Test::createXdgToplevelSurface(siblingSurface.get()));
+    siblingShell->set_app_id(key);
+    Window *sibling = Test::renderAndWaitForShown(siblingSurface.get(), QSize(220, 120), Qt::green);
+    QVERIFY(sibling);
+    QSignalSpy treeChanged(facade.api, SIGNAL(treeChanged()));
+    QVERIFY(facade.trackWindow(sibling));
+    QVERIFY(!master->tile());
+    QTRY_VERIFY(!facade.hasTree());
+    QVERIFY(!treeChanged.isEmpty());
+
+    QVERIFY(master->m_transientOwnership);
+    QCOMPARE(master->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(!master->m_transientOwnership->restoreAttempt);
+    QVERIFY(facade.restoreWindow(master));
+    QVERIFY(master->m_transientOwnership);
+    QVERIFY(!master->m_transientOwnership->restoreAttempt);
+    QVERIFY(exactFrame(master->moveResizeGeometry(), managed));
+    QVERIFY(exactFrame(master->frameGeometry(), managed));
+    const QVariantMap again = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Busy));
+    QCOMPARE(facade.releaseTile(again.value(QStringLiteral("generation")).toInt()), int(TransientTileController::Result::Accepted));
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeProviderKeepsRecording_data()
+{
+    QTest::addColumn<int>("moment");
+    QTest::newRow("another-app-before-the-tile-commit") << 0;
+    QTest::newRow("another-app-while-tiled") << 1;
+    QTest::newRow("the-restored-frame-in-its-commit") << 2;
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeProviderKeepsRecording()
+{
+    // The provider is the placement memory: it records other apps' windows all the time, and
+    // the restored master's own float as soon as that frame settles. An admission is proven
+    // against the provider's revision; once admitted, the window is bound to the provider's
+    // incarnation (the contract: "While K is reserved, accepted writes for other keys proceed
+    // normally", and "completion may re-record the restored frame subject to all normal
+    // guards"). Another app's record, before the client's tile commit or while tiled, must not
+    // stop the explicit restore from starting (the first two rows), and the restored frame's
+    // own record must not stop the restoration from completing (the third). On the ThinkPad
+    // that record came inside the landing commit, before the completion: the ownership was
+    // held for good and every window could be tiled once.
+    QFETCH(int, moment);
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.recording.") + QString::fromLatin1(QTest::currentDataTag());
+    // The other app's window first: the master opens last and is the active one, so no
+    // activation configure follows its setup.
+    std::unique_ptr<KWayland::Client::Surface> otherSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> otherShell(Test::createXdgToplevelSurface(otherSurface.get()));
+    otherShell->set_app_id(key + QStringLiteral(".other"));
+    Window *other = Test::renderAndWaitForShown(otherSurface.get(), QSize(220, 120), Qt::green);
+    QVERIFY(other);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *master = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(master);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    // The client's side of a configure: acknowledge the newest one and commit its size.
+    const auto follow = [&]() {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+        return Test::waylandSync();
+    };
+    QCOMPARE(workspace()->activeWindow(), master);
+    const QRectF floating = master->frameGeometry();
+
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(master));
+    QVERIFY(facade.trackWindow(other));
+    QCOMPARE(facade.record(token, 1, master, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+    QCOMPARE(facade.record(token, 2, other, scriptRecord(other->frameGeometry()), 2), int(TransientPlacementWriter::Result::Accepted));
+    int revision = 2;
+    // Another app's window recorded at a new place: an accepted write for another key.
+    const auto elsewhere = [&]() {
+        ++revision;
+        return facade.record(token, revision, other, QRectF(300 + revision, 300, 220, 120), revision);
+    };
+
+    auto output = master->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
+    const QRectF managed = facade.masterWindowRect();
+    if (moment == 0) {
+        QCOMPARE(elsewhere(), int(TransientPlacementWriter::Result::Accepted));
+    }
+    QVERIFY(follow());
+    QVERIFY(master->tile());
+    QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
+    QVERIFY(master->m_transientOwnership);
+    QCOMPARE(master->m_transientOwnership->phase, Window::TransientOwnershipPhase::Owned);
+    if (moment == 1) {
+        QCOMPARE(elsewhere(), int(TransientPlacementWriter::Result::Accepted));
+    }
+    QObject context;
+    int settled = TilingFacade::notCallable;
+    if (moment == 2) {
+        // As the script does: the restored frame settles and its float is recorded, inside the
+        // commit that lands it and before that commit completes the restoration.
+        connect(master, &Window::frameGeometryChanged, &context, [&]() {
+            if (settled == TilingFacade::notCallable && exactFrame(master->frameGeometry(), floating)) {
+                ++revision;
+                settled = facade.record(token, revision, master, scriptRecord(floating), revision);
+            }
+        });
+    }
+    QVERIFY(facade.restoreWindow(master));
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(master->frameGeometry(), floating), frameText(master->frameGeometry()).constData());
+    if (moment == 2) {
+        QCOMPARE(settled, int(TransientPlacementWriter::Result::Deferred));
+    }
+    QVERIFY(!master->m_transientOwnership);
+    QTRY_VERIFY(!facade.hasTree());
+    QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
+
+    // The window is free again: a second session admits it and gives it back.
+    const QVariantMap again = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(follow());
+    QVERIFY(master->tile());
+    QVERIFY(facade.restoreWindow(master));
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(master->frameGeometry(), floating), frameText(master->frameGeometry()).constData());
+    QVERIFY(!master->m_transientOwnership);
+    QTRY_VERIFY(!facade.hasTree());
+}
+
 void TestXdgShellWindow::testTransientRequestRequestedRevocation_data()
 {
     QTest::addColumn<int>("cause");
@@ -12251,6 +12926,56 @@ void TestXdgShellWindow::testControllerProviderChange_data()
     QTest::addColumn<bool>("retire");
     QTest::newRow("retired") << true;
     QTest::newRow("revision-changed") << false;
+}
+
+void TestXdgShellWindow::testControllerProviderRecordDuringApplication()
+{
+    // The provider's revision is the admission's proof until the admission has returned: a
+    // record for another key from the application's own callbacks (after the publication, the
+    // association being installed) still supersedes it. Only an admitted ownership is bound to
+    // the provider's incarnation alone.
+    using Result = TransientTileController::Result;
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(QStringLiteral("org.example.application"));
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = window->internalId();
+    const auto other = QUuid::createUuid();
+    const auto key = QStringLiteral("org.example.application");
+    QVERIFY(writer.trackWindow(id, key));
+    QVERIFY(writer.trackWindow(other, QStringLiteral("other")));
+    QCOMPARE(writer.record(token, 1, {id, window->frameGeometry(), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    auto manager = workspace()->tileManager(window->moveResizeOutput());
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(window->moveResizeOutput());
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), Result::Accepted);
+    bool published = false;
+    int recorded = 0;
+    connect(controller.tile(), &Tile::windowsChanged, &writer, [&]() {
+        published = true;
+    });
+    connect(window, &Window::requestedTileChanged, &writer, [&]() {
+        if (published && !recorded) {
+            recorded = 1;
+            QCOMPARE(writer.record(token, 2, {other, QRectF(10, 10, 180, 90), 2, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+        }
+    });
+    const auto state = writer.snapshot();
+    QCOMPARE(controller.admit(controller.generation(), window, &writer, token, key, state.providerRevision, state.mapRevision), Result::Superseded);
+    QCOMPARE(recorded, 1);
+    QVERIFY(controller.tile()->windows().isEmpty());
+    QVERIFY(!window->m_transientOwnership || !window->m_transientOwnership->admitted);
 }
 
 void TestXdgShellWindow::testControllerProviderChange()

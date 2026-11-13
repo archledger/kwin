@@ -52,6 +52,7 @@ public:
     /**
      * Tracks a window under its placement key. The key follows the controller's rule:
      * the desktop file's basename minus .desktop, else the resource class, lowercased.
+     * The binding ends with the window.
      */
     Q_INVOKABLE bool trackWindow(Window *window, const QString &key);
 
@@ -101,6 +102,16 @@ public:
     Q_INVOKABLE int releaseTile(int generation);
 
     /**
+     * The explicit restore of one window: the Window Restore action (un-fullscreen, un-tile
+     * or un-maximize, with its raise and focus) for this window instead of the active one.
+     * It is how the tiler gives an admitted master back its floating frame, and it has to
+     * come before the release: the action restores an owned window, while a window the
+     * native layer has already released stays where it stands (a generic revocation is
+     * detach-only) and consumes the action without a restoration.
+     */
+    Q_INVOKABLE void restoreWindow(Window *window);
+
+    /**
      * The transient leaf's absolute window geometry (the master's placed rectangle,
      * including the tile padding and strut adjustments).
      */
@@ -119,12 +130,18 @@ public:
 Q_SIGNALS:
     /**
      * Forwarded from the controller's treeChanged: the tiler treats a change with no
-     * live tree as session-end (native teardown of any cause).
+     * live tree as session-end (native teardown of any cause). A tree whose admitted
+     * window has left it (closed, restored, or released by the native layer) is ended
+     * here, so that cause reaches the tiler the same way.
      */
     void treeChanged();
 
 private:
+    void endTreeWhenVacated(TransientTileController *controller);
+    void endVacatedTree(quint64 generation);
+
     Workspace *m_workspace;
+    QMetaObject::Connection m_vacated;
 };
 
 } // namespace KWin

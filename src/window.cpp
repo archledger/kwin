@@ -3953,7 +3953,7 @@ bool Window::transientOwnershipIsCurrent(quint64 generation) const
         return false;
     }
     const auto &ownership = *m_transientOwnership;
-    if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+    if (!transientProviderIsCurrent(ownership)
         || !ownership.writer->ownsReservation(internalId(), QString::number(generation))) {
         return false;
     }
@@ -5060,13 +5060,17 @@ quint64 Window::prepareTransientOwnership(TransientPlacementWriter *writer, cons
     request->m_ownerGeneration = generation;
     request->m_sequence = 0;
     auto ownership = std::make_unique<TransientOwnership>(writer, provider, providerRevision, generation, std::move(request));
-    const auto result = writer->reserve(provider, {internalId(), QString::number(generation), ownership->floating, providerRevision, mapRevision, key});
+    // The writer holds whole logical pixels: the reservation is made with the memory's image of
+    // the floating frame. The exact frame stays in the ownership, for the native restore.
+    const auto result = writer->reserve(provider, {internalId(), QString::number(generation), TransientPlacementWriter::memoryFrame(ownership->floating), providerRevision, mapRevision, key});
     if (result != TransientPlacementWriter::Result::Accepted) {
         return 0;
     }
     // QObject::destroyed runs after Window's fields have gone: capture no Window state here.
     ownership->closeCleanup = connect(this, &QObject::destroyed, writer, [writer, id = internalId()]() {
-        if (!writer->forgetWindow(id)) {
+        // Whoever tracked the window may have bound its record to the window's lifetime itself
+        // (the scripting facade does) and removed it first.
+        if (!writer->forgetWindow(id) && !writer->windowBinding(id).isEmpty()) {
             qCWarning(KWIN_CORE) << "Failed to remove transient placement tracking for" << id;
         }
     });
@@ -5125,8 +5129,7 @@ Window::TransientApplication Window::applyTransientOwnershipGuarded(quint64 gene
         application.continuation.checkpoint.reset();
         application.continuation.owned = {};
     };
-    if (!m_transientOwnership->writer
-        || !m_transientOwnership->writer->isProviderCurrent(m_transientOwnership->provider, m_transientOwnership->providerRevision)
+    if (!transientProviderIsCurrent(*m_transientOwnership)
         || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(generation))) {
         revokeTransientOwnership(generation);
         conclude();
@@ -5181,7 +5184,7 @@ bool Window::transientRestoreAttemptIsCurrent(quint64 generation, quint64 sequen
         || ownership.progress != TransientRequestProgress::Requested || m_requestedTile || m_tile || m_requestedTransientTileGeneration) {
         return false;
     }
-    if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+    if (!transientProviderIsCurrent(ownership)
         || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
         return false;
     }
@@ -5744,8 +5747,8 @@ bool Window::transientRequestIsCurrent(const TransientTileRequest &request) cons
 {
     if (m_transientOwnership
         && (m_transientOwnership->generation != request.m_ownerGeneration
-            || m_transientOwnership->phase != TransientOwnershipPhase::Owned || !m_transientOwnership->writer
-            || !m_transientOwnership->writer->isProviderCurrent(m_transientOwnership->provider, m_transientOwnership->providerRevision)
+            || m_transientOwnership->phase != TransientOwnershipPhase::Owned
+            || !transientProviderIsCurrent(*m_transientOwnership)
             || !m_transientOwnership->writer->ownsReservation(internalId(), QString::number(request.m_ownerGeneration)))) {
         return false;
     }
@@ -5783,6 +5786,15 @@ bool Window::transientAdmissionEligible(const RectF &target) const
     return !isDeleted() && !m_transientOwnership && !m_activeTransientRequest && !m_requestedTile && !m_tile
         && !m_requestedTransientTileGeneration && supportsAssignmentGeometryRequest() && canStartTransientTileRequest(target)
         && exactFrameGeometry(frameGeometry(), moveResizeGeometry());
+}
+
+bool Window::transientProviderIsCurrent(const TransientOwnership &ownership) const
+{
+    if (!ownership.writer) {
+        return false;
+    }
+    return ownership.admitted ? ownership.writer->isProviderRegistered(ownership.provider)
+                              : ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision);
 }
 
 bool Window::transientAdmissionHeadroom() const

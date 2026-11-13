@@ -297,6 +297,18 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             if (guarded) {
                 publishForAssignment(target, *guarded);
             } else {
+                // The request is resolved here, with no configure and nothing for the client to
+                // commit: what is published is the request's image on the output's pixels, and
+                // the requested geometry follows it, as it does when a configure's commit lands
+                // (synchronizeCommittedGeometry). Left at the rectangle that was asked for, it
+                // would differ from the frame until the client's next commit, and the window
+                // would read as unsettled for that long. Half a pixel must not carry the
+                // center to another output: there the request stays as it was asked. A guarded
+                // request keeps its rectangle on purpose: its caller compares the requested
+                // geometry with the rectangle it asked for (a tile's, a restoration's).
+                if (target != rect && workspace()->outputAt(target.center()) == moveResizeOutput()) {
+                    setMoveResizeGeometry(target);
+                }
                 updateGeometry(target);
             }
         } else {
@@ -970,11 +982,15 @@ bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) con
     if (snappedFrame.width() != target.width() || snappedFrame.height() != target.height()) {
         return false;
     }
-    const auto client = nextFrameSizeToClientSize(snappedFrame);
-    const auto snappedClient = surface()->snappedSize(client);
-    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(snappedClient, nextTargetScale()));
-    return client.width() == snappedClient.width() && client.height() == snappedClient.height()
-        && roundTrip.width() == target.width() && roundTrip.height() == target.height();
+    // The size a configure can carry is on the client's own grid (whole logical pixels without
+    // fractional-scale-v2), and the client size under this frame need not be on it: a title bar
+    // snapped to the output's pixels leaves a fractional client height under a whole frame. The
+    // frame is reachable when the round trip lands on it - the size the client is asked for,
+    // snapped back to the output's pixels and decorated again - which is the path a geometry
+    // request takes (moveResizeInternal, then the commit's clientGeometry).
+    const auto client = surface()->snappedSize(nextFrameSizeToClientSize(snappedFrame));
+    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(client, nextTargetScale()));
+    return roundTrip.width() == target.width() && roundTrip.height() == target.height();
 }
 
 std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const
