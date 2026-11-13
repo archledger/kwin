@@ -8,32 +8,29 @@
 */
 #include "kwin_wayland_test.h"
 
-#include "atoms.h"
 #include "core/output.h"
 #include "pointer_input.h"
-#include "rules.h"
 #include "tiles/tilemanager.h"
-#include "tiles/transientplacementwriter.h"
-#include "tiles/transienttilecontroller.h"
-#include "utils/gravity.h"
 #include "wayland_server.h"
 #include "window.h"
 #include "workspace.h"
-#include "xdgshellwindow.h"
 
-#if KWIN_BUILD_X11
+// The fork's includes, in blocks of their own between upstream's: a line of ours inside one
+// of upstream's blocks is a merge conflict with every edit beside it.
+#include "atoms.h"
+#include "rules.h"
+#include "tiles/transientplacementwriter.h"
+#include "tiles/transienttilecontroller.h"
+#include "utils/gravity.h"
+#include "xdgshellwindow.h"
+#if KWIN_BUILD_X11 // the fork's X11 rows
 #include "utils/xcbutils.h"
-#include "x11window.h"
-#include <KDecoration3/DecoratedWindow>
-#include <KDecoration3/Decoration>
-#include <netwm.h>
-#include <xcb/xcb_icccm.h>
 #endif
 
 #include <KConfigGroup>
+#include <KDecoration3/DecoratedWindow>
 #include <KDecoration3/Decoration>
 #include <KSharedConfig>
-#include <QAbstractItemModelTester>
 #include <QChildEvent>
 #include <QPointer>
 
@@ -41,6 +38,14 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+
+#if KWIN_BUILD_X11
+#include "x11window.h"
+#include <netwm.h>
+#include <xcb/xcb_icccm.h>
+#endif
+
+#include <QAbstractItemModelTester>
 
 Q_DECLARE_METATYPE(KWin::QuickTileMode)
 Q_DECLARE_METATYPE(KWin::MaximizeMode)
@@ -182,6 +187,7 @@ private Q_SLOTS:
     void transientPublicMutations_data();
     void transientPublicMutations();
     void transientRefusesDirectManagement();
+    void rootTileIsNotTransient();
     void compatibilityAssignmentRefusal_data();
     void compatibilityAssignmentRefusal();
     void compatibilityAssignmentAcrossDesktops_data();
@@ -270,7 +276,6 @@ void TilesTest::init()
     m_output = workspace()->activeOutput();
     m_tileManager = workspace()->tileManager(m_output);
     m_rootTile = workspace()->rootTile(m_output);
-    QVERIFY(!m_rootTile->isTransient());
     QAbstractItemModelTester(m_tileManager->model(), QAbstractItemModelTester::FailureReportingMode::QtTest);
 
     VirtualDesktopManager::self()->setCount(3);
@@ -435,6 +440,14 @@ void TilesTest::transientRefusesDirectManagement()
     QVERIFY(keptGeometry);
     QVERIFY(empty);
     QVERIFY(silent);
+}
+
+void TilesTest::rootTileIsNotTransient()
+{
+    // The fixture every row starts from: init() leaves an ordinary root tile. A test of its
+    // own, so that upstream's init() stays as upstream has it.
+    QVERIFY(m_rootTile);
+    QVERIFY(!m_rootTile->isTransient());
 }
 
 void TilesTest::compatibilityAssignmentRefusal_data()
