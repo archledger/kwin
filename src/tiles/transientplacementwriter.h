@@ -123,6 +123,13 @@ public:
     {
         return m_provider && !provider.isNull() && provider == m_providerToken && revision == m_providerRevision;
     }
+    // The provider's incarnation alone: what binds a window once its admission is done. The
+    // revision is the admission's proof (isProviderCurrent); after it the provider goes on
+    // recording - other keys at any time, the owner's own restored frame - at newer revisions.
+    bool isProviderRegistered(const QUuid &provider) const
+    {
+        return m_provider && !provider.isNull() && provider == m_providerToken;
+    }
     bool trackWindow(const QUuid &window, const QString &key);
     // The key a window is bound under, or empty when it is not bound: read-only, so a
     // reloaded provider incarnation can ask which key an earlier one left a window under
@@ -130,6 +137,12 @@ public:
     QString windowBinding(const QUuid &window) const;
     // Called at QObject destruction, not before the window's close callbacks.
     bool forgetWindow(const QUuid &window);
+    // The memory's image of a native frame: x, y, width and height each rounded to a whole
+    // logical pixel, a half rounding up - the rule the provider records under (the placement
+    // script's Math.round). The memory holds whole pixels by contract and a native frame on a
+    // fractional-scale output need not be whole, so a reservation is made with the image of the
+    // floating frame; the frame itself would be refused, or would never equal its own entry.
+    static QRectF memoryFrame(const QRectF &frame);
     Result record(const QUuid &provider, quint64 revision, const Update &update);
     Result reserve(const QUuid &provider, const ReservationRequest &request);
     Result activateReservation(const QUuid &provider, const QUuid &window, const QString &generation);
