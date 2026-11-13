@@ -53,6 +53,23 @@ namespace KWin
 static bool changeMaximizeRecursion = false;
 static bool isFiniteExtent(const RectF &rect);
 
+// Whether two logical lengths are the same number of an output's pixels. A size read back from
+// a rectangle is the difference of two corners, and a frame's size is a client size plus its
+// borders: wherever the output's pixel is not a binary fraction (0.8 at 125%, two thirds at
+// 150%) either differs in its last bits from the number the pixel grid itself gives, and an
+// exact comparison of the two refuses a frame the window has had all along. Sizes that are
+// different on the grid differ by a whole pixel; the tolerance is far below that and far above
+// the arithmetic's noise.
+static bool samePixels(qreal left, qreal right, qreal scale)
+{
+    return std::abs(left - right) * scale < 1.0 / 1024;
+}
+
+static bool samePixels(const QSizeF &left, const QSizeF &right, qreal scale)
+{
+    return samePixels(left.width(), right.width(), scale) && samePixels(left.height(), right.height(), scale);
+}
+
 XdgSurfaceWindow::XdgSurfaceWindow(XdgSurfaceInterface *shellSurface)
     : WaylandWindow(shellSurface->surface())
     , m_shellSurface(shellSurface)
@@ -980,6 +997,76 @@ bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
     return isTransientRestoreFrameFeasible(target);
 }
 
+RectF XdgToplevelWindow::transientTileFrame(const RectF &tile) const
+{
+    if (isDeleted() || !surface() || isTransientRestoreFrameFeasible(tile)) {
+        return tile;
+    }
+    const qreal scale = nextTargetScale();
+    const qreal clientScale = surface()->serverScale() * surface()->compositorToClientScale();
+    for (qreal value : {tile.x(), tile.y(), tile.width(), tile.height(), scale, clientScale}) {
+        if (!std::isfinite(value)) {
+            return tile;
+        }
+    }
+    if (tile.width() <= 0 || tile.height() <= 0 || scale <= 0 || clientScale <= 0) {
+        return tile;
+    }
+    // The size a request for the tile would publish is the tile's size taken to the output's
+    // pixels, to the client's grid and back (dispatchMoveResize, then the commit), and each of
+    // those roundings can go up: a 892-high tile at 133% under a 50.25 title bar asks the
+    // client for 842, which commits a 892.5-high frame. So the size is asked one device pixel
+    // smaller on an axis for as long as its image is larger than the tile there. An image is
+    // at most half a step of the client's grid and one device pixel over what was asked, which
+    // bounds the steps and keeps the fit within a step of that grid and two device pixels of
+    // the tile.
+    // Counted in whole device pixels, so that every step is one of the grid's own numbers.
+    const int steps = int(std::ceil(scale / clientScale)) + 2;
+    qreal width = std::round(tile.width() * scale);
+    qreal height = std::round(tile.height() * scale);
+    for (int step = 0; step <= steps && width > 0 && height > 0; ++step) {
+        const QSizeF client = surface()->snappedSize(nextFrameSizeToClientSize(QSizeF(width / scale, height / scale)));
+        const QSizeF image = nextClientSizeToFrameSize(snapToPixels(client, scale));
+        const bool wide = image.width() > tile.width() && !samePixels(image.width(), tile.width(), scale);
+        const bool tall = image.height() > tile.height() && !samePixels(image.height(), tile.height(), scale);
+        if (!wide && !tall) {
+            // Inside the tile; reachable unless the client's limits or a grid coarser than
+            // the client's (a scale below one) say otherwise, and then nothing smaller is.
+            const RectF frame(tile.topLeft(), image);
+            return isTransientRestoreFrameFeasible(frame) ? frame : tile;
+        }
+        if (wide) {
+            --width;
+        }
+        if (tall) {
+            --height;
+        }
+    }
+    return tile;
+}
+
+bool XdgToplevelWindow::isTransientTileFrame(const RectF &frame, const RectF &tile) const
+{
+    if (Window::isTransientTileFrame(frame, tile)) {
+        return true;
+    }
+    if (isDeleted() || !surface() || frame.x() != tile.x() || frame.y() != tile.y()) {
+        return false;
+    }
+    const qreal scale = nextTargetScale();
+    const qreal clientScale = surface()->serverScale() * surface()->compositorToClientScale();
+    if (!std::isfinite(scale) || !std::isfinite(clientScale) || scale <= 0 || clientScale <= 0) {
+        return false;
+    }
+    // A fit is short of its tile by less than a step of the client's grid and two device
+    // pixels on an axis (transientTileFrame).
+    const qreal slack = 1 / clientScale + 2 / scale;
+    const auto fits = [scale, slack](qreal size, qreal extent) {
+        return (size <= extent || samePixels(size, extent, scale)) && extent - size < slack;
+    };
+    return fits(frame.width(), tile.width()) && fits(frame.height(), tile.height());
+}
+
 bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) const
 {
     for (qreal value : {target.x(), target.y(), target.width(), target.height()}) {
@@ -990,12 +1077,14 @@ bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) con
     if (target.width() <= 0 || target.height() <= 0) {
         return false;
     }
-    const auto constrained = constrainFrameSize(target.size());
-    if (constrained.width() != target.width() || constrained.height() != target.height()) {
+    // Every comparison here is of sizes on the output's pixels (samePixels): the target's is
+    // read back from a rectangle, the others are computed on the grid.
+    const qreal scale = nextTargetScale();
+    if (!samePixels(constrainFrameSize(target.size()), target.size(), scale)) {
         return false;
     }
-    const auto snappedFrame = snapToPixels(target.size(), nextTargetScale());
-    if (snappedFrame.width() != target.width() || snappedFrame.height() != target.height()) {
+    const auto snappedFrame = snapToPixels(target.size(), scale);
+    if (!samePixels(snappedFrame, target.size(), scale)) {
         return false;
     }
     // The size a configure can carry is on the client's own grid (whole logical pixels without
@@ -1005,8 +1094,8 @@ bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) con
     // snapped back to the output's pixels and decorated again - which is the path a geometry
     // request takes (moveResizeInternal, then the commit's clientGeometry).
     const auto client = surface()->snappedSize(nextFrameSizeToClientSize(snappedFrame));
-    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(client, nextTargetScale()));
-    return roundTrip.width() == target.width() && roundTrip.height() == target.height();
+    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(client, scale));
+    return samePixels(roundTrip, target.size(), scale);
 }
 
 std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const
@@ -1116,7 +1205,7 @@ Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximi
             return {};
         }
     } else if (!isFiniteExtent(target) || target.width() < minSize().width() || target.height() < minSize().height()
-               || snapToPixels(target.size(), nextTargetScale()) != target.size()) {
+               || !samePixels(snapToPixels(target.size(), nextTargetScale()), target.size(), nextTargetScale())) {
         // Maximized or fullscreen borders are not the borders that A will use. These are only necessary
         // checks; exact frame/client feasibility follows the same-decoration response.
         return {};
@@ -2390,7 +2479,7 @@ std::optional<XdgToplevelWindow::OwnedFullScreen> XdgToplevelWindow::ownedFullSc
     if (!transientOwnershipIsCurrent(generation)) {
         return std::nullopt;
     }
-    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    const RectF managed = transientTileFrame(m_transientOwnership->tile->windowGeometry());
     if (!isFiniteExtent(managed)) {
         return std::nullopt;
     }
@@ -2722,7 +2811,7 @@ std::optional<XdgToplevelWindow::OwnedMaximize> XdgToplevelWindow::ownedMaximize
     if (!transientOwnershipIsCurrent(generation)) {
         return std::nullopt;
     }
-    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    const RectF managed = transientTileFrame(m_transientOwnership->tile->windowGeometry());
     if (!ownedMaximizeFeasible(managed, mode, oldMode)) {
         return std::nullopt;
     }

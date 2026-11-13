@@ -2431,6 +2431,24 @@ protected:
     virtual bool isTransientGeometrySettled() const;
     virtual bool canStartTransientRestoreRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
+    /**
+     * The frame this window takes in a transient tile. A tile's rectangle is whole logical
+     * pixels; a frame is on the output's device pixels over a client size on the client's own
+     * grid, and at a fractional scale most whole rectangles are neither. The window takes the
+     * tile's top-left corner and the largest size it reaches inside the tile, which is the
+     * rectangle itself where that is reachable. A rectangle nothing inside which is reachable
+     * is returned as it is, and refused where its feasibility is checked.
+     */
+    virtual RectF transientTileFrame(const RectF &tile) const;
+    /**
+     * Whether @p frame is a frame this window takes in a tile of rectangle @p tile: the one
+     * transientTileFrame() gives now, or one it gave under other borders. A decoration that
+     * changes its borders when its window is tiled changes, in the middle of the admission,
+     * which sizes the client reaches; the request's frame is then still at the tile's corner
+     * and inside the tile, short of it by no more than a fit ever is. Reachability is the
+     * caller's separate check (isTransientTileTargetFeasible).
+     */
+    virtual bool isTransientTileFrame(const RectF &frame, const RectF &tile) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;
     // a dispatcher reports what it staged or published through the stack-bound request.
     virtual bool supportsAssignmentGeometryRequest() const;

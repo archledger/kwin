@@ -402,6 +402,8 @@ private Q_SLOTS:
     void testTransientTilingFacadeFractionalScale();
     void testTransientTilingFacadeClosedSibling();
     void testTransientTilingFacadeMasterClosed();
+    void testTransientTilingFacadeScales_data();
+    void testTransientTilingFacadeScales();
     void testTransientTilingFacadeKeyConflict();
     void testTransientTilingFacadeReleasedMaster_data();
     void testTransientTilingFacadeReleasedMaster();
@@ -10395,14 +10397,33 @@ void TestXdgShellWindow::testTransientRequestConstraints()
 
 void TestXdgShellWindow::testTransientRequestFractional_data()
 {
-    QTest::addColumn<bool>("fits");
-    QTest::newRow("snapped") << true;
-    QTest::newRow("nonrepresentable") << false;
+    QTest::addColumn<QSizeF>("tileSize");
+    QTest::addColumn<QSize>("minimum");
+    QTest::addColumn<QSizeF>("frameSize");
+    // The output's pixel is 0.8 logical pixels: a 200x100 tile is on it.
+    QTest::newRow("snapped") << QSizeF(200, 100) << QSize() << QSizeF(200, 100);
+    // 201x101 is not (251.25 x 126.25 device pixels). A client asked for 201x101 is 251x126
+    // device pixels, a 200.8 x 100.8 frame: the largest the window reaches inside the tile.
+    QTest::newRow("off-the-pixel-grid") << QSizeF(201, 101) << QSize() << QSizeF(200.8, 100.8);
+    // One axis on the grid, the other not.
+    QTest::newRow("height-off-the-pixel-grid") << QSizeF(200, 101) << QSize() << QSizeF(200, 100.8);
+    // The client's own grid is a whole logical pixel. A 202-wide client is 252.5 device pixels,
+    // which is 253: a 202.4 frame, wider than the tile. The one that fits is 201 wide.
+    QTest::newRow("client-size-over-the-tile") << QSizeF(202, 100) << QSize() << QSizeF(200.8, 100);
+    // Nothing inside the tile is a size the client accepts: refused, as before.
+    QTest::newRow("below-the-minimum") << QSizeF(201, 101) << QSize(201, 101) << QSizeF();
 }
 
 void TestXdgShellWindow::testTransientRequestFractional()
 {
-    QFETCH(bool, fits);
+    // A tile's rectangle is whole logical pixels, and on a fractional-scale output most of
+    // them are off the pixels a frame can have. The window is not refused for that: it takes
+    // the tile's corner and the largest size it can reach inside the tile, and that frame is
+    // the request's target. A rectangle with no reachable size inside it is still refused.
+    QFETCH(QSizeF, tileSize);
+    QFETCH(QSize, minimum);
+    QFETCH(QSizeF, frameSize);
+    const bool reachable = frameSize.isValid();
     Test::OutputInfo output;
     output.geometry = Rect(0, 0, 1280, 1024);
     output.scale = 1.25;
@@ -10410,22 +10431,53 @@ void TestXdgShellWindow::testTransientRequestFractional()
     workspace()->setActiveOutput(QPoint(100, 100));
     std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
     std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    if (minimum.isValid()) {
+        shell->set_min_size(minimum.width(), minimum.height());
+    }
     QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
-    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(220, 120), Qt::red);
     QVERIFY(window);
     QVERIFY(!configure.isEmpty() || configure.wait());
     shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
-    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    configure.clear();
+    Test::render(surface.get(), QSize(220, 120), Qt::red);
     QVERIFY(Test::waylandSync());
     QCOMPARE(window->nextTargetScale(), 1.25);
     RequestTestTile tile(window);
-    tile.setTargetForTest(RectF(100, 100, fits ? 200 : 201, fits ? 100 : 101));
-    QCOMPARE(window->isTransientTileTargetFeasible(tile.windowGeometry()), fits);
+    const RectF rectangle(QPointF(100, 100), tileSize);
+    tile.setTargetForTest(rectangle);
+    const RectF frame = window->transientTileFrame(tile.windowGeometry());
+    const bool onGrid = frameSize == tileSize;
+    QCOMPARE(window->isTransientTileTargetFeasible(tile.windowGeometry()), onGrid);
+    QCOMPARE(window->isTransientTileTargetFeasible(frame), reachable);
+    // RectF compares exactly. Without a fit it is the rectangle itself, which is refused.
+    QCOMPARE(frame, reachable ? RectF(QPointF(100, 100), frameSize) : rectangle);
+    // The fit is the tile's frame. So is a fit under other borders, a size of the client or
+    // two below it (a 200x100 client is 250x125 device pixels, inside every tile here and
+    // within a step of the client's grid and two device pixels of it); nothing at another
+    // corner, larger than the tile or further inside.
+    QVERIFY(window->isTransientTileFrame(frame, rectangle));
+    QVERIFY(window->isTransientTileFrame(RectF(100, 100, 200, 100), rectangle));
+    QVERIFY(!window->isTransientTileFrame(RectF(100.8, 100, 200, 100), rectangle));
+    QVERIFY(!window->isTransientTileFrame(RectF(100, 100, 203.2, 100), rectangle));
+    QVERIFY(!window->isTransientTileFrame(RectF(100, 100, 196.8, 100), rectangle));
+    QVERIFY(!window->isTransientTileFrame(RectF(100, 100, 200, 96.8), rectangle));
     QObject owner;
     auto authority = std::make_shared<RequestAuthority>();
     authority->owner = &owner;
     const auto receipt = window->requestTransientTile(std::make_unique<RequestForTest>(window, &tile, authority));
-    QCOMPARE(receipt.outcome, fits ? Window::TransientRequestOutcome::Applied : Window::TransientRequestOutcome::Rejected);
+    QCOMPARE(receipt.outcome, reachable ? Window::TransientRequestOutcome::Applied : Window::TransientRequestOutcome::Rejected);
+    if (!reachable) {
+        return;
+    }
+    // The request is for the fitted frame, and the client's commit lands on it exactly.
+    QCOMPARE(window->moveResizeGeometry(), frame);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), frame);
 }
 
 void TestXdgShellWindow::testTransientRequestDecorated()
@@ -10689,17 +10741,30 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale_data()
     QTest::addColumn<QSize>("client");
     QTest::addColumn<QRectF>("floating");
     QTest::addColumn<QRectF>("request");
+    QTest::addColumn<QRectF>("relative");
+    QTest::addColumn<QRectF>("tile");
+    QTest::addColumn<QRectF>("managed");
+    // A quarter of the output: 600x450 less the tile padding, both on the output's pixel grid.
+    const QRectF quarter(0, 0, 0.5, 0.5);
+    const QRectF onGrid(4, 4, 594, 444);
     // The output's pixel is 0.75 logical pixels. A title bar a decoration snapped to it (50.25,
     // 67 device pixels) over a 241-high client is a whole 291-high frame over a fractional client
     // (240.75); a 361-wide client is 481 device pixels, a 360.75-wide frame.
-    QTest::newRow("title-bar") << true << QSize(360, 241) << QRectF(102, 102, 360, 291) << QRectF();
-    QTest::newRow("fractional-frame") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF();
-    QTest::newRow("title-bar-fractional-frame") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF();
+    QTest::newRow("title-bar") << true << QSize(360, 241) << QRectF(102, 102, 360, 291) << QRectF() << quarter << onGrid << onGrid;
+    QTest::newRow("fractional-frame") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF() << quarter << onGrid << onGrid;
+    QTest::newRow("title-bar-fractional-frame") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF() << quarter << onGrid << onGrid;
     // A script places the window first, in whole pixels: the image of the frame it has, where
     // it is or elsewhere. The client's size is already that one, so no configure follows.
-    QTest::newRow("whole-pixel-request") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(102, 102, 361, 290);
-    QTest::newRow("whole-pixel-move") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(132, 123, 361, 290);
-    QTest::newRow("whole-pixel-move-without-a-title-bar") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF(132, 123, 361, 240);
+    QTest::newRow("whole-pixel-request") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(102, 102, 361, 290) << quarter << onGrid << onGrid;
+    QTest::newRow("whole-pixel-move") << true << QSize(361, 240) << QRectF(102, 102, 360.75, 290.25) << QRectF(132, 123, 361, 290) << quarter << onGrid << onGrid;
+    QTest::newRow("whole-pixel-move-without-a-title-bar") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF(132, 123, 361, 240) << quarter << onGrid << onGrid;
+    // A master column of 55% over the whole height: 654 wide is on the output's pixels (872),
+    // 892 high is not (1189.33). An 892-high client is 1189 device pixels, an 891.75-high
+    // frame: the window's in that tile. (Decorated windows in such a tile, at this and the
+    // other scales: testTransientTilingFacadeScales.)
+    const QRectF column(0, 0, 0.55, 1);
+    const QRectF offGrid(4, 4, 654, 892);
+    QTest::newRow("tile-off-the-pixel-grid") << false << QSize(361, 240) << QRectF(102, 102, 360.75, 240) << QRectF() << column << offGrid << QRectF(4, 4, 654, 891.75);
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
@@ -10711,6 +10776,9 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
     QFETCH(QSize, client);
     QFETCH(QRectF, floating);
     QFETCH(QRectF, request);
+    QFETCH(QRectF, relative);
+    QFETCH(QRectF, tile);
+    QFETCH(QRectF, managed);
     Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}});
     workspace()->setActiveOutput(QPoint(100, 100));
     const TilingFacade facade;
@@ -10788,19 +10856,19 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
 
     auto output = window->moveResizeOutput();
     auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
-    // A quarter of the output: 600x450 less the tile padding, both on the output's pixel grid.
-    const QRectF quarter(0, 0, 0.5, 0.5);
-    const QRectF managed(4, 4, 594, 444);
-    const QVariantMap tree = facade.createTile(output, desktop, quarter);
+    // The tile's rectangle is the layout's, in whole pixels; the window's frame in it is the
+    // largest it reaches there: the rectangle itself where that is on the window's pixel grid.
+    const QVariantMap tree = facade.createTile(output, desktop, relative);
     QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
     QVERIFY(tree.value(QStringLiteral("generation")).toInt() > 0);
-    QVERIFY2(exactFrame(facade.masterWindowRect(), managed), frameText(facade.masterWindowRect()).constData());
+    QVERIFY2(exactFrame(facade.masterWindowRect(), tile), frameText(facade.masterWindowRect()).constData());
     QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
     QVERIFY(window->m_transientOwnership);
     QVERIFY(follow());
     QVERIFY2(exactFrame(window->frameGeometry(), managed), frameText(window->frameGeometry()).constData());
     QVERIFY(window->tile());
     QVERIFY(window->m_transientOwnership);
+    QVERIFY2(exactFrame(facade.masterWindowRect(), tile), frameText(facade.masterWindowRect()).constData());
 
     // The explicit restore for this window: the Window Restore action, addressed to the window.
     QSignalSpy treeChanged(facade.api, SIGNAL(treeChanged()));
@@ -10815,7 +10883,7 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
     QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
 
     // Nothing of the first session is left on the window: it is admitted and restored again.
-    const QVariantMap again = facade.createTile(output, desktop, quarter);
+    const QVariantMap again = facade.createTile(output, desktop, relative);
     QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
     QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
     QVERIFY(follow());
@@ -10825,6 +10893,151 @@ void TestXdgShellWindow::testTransientTilingFacadeFractionalScale()
     QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
     QVERIFY(!window->m_transientOwnership);
     QTRY_VERIFY(!facade.hasTree());
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeScales_data()
+{
+    QTest::addColumn<qreal>("scale");
+    QTest::addColumn<bool>("decorated");
+    QTest::addColumn<QSize>("client");
+    QTest::addColumn<QRectF>("relative");
+    // A master column of 55% over the whole height, 654x892 less nothing: off the pixels of
+    // every fractional scale here on at least one axis.
+    const QRectF column(0, 0, 0.55, 1);
+    // 600x400: on the pixels of 125%, 150% and 175%, so only the floating frame is fractional.
+    const QRectF onGrid(0, 0, 0.505, 406.0 / 900);
+    // The client sizes are the ones whose frame, stored as a rectangle's corners at 102,102,
+    // reads back a last bit away from the size on the pixel grid (a 101-high client at 125%
+    // is 126 device pixels, 100.8; 102 + 100.8 - 102 is not 100.8).
+    QTest::newRow("100%") << 1.0 << false << QSize(201, 101) << column;
+    QTest::newRow("110%") << 1.1 << false << QSize(201, 101) << column;
+    QTest::newRow("125%") << 1.25 << false << QSize(201, 101) << column;
+    QTest::newRow("125%-tile-on-the-pixel-grid") << 1.25 << false << QSize(201, 101) << onGrid;
+    QTest::newRow("125%-title-bar") << 1.25 << true << QSize(361, 241) << column;
+    QTest::newRow("133%") << 4.0 / 3.0 << false << QSize(201, 101) << column;
+    QTest::newRow("150%") << 1.5 << false << QSize(201, 101) << column;
+    QTest::newRow("150%-tile-on-the-pixel-grid") << 1.5 << false << QSize(201, 101) << onGrid;
+    QTest::newRow("150%-title-bar") << 1.5 << true << QSize(361, 241) << column;
+    QTest::newRow("150%-title-bar-tile-on-the-pixel-grid") << 1.5 << true << QSize(361, 241) << onGrid;
+    QTest::newRow("175%") << 1.75 << false << QSize(201, 101) << column;
+    QTest::newRow("175%-title-bar") << 1.75 << true << QSize(361, 241) << column;
+    QTest::newRow("200%") << 2.0 << false << QSize(201, 101) << column;
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeScales()
+{
+    // A whole session at each scale: admitted to the tile, restored to the exact floating
+    // frame, admitted again. At 133% and 200% the output's pixel is a binary fraction and
+    // every size on its grid is an exact number; at 110%, 125%, 150% and 175% it is not, and a
+    // size read back from a rectangle or put together from a client size and borders differs
+    // from the grid's in its last bit. Nothing may be refused or left unfinished for that.
+    QFETCH(qreal, scale);
+    QFETCH(bool, decorated);
+    QFETCH(QSize, client);
+    QFETCH(QRectF, relative);
+    Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = scale}});
+    workspace()->setActiveOutput(QPoint(100, 100));
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.scale.") + QString::fromLatin1(QTest::currentDataTag()).remove(QLatin1Char('%'));
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    shell->set_app_id(key);
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration;
+    if (decorated) {
+        decoration = Test::createXdgToplevelDecorationV1(shell.get());
+        decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    }
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    QSize committed = client;
+    // The client's side of a configure: acknowledge the newest one and commit its size (the
+    // size it has where the configure leaves the choice to it).
+    const auto follow = [&]() {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        const QSize asked = toplevelConfigure.last().at(0).value<QSize>();
+        if (!asked.isEmpty()) {
+            committed = asked;
+        }
+        Test::render(surface.get(), committed, Qt::blue);
+        return Test::waylandSync();
+    };
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Window *window = Test::renderAndWaitForShown(surface.get(), client, Qt::blue);
+    QVERIFY(window);
+    QCOMPARE(window->isDecorated(), decorated);
+    QVERIFY(follow());
+    // The decoration's own borders, which it keeps when its window is tiled.
+    const QMarginsF borders = decorated ? window->nextDecoration()->nextState()->borders() : QMarginsF();
+    QCOMPARE(borders.top() > 0, decorated);
+    auto toplevel = static_cast<XdgToplevelWindow *>(window);
+    const auto answerAll = [&]() {
+        for (int i = 0; i < 6 && toplevel->hasPendingNativeGeometry(); ++i) {
+            if (!follow()) {
+                return false;
+            }
+        }
+        return !toplevel->hasPendingNativeGeometry();
+    };
+    window->move(QPointF(102, 102));
+    QVERIFY(answerAll());
+    QCOMPARE(window->nextTargetScale(), scale);
+    const QRectF floating = window->frameGeometry();
+    QCOMPARE(floating.topLeft(), QPointF(102, 102));
+    QVERIFY2(exactFrame(window->moveResizeGeometry(), floating), frameText(window->moveResizeGeometry()).constData());
+
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(window));
+    QCOMPARE(facade.record(token, 1, window, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+
+    auto output = window->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    for (int session = 0; session < 2; ++session) {
+        const QVariantMap tree = facade.createTile(output, desktop, relative);
+        QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+        const QRectF tile = facade.masterWindowRect();
+        QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
+        QVERIFY(window->m_transientOwnership);
+        QVERIFY(follow());
+        QVERIFY(answerAll());
+        // In the tile: its corner, and the largest size the client reaches inside it. One more
+        // step of the client's grid (a whole logical pixel here) would be over the tile.
+        const QRectF frame = window->frameGeometry();
+        QVERIFY(window->tile());
+        QVERIFY(window->m_transientOwnership);
+        QCOMPARE(frame.topLeft(), tile.topLeft());
+        QVERIFY2(frame.width() <= tile.width() && frame.height() <= tile.height(), frameText(frame).constData());
+        QCOMPARE(decorated ? window->nextDecoration()->nextState()->borders() : QMarginsF(), borders);
+        QVERIFY2(borders.left() + borders.right() + std::round((committed.width() + 1) * scale) / scale > tile.width(), frameText(frame).constData());
+        QVERIFY2(borders.top() + borders.bottom() + std::round((committed.height() + 1) * scale) / scale > tile.height(), frameText(frame).constData());
+        QVERIFY2(exactFrame(frame, QRectF(window->transientTileFrame(RectF(tile)))), frameText(frame).constData());
+        QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
+
+        // The explicit restore: the exact floating frame, the record's end and the tree's.
+        QVERIFY(facade.restoreWindow(window));
+        QVERIFY(follow());
+        QVERIFY(answerAll());
+        QVERIFY2(exactFrame(window->frameGeometry(), floating), frameText(window->frameGeometry()).constData());
+        QVERIFY(!window->tile());
+        QVERIFY(!window->m_transientOwnership);
+        QTRY_VERIFY(!facade.hasTree());
+        QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
+    }
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeClosedSibling()
@@ -11013,9 +11226,16 @@ void TestXdgShellWindow::testTransientTilingFacadeKeyConflict()
 void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
 {
     QTest::addColumn<int>("release");
-    QTest::newRow("desktop-removed") << 0;
-    QTest::newRow("key-conflict") << 1;
-    QTest::newRow("moved-by-hand") << 2;
+    QTest::addColumn<qreal>("scale");
+    QTest::addColumn<QSize>("client");
+    QTest::newRow("desktop-removed") << 0 << 1.0 << QSize(200, 100);
+    QTest::newRow("key-conflict") << 1 << 1.0 << QSize(200, 100);
+    QTest::newRow("moved-by-hand") << 2 << 1.0 << QSize(200, 100);
+    // The output's pixel is 0.8: the floating frame is 200.8x100.8 and the tile's rectangle
+    // (634 wide, 792.5 device pixels) is off the grid, so the automatic rectangle is the
+    // window's fit in it and none of the frames is a binary fraction.
+    QTest::newRow("desktop-removed-at-125%") << 0 << 1.25 << QSize(201, 101);
+    QTest::newRow("moved-by-hand-at-125%") << 2 << 1.25 << QSize(201, 101);
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
@@ -11029,7 +11249,13 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     // facade to settle the record. The native layer does that only when the window's geometry
     // is settled and the window no longer stands on the automatic rectangle.
     QFETCH(int, release);
+    QFETCH(qreal, scale);
+    QFETCH(QSize, client);
     using Settle = Window::TransientSettleResult;
+    if (scale != 1.0) {
+        Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1024), .scale = scale}});
+        workspace()->setActiveOutput(QPoint(100, 100));
+    }
     const TilingFacade facade;
     QVERIFY(facade.api);
     QVERIFY(!facade.hasTree());
@@ -11048,16 +11274,17 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     shell->set_app_id(key);
     QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
     QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
-    Window *master = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    Window *master = Test::renderAndWaitForShown(surface.get(), client, Qt::red);
     QVERIFY(master);
     QVERIFY(!configure.isEmpty() || configure.wait());
     shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
     configure.clear();
-    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    Test::render(surface.get(), client, Qt::red);
     QVERIFY(Test::waylandSync());
+    QCOMPARE(master->nextTargetScale(), scale);
     // The client's side of a configure: acknowledge the newest one and commit its size (the
     // size it has where the configure leaves the choice to it).
-    QSize committed(200, 100);
+    QSize committed = client;
     const auto follow = [&]() {
         if (configure.isEmpty() && !configure.wait()) {
             return false;
@@ -11098,7 +11325,9 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     const QVariantMap tree = facade.createTile(output, first, QRectF(0, 0, 0.5, 1));
     QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
     QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
-    const QRectF managed = facade.masterWindowRect();
+    // The automatic rectangle: the window's frame in the tile.
+    const QRectF managed(master->transientTileFrame(RectF(facade.masterWindowRect())));
+    QCOMPARE(exactFrame(managed, facade.masterWindowRect()), scale == 1.0);
     QVERIFY(follow());
     QVERIFY(master->tile());
     QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
