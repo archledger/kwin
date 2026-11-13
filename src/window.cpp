@@ -70,7 +70,8 @@ bool exactFrameGeometry(const RectF &left, const RectF &right)
 
 // The same frame up to the arithmetic's last bits. Where an output's pixel is not a binary
 // fraction (125%, 150%), the frame a commit publishes and the rectangle that was asked for can
-// differ there; frames that are different on any output differ by far more.
+// differ there; frames that are different on any output differ by far more. The tolerance is
+// in logical pixels (the comparison knows no output), below a thousandth of one.
 bool sameFrameGeometry(const RectF &left, const RectF &right)
 {
     const auto same = [](qreal a, qreal b) {
@@ -1140,6 +1141,11 @@ void Window::finishInteractiveMoveResize(bool cancel)
     workspace()->outline()->hide();
 
     m_interactiveMoveResize.counter++;
+    if (!cancel && m_transientOwnership && m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
+        // The operation's own first request released the record; where it ended is the place
+        // the user chose. A cancelled one put the window back.
+        m_transientOwnership->placedByUser = true;
+    }
     Q_EMIT interactiveMoveResizeFinished();
 }
 
@@ -5283,7 +5289,15 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
     if (m_requestedTile || m_tile || !isTransientGeometrySettled()) {
         return TransientSettleResult::Unsettled;
     }
-    if (sameFrameGeometry(frameGeometry(), ownership.target) && !sameFrameGeometry(ownership.target, ownership.floating)) {
+    // Positive evidence only. The rectangle recorded at the admission is not the only
+    // automatic one a released window can stand on: a work-area re-check releases the window
+    // with a public request for the tile's rectangle as it is then, and a transfer to another
+    // output carries the tile's size along. The record ends on the floating frame, or where
+    // the user's own move or resize left the window.
+    const RectF frame = frameGeometry();
+    const bool onFloating = sameFrameGeometry(frame, ownership.floating);
+    const bool placedByUser = ownership.placedByUser && !sameFrameGeometry(frame, ownership.target);
+    if (!onFloating && !placedByUser) {
         return TransientSettleResult::AtManagedRectangle;
     }
     if (ownership.writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
@@ -5295,10 +5309,14 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
     });
     // As after a completed restoration, the close cleanup stays connected: the writer forgets
     // the tracked window at its destruction.
-    const RectF frame = frameGeometry();
     m_transientOwnership.reset();
     Q_EMIT transientReleaseSettled(QRectF(frame));
     return TransientSettleResult::Settled;
+}
+
+RectF Window::transientFloatingFrame() const
+{
+    return m_transientOwnership ? m_transientOwnership->floating : RectF();
 }
 
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)

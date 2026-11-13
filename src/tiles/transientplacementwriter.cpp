@@ -261,6 +261,10 @@ TransientPlacementWriter::Result TransientPlacementWriter::record(const QUuid &p
             // re-recorded when it lands) is not a newer placement: a sibling's manual update
             // keeps the one deferred slot whatever the sequences say. A frame the released
             // owner was moved to by hand differs from it and takes the slot as the latest.
+            // An owner moved by hand back onto exactly that frame is not told apart from the
+            // landing and is suppressed too: the sibling's update is the newer placement
+            // either way. After a transfer to another output the frame the owner is restored
+            // to is no longer the reservation's, and the latest record wins as before.
             return Result::Suppressed;
         }
         reservation->deferred = update;

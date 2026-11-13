@@ -404,6 +404,7 @@ private Q_SLOTS:
     void testTransientTilingFacadeMasterClosed();
     void testTransientTilingFacadeScales_data();
     void testTransientTilingFacadeScales();
+    void testTransientTilingFacadeBordersChangeWhenTiled();
     void testTransientTilingFacadeKeyConflict();
     void testTransientTilingFacadeReleasedMaster_data();
     void testTransientTilingFacadeReleasedMaster();
@@ -10588,6 +10589,13 @@ struct TilingFacade
         return result;
     }
 
+    QRectF floatingFrame(Window *window) const
+    {
+        QRectF frame;
+        QMetaObject::invokeMethod(api, "floatingFrame", Q_RETURN_ARG(QRectF, frame), Q_ARG(Window *, window));
+        return frame;
+    }
+
     QRectF masterWindowRect() const
     {
         QRectF rect;
@@ -10906,10 +10914,24 @@ void TestXdgShellWindow::testTransientTilingFacadeScales_data()
     const QRectF column(0, 0, 0.55, 1);
     // 600x400: on the pixels of 125%, 150% and 175%, so only the floating frame is fractional.
     const QRectF onGrid(0, 0, 0.505, 406.0 / 900);
+    // The bottom-right 55% by 60%: 654x534 at 542,362. A frame that lands there is put
+    // together at the place the window came from and then moved, so its corners are other
+    // numbers than a frame's at the output's origin.
+    const QRectF corner(0.45, 0.4, 0.55, 0.6);
     // The client sizes are the ones whose frame, stored as a rectangle's corners at 102,102,
     // reads back a last bit away from the size on the pixel grid (a 101-high client at 125%
     // is 126 device pixels, 100.8; 102 + 100.8 - 102 is not 100.8).
+    QTest::newRow("75%") << 0.75 << false << QSize(201, 101) << column;
+    QTest::newRow("75%-tile-off-the-origin") << 0.75 << false << QSize(201, 101) << corner;
     QTest::newRow("100%") << 1.0 << false << QSize(201, 101) << column;
+    QTest::newRow("110%-tile-off-the-origin") << 1.1 << false << QSize(201, 101) << corner;
+    QTest::newRow("125%-tile-off-the-origin") << 1.25 << false << QSize(201, 101) << corner;
+    QTest::newRow("125%-title-bar-tile-off-the-origin") << 1.25 << true << QSize(361, 241) << corner;
+    QTest::newRow("133%-tile-off-the-origin") << 4.0 / 3.0 << false << QSize(201, 101) << corner;
+    QTest::newRow("150%-tile-off-the-origin") << 1.5 << false << QSize(201, 101) << corner;
+    QTest::newRow("150%-title-bar-tile-off-the-origin") << 1.5 << true << QSize(361, 241) << corner;
+    QTest::newRow("175%-tile-off-the-origin") << 1.75 << false << QSize(201, 101) << corner;
+    QTest::newRow("175%-title-bar-tile-off-the-origin") << 1.75 << true << QSize(361, 241) << corner;
     QTest::newRow("110%") << 1.1 << false << QSize(201, 101) << column;
     QTest::newRow("125%") << 1.25 << false << QSize(201, 101) << column;
     QTest::newRow("125%-tile-on-the-pixel-grid") << 1.25 << false << QSize(201, 101) << onGrid;
@@ -10926,11 +10948,12 @@ void TestXdgShellWindow::testTransientTilingFacadeScales_data()
 
 void TestXdgShellWindow::testTransientTilingFacadeScales()
 {
-    // A whole session at each scale: admitted to the tile, restored to the exact floating
-    // frame, admitted again. At 133% and 200% the output's pixel is a binary fraction and
-    // every size on its grid is an exact number; at 110%, 125%, 150% and 175% it is not, and a
-    // size read back from a rectangle or put together from a client size and borders differs
-    // from the grid's in its last bit. Nothing may be refused or left unfinished for that.
+    // A whole session at each scale: admitted to the tile, maximized and back, restored to
+    // the exact floating frame, admitted again. At 75%, 133% and 200% the output's pixel is a
+    // binary fraction and every size on its grid is an exact number; at 110%, 125%, 150% and
+    // 175% it is not, and a size read back from a rectangle or put together from a client
+    // size and borders differs from the grid's in its last bit. Nothing may be refused or
+    // left unfinished for that.
     QFETCH(qreal, scale);
     QFETCH(bool, decorated);
     QFETCH(QSize, client);
@@ -11028,6 +11051,21 @@ void TestXdgShellWindow::testTransientTilingFacadeScales()
         QVERIFY2(exactFrame(frame, QRectF(window->transientTileFrame(RectF(tile)))), frameText(frame).constData());
         QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
 
+        if (session == 0) {
+            // An ordinary maximize keeps the ownership, and its end returns the window to
+            // its frame in the tile, not to the tile's rectangle.
+            window->maximize(MaximizeFull);
+            QVERIFY(answerAll());
+            QCOMPARE(window->maximizeMode(), MaximizeFull);
+            QVERIFY(window->m_transientOwnership);
+            window->maximize(MaximizeRestore);
+            QVERIFY(answerAll());
+            QCOMPARE(window->maximizeMode(), MaximizeRestore);
+            QVERIFY(window->m_transientOwnership);
+            QVERIFY(window->tile());
+            QVERIFY2(exactFrame(window->frameGeometry(), frame), frameText(window->frameGeometry()).constData());
+        }
+
         // The explicit restore: the exact floating frame, the record's end and the tree's.
         QVERIFY(facade.restoreWindow(window));
         QVERIFY(follow());
@@ -11038,6 +11076,118 @@ void TestXdgShellWindow::testTransientTilingFacadeScales()
         QTRY_VERIFY(!facade.hasTree());
         QVERIFY(exactFrame(facade.entry(key), scriptRecord(floating)));
     }
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeBordersChangeWhenTiled()
+{
+    // A decoration can change its borders when its window is tiled, in the middle of the
+    // admission: the sizes the client reaches change with them, and with them the largest one
+    // inside a tile that is off the pixel grid. The request's frame was that fit when the
+    // request was made; it stays the request's while it is at the tile's corner, inside the
+    // tile by no more than a fit is, and still reachable. Here the title bar is set by hand
+    // before the admission and the decoration puts its own back as the window is tiled.
+    const qreal scale = 4.0 / 3.0;
+    Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = scale}});
+    workspace()->setActiveOutput(QPoint(100, 100));
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.borders");
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly));
+    shell->set_app_id(key);
+    std::unique_ptr<Test::XdgToplevelDecorationV1> decoration(Test::createXdgToplevelDecorationV1(shell.get()));
+    decoration->set_mode(Test::XdgToplevelDecorationV1::mode_server_side);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    QSize committed(360, 241);
+    const auto follow = [&]() {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        const QSize asked = toplevelConfigure.last().at(0).value<QSize>();
+        if (!asked.isEmpty()) {
+            committed = asked;
+        }
+        Test::render(surface.get(), committed, Qt::blue);
+        return Test::waylandSync();
+    };
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Window *window = Test::renderAndWaitForShown(surface.get(), committed, Qt::blue);
+    QVERIFY(window);
+    QVERIFY(window->isDecorated());
+    QVERIFY(follow());
+    auto toplevel = static_cast<XdgToplevelWindow *>(window);
+    const auto answerAll = [&]() {
+        for (int i = 0; i < 6 && toplevel->hasPendingNativeGeometry(); ++i) {
+            if (!follow()) {
+                return false;
+            }
+        }
+        return !toplevel->hasPendingNativeGeometry();
+    };
+    window->move(QPointF(102, 102));
+    QVERIFY(answerAll());
+
+    // The decoration's own borders, and the window's fit under them in a tile whose height
+    // (892, 1189.33 device pixels) is off the grid.
+    const QMarginsF own = window->nextDecoration()->nextState()->borders();
+    const RectF tile(4, 4, 654, 892);
+    const RectF ownFit = window->transientTileFrame(tile);
+    const int ownPixels = qRound((own.top() + own.bottom()) * scale);
+    // A title bar a few device pixels taller, under which the fit is another one that the
+    // client still reaches under the decoration's own borders: a height whose client part is
+    // the image of a whole client size.
+    RectF fit;
+    for (int taller = 1; taller <= 12 && fit.isNull(); ++taller) {
+        auto state = window->nextDecoration()->nextState();
+        state->setBorders(QMarginsF(own.left(), own.top() + taller / scale, own.right(), own.bottom()));
+        Q_EMIT window->nextDecoration()->nextStateChanged(state);
+        QVERIFY(follow());
+        QVERIFY(answerAll());
+        const RectF candidate = window->transientTileFrame(tile);
+        const int clientPixels = qRound(candidate.height() * scale) - ownPixels;
+        const bool reachable = qRound(qRound(clientPixels / scale) * scale) == clientPixels;
+        if (qRound(candidate.height() * scale) != qRound(ownFit.height() * scale) && reachable) {
+            fit = candidate;
+        }
+    }
+    QVERIFY2(!fit.isNull(), "no title bar within a dozen device pixels gives another fit");
+    const QRectF floating = window->frameGeometry();
+    QVERIFY2(exactFrame(window->moveResizeGeometry(), floating), frameText(window->moveResizeGeometry()).constData());
+
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(window));
+    QCOMPARE(facade.record(token, 1, window, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+    auto output = window->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.55, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QVERIFY2(exactFrame(facade.masterWindowRect(), QRectF(tile)), frameText(facade.masterWindowRect()).constData());
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), window, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(follow());
+    QVERIFY(answerAll());
+    // The decoration has its own borders again, and under them the fit is another frame.
+    QCOMPARE(window->nextDecoration()->nextState()->borders(), own);
+    QVERIFY(window->transientTileFrame(tile) != fit);
+    // The window is in the tile on the frame the request was made for.
+    QVERIFY(window->tile());
+    QVERIFY(window->m_transientOwnership);
+    QVERIFY2(exactFrame(window->frameGeometry(), QRectF(fit)), frameText(window->frameGeometry()).constData());
+    QVERIFY(window->isTransientTileFrame(fit, tile));
+    QVERIFY(window->isTransientTileTargetFeasible(fit));
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeClosedSibling()
@@ -11223,19 +11373,46 @@ void TestXdgShellWindow::testTransientTilingFacadeKeyConflict()
     QCOMPARE(facade.releaseTile(again.value(QStringLiteral("generation")).toInt()), int(TransientTileController::Result::Accepted));
 }
 
+namespace
+{
+
+// How the native layer comes to release the master without restoring it.
+enum ReleasedBy {
+    DesktopRemoved,
+    KeyConflict,
+    MovedByHand,
+    MovedByARequest,
+    RecheckedByTheWorkspace,
+    SentToAnotherOutput,
+    MaximizedAfterwards,
+};
+
+}
+
 void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
 {
     QTest::addColumn<int>("release");
     QTest::addColumn<qreal>("scale");
     QTest::addColumn<QSize>("client");
-    QTest::newRow("desktop-removed") << 0 << 1.0 << QSize(200, 100);
-    QTest::newRow("key-conflict") << 1 << 1.0 << QSize(200, 100);
-    QTest::newRow("moved-by-hand") << 2 << 1.0 << QSize(200, 100);
+    QTest::newRow("desktop-removed") << int(DesktopRemoved) << 1.0 << QSize(200, 100);
+    QTest::newRow("key-conflict") << int(KeyConflict) << 1.0 << QSize(200, 100);
+    QTest::newRow("moved-by-hand") << int(MovedByHand) << 1.0 << QSize(200, 100);
+    // A script's request, or the compositor's own: not the user's hand.
+    QTest::newRow("moved-by-a-request") << int(MovedByARequest) << 1.0 << QSize(200, 100);
+    // The workspace re-checks every window's position when the work area changes (a panel, a
+    // strut, an output's size), and asks a tiled one for its tile's rectangle.
+    QTest::newRow("re-checked-by-the-workspace") << int(RecheckedByTheWorkspace) << 1.0 << QSize(200, 100);
+    QTest::newRow("sent-to-another-output") << int(SentToAnotherOutput) << 1.0 << QSize(200, 100);
+    QTest::newRow("maximized-afterwards") << int(MaximizedAfterwards) << 1.0 << QSize(200, 100);
     // The output's pixel is 0.8: the floating frame is 200.8x100.8 and the tile's rectangle
     // (634 wide, 792.5 device pixels) is off the grid, so the automatic rectangle is the
     // window's fit in it and none of the frames is a binary fraction.
-    QTest::newRow("desktop-removed-at-125%") << 0 << 1.25 << QSize(201, 101);
-    QTest::newRow("moved-by-hand-at-125%") << 2 << 1.25 << QSize(201, 101);
+    QTest::newRow("desktop-removed-at-125%") << int(DesktopRemoved) << 1.25 << QSize(201, 101);
+    QTest::newRow("moved-by-hand-at-125%") << int(MovedByHand) << 1.25 << QSize(201, 101);
+    // There the rectangle the re-check asks for is the tile's own, off the pixel grid: the
+    // window lands on its image, which is neither the fit it was admitted to nor inside the
+    // tile.
+    QTest::newRow("re-checked-by-the-workspace-at-125%") << int(RecheckedByTheWorkspace) << 1.25 << QSize(201, 101);
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
@@ -11247,7 +11424,9 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     // of the app, a move of the master). The policy ends it: it gives the window its floating
     // frame back with an ordinary request, or leaves it where the user put it, and asks the
     // facade to settle the record. The native layer does that only when the window's geometry
-    // is settled and the window no longer stands on the automatic rectangle.
+    // is settled and the window stands on its floating frame or where the user's own move
+    // left it: every other frame can be an automatic rectangle, and not only the one the
+    // window was admitted to.
     QFETCH(int, release);
     QFETCH(qreal, scale);
     QFETCH(QSize, client);
@@ -11336,22 +11515,55 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
 
     std::unique_ptr<KWayland::Client::Surface> siblingSurface;
     std::unique_ptr<Test::XdgToplevel> siblingShell;
-    QRectF expected = floating;
     int revision = 1;
-    if (release == 0) {
+    switch (release) {
+    case DesktopRemoved:
+    case MaximizedAfterwards:
         desktops->setCurrent(second);
         desktops->removeVirtualDesktop(first);
-    } else if (release == 1) {
+        break;
+    case KeyConflict: {
         siblingSurface = Test::createSurface();
         siblingShell = Test::createXdgToplevelSurface(siblingSurface.get());
         siblingShell->set_app_id(key);
         Window *sibling = Test::renderAndWaitForShown(siblingSurface.get(), QSize(220, 120), Qt::green);
         QVERIFY(sibling);
         QVERIFY(facade.trackWindow(sibling));
-    } else {
-        // The user's own move: the request itself releases the master, and its place wins.
-        expected = QRectF(300, 200, 260, 180);
-        master->moveResize(expected);
+        break;
+    }
+    case MovedByHand: {
+        // The user's own move: its first step releases the master. While it lasts the
+        // geometry is not settled; where it ends is the user's placement.
+        QSignalSpy finished(master, &Window::interactiveMoveResizeFinished);
+        workspace()->slotWindowMove();
+        QCOMPARE(workspace()->moveResizeWindow(), master);
+        for (const auto key : {Qt::Key_Right, Qt::Key_Right, Qt::Key_Down}) {
+            master->keyPressEvent(key);
+            master->updateInteractiveMoveResize(KWin::Cursors::self()->mouse()->pos(), Qt::KeyboardModifiers());
+        }
+        QTRY_VERIFY(!facade.hasTree());
+        QVERIFY(master->isInteractiveMove());
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+        master->keyPressEvent(Qt::Key_Enter);
+        QCOMPARE(finished.count(), 1);
+        QVERIFY(!master->isInteractiveMove());
+        break;
+    }
+    case MovedByARequest:
+        master->moveResize(QRectF(300, 200, 260, 180));
+        break;
+    case RecheckedByTheWorkspace:
+        // What Workspace::rearrange() calls for every window: a tiled one is asked for its
+        // tile's rectangle with a public request, which releases the master.
+        master->checkWorkspacePosition();
+        break;
+    case SentToAnotherOutput: {
+        const auto outputs = workspace()->outputs();
+        QCOMPARE(outputs.count(), 2);
+        master->sendToOutput(outputs.at(0) == output ? outputs.at(1) : outputs.at(0));
+        QVERIFY(master->moveResizeOutput() != output);
+        break;
+    }
     }
     QTRY_VERIFY(!facade.hasTree());
     QVERIFY(master->m_transientOwnership);
@@ -11360,37 +11572,70 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
 
     // Only the provider that admitted the window settles its record.
     QCOMPARE(facade.settleWindow(master, QUuid::createUuid().toString()), int(Settle::StaleProvider));
-    if (release != 2) {
-        // The release changed the window's states; until the client has answered that
-        // configure the geometry is not settled.
-        if (toplevel->hasPendingNativeGeometry()) {
-            QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
-            QVERIFY(answerAll());
-        }
-        // Settled, but still on the automatic rectangle: the record stays, the memory's
-        // barrier with it.
-        QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
-        QCOMPARE(facade.settleWindow(master, token), int(Settle::AtManagedRectangle));
-        QVERIFY(master->m_transientOwnership);
-        // The policy gives the window its floating frame back: an ordinary request.
-        master->moveResize(floating);
+    // The release changed the window's states, and some releases its geometry; until the
+    // client has answered those configures the geometry is not settled.
+    if (toplevel->hasPendingNativeGeometry()) {
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+        QVERIFY(answerAll());
     }
-    // The client has not answered the request yet.
-    QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
-    QVERIFY(master->m_transientOwnership);
-    QVERIFY(answerAll());
-    QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
-    if (release == 2) {
+    QVERIFY(!toplevel->hasPendingNativeGeometry());
+    if (release == MaximizedAfterwards) {
+        // A mode owns the frame and gives it back to the rectangle the window had before:
+        // the record waits for the ordinary state.
+        master->maximize(MaximizeFull);
+        QVERIFY(answerAll());
+        QCOMPARE(master->maximizeMode(), MaximizeFull);
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+        master->maximize(MaximizeRestore);
+        QVERIFY(answerAll());
+        QCOMPARE(master->maximizeMode(), MaximizeRestore);
+        QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
+    }
+    QRectF expected = master->frameGeometry();
+    if (release == MovedByHand) {
+        QVERIFY2(!exactFrame(expected, managed) && !exactFrame(expected, floating), frameText(expected).constData());
         // The provider records the place the user chose; the key is still reserved.
         QCOMPARE(facade.record(token, ++revision, master, scriptRecord(expected), revision), int(TransientPlacementWriter::Result::Deferred));
+    } else {
+        // Settled, and on a rectangle nothing says the user chose: the tile's frame the
+        // window was admitted to, or another one (the tile's new rectangle, the tile's size
+        // on another output, a script's request). The record stays, the memory's barrier
+        // with it.
+        const bool admittedFrame = release == DesktopRemoved || release == KeyConflict || release == MaximizedAfterwards
+            || (release == RecheckedByTheWorkspace && scale == 1.0);
+        QCOMPARE(exactFrame(expected, managed), admittedFrame);
+        QVERIFY2(!exactFrame(expected, floating), frameText(expected).constData());
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::AtManagedRectangle));
+        QVERIFY(master->m_transientOwnership);
+        // The policy gives the window its floating frame back: an ordinary request for the
+        // frame the record holds, which followed the window to another output.
+        expected = facade.floatingFrame(master);
+        QVERIFY(expected.isValid());
+        QCOMPARE(exactFrame(expected, floating), release != SentToAnotherOutput);
+        QCOMPARE(workspace()->outputAt(expected.center()), master->moveResizeOutput());
+        master->moveResize(expected);
+        // The client has not answered the request yet.
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+        QVERIFY(master->m_transientOwnership);
+        QVERIFY(answerAll());
     }
+    QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
     QSignalSpy settled(master, &Window::transientReleaseSettled);
     QCOMPARE(facade.settleWindow(master, token), int(Settle::Settled));
     QCOMPARE(settled.count(), 1);
     QVERIFY(!master->m_transientOwnership);
+    QVERIFY(!facade.floatingFrame(master).isValid());
     QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
-    QVERIFY(exactFrame(facade.entry(key), scriptRecord(expected)));
+    // The memory: the user's place, recorded while the key was reserved, or the entry as it
+    // was (the tiler returns the window without recording anything).
+    QVERIFY(exactFrame(facade.entry(key), scriptRecord(release == MovedByHand ? expected : floating)));
     QCOMPARE(facade.settleWindow(master, token), int(Settle::NotReleased));
+    if (release != MovedByHand) {
+        // The policy records the frame the window settled at. It is the entry already, except
+        // on another output, where the next admission's reservation needs it.
+        QCOMPARE(facade.record(token, ++revision, master, scriptRecord(expected), revision), int(TransientPlacementWriter::Result::Accepted));
+        QVERIFY(exactFrame(facade.entry(key), scriptRecord(expected)));
+    }
 
     // The window is free again: a new session admits it and the explicit restore returns it.
     if (siblingSurface) {
@@ -11402,13 +11647,18 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         QTRY_COMPARE(workspace()->activeWindow(), master);
         QVERIFY(answerAll());
     }
+    output = master->moveResizeOutput();
     const auto desktop = desktops->currentDesktop(output);
     const QVariantMap again = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
     QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
     QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
     QVERIFY(follow());
     QVERIFY(master->tile());
+    QVERIFY(exactFrame(facade.floatingFrame(master), expected));
     QVERIFY(facade.restoreWindow(master));
+    // A live restoration completes at its own boundary; there is nothing to settle.
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::NotReleased));
+    QVERIFY(master->m_transientOwnership);
     QVERIFY(follow());
     QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
     QVERIFY(!master->m_transientOwnership);

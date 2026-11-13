@@ -1418,13 +1418,19 @@ public:
      * The end of a released record that no explicit restoration will complete. A release that
      * is not the explicit restore is detach-only: the window stays where it stands and its
      * record (Restoring) keeps the automatic rectangle out of the placement memory. The policy
-     * that admitted the window ends that record once the window is somewhere else: back on its
-     * floating frame by the policy's own ordinary request, or where the user put it. Settled
-     * only for the provider that admitted the window, with no live restoration, in an ordinary
-     * mode outside every tile, with the native geometry settled (nothing scheduled, sent or
-     * acknowledged, the frame the requested geometry) and off the automatic rectangle; every
-     * other answer changes nothing. The writer finalizes as it does for a completed
-     * restoration: a deferred update for the key is applied, else the entry stays.
+     * that admitted the window ends that record once the window stands on a frame that is
+     * known not to be automatic: its floating frame (the policy's own ordinary request for
+     * transientFloatingFrame(), or the compositor's replay of it), or where the user's own
+     * interactive move or resize left it. Any other frame can be an automatic rectangle (the
+     * tile's frame the window was admitted to, the tile's rectangle a work-area re-check asks
+     * for as it releases the window, either of them carried to another output) and is
+     * answered AtManagedRectangle. Settled only for the provider that admitted the window
+     * (StaleProvider otherwise, also when the writer no longer holds the record's
+     * reservation), with no live restoration (NotReleased), in an ordinary mode outside
+     * every tile and with the native geometry settled: nothing scheduled, sent or
+     * acknowledged, the frame the requested geometry (Unsettled otherwise). Every answer but
+     * Settled changes nothing. The writer finalizes as it does for a completed restoration:
+     * a deferred update for the key is applied, else the entry stays.
      */
     enum class TransientSettleResult {
         Settled,
@@ -1435,6 +1441,12 @@ public:
         Refused,
     };
     TransientSettleResult settleReleasedTransientOwnership(const QUuid &provider);
+    /**
+     * The floating frame of this window's transient record, owned or released: where an
+     * explicit restoration returns it, carried along when the window is sent to another
+     * output. Null without a record.
+     */
+    RectF transientFloatingFrame() const;
     /**
      * NT04's read-only state/completion contract. The state query reflects the native record
      * only - no protocol logging and no timeout participates - for the placement policy that
@@ -2204,6 +2216,10 @@ private:
         bool releasing = false;
         bool releaseWriterReady = false;
         bool committed = false;
+        // A released record's window was moved or resized by the user's own interactive
+        // operation, which ended without being cancelled: where it stands is the user's
+        // placement, not an automatic rectangle (settleReleasedTransientOwnership).
+        bool placedByUser = false;
         QMetaObject::Connection closeCleanup;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
         std::unique_ptr<TransientTileRequest> request;
