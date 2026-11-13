@@ -128,9 +128,11 @@ public:
     Q_INVOKABLE int settleWindow(Window *window, const QString &providerToken);
 
     /**
-     * The floating frame of a window's record, owned or released: where the explicit restore
-     * returns it, and where a tiler returns a master the native layer released without
-     * restoring it. It follows the window to another output. Null without a record.
+     * The floating frame of @p window's transient record: of an owned window the frame an
+     * explicit restoration returns it to; of a released one that frame as the window takes
+     * it on the output it is on now (it follows the window to another output, and on an
+     * output of another scale its size is on that output's pixels) - the rectangle to ask
+     * for before settleWindow(). Null when the window has no record.
      */
     Q_INVOKABLE QRectF floatingFrame(Window *window) const;
 

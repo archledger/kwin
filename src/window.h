@@ -1443,10 +1443,12 @@ public:
     };
     TransientSettleResult settleReleasedTransientOwnership(const QUuid &provider);
     /**
-     * The floating frame of this window's transient record, owned or released: where an
-     * explicit restoration returns it, carried along when the window is sent to another
-     * output, as the window takes it on the output it is on (transientFloatingImage()).
-     * Null without a record.
+     * The floating frame of this window's transient record. Of an owned record: where an
+     * explicit restoration returns the window, exactly. Of a released one: that frame,
+     * carried along when the window was sent to another output or its output went, as the
+     * window takes it on the output it is on now (transientFloatingImage()) - the rectangle
+     * the policy asks for to return the window, and on which the record settles. Null
+     * without a record.
      */
     RectF transientFloatingFrame() const;
     /**
@@ -2474,10 +2476,12 @@ protected:
      * The frame a request for a transient record's floating frame gives this window on the
      * output it is on now. The floating frame was a frame of the window where it was taken.
      * Carried to an output of another scale (sendToOutput, a removed output) its size is not
-     * on the pixels there: the window cannot take it, a request for it is never the frame,
-     * and the geometry of a window asked for it never settles. This is @p floating where the
-     * window reaches it, and otherwise its corner with its size taken to this output's
-     * pixels and to the client's grid and back, as a request and its commit take it.
+     * on the pixels there and the window cannot take it: a request for it ends with the
+     * frame and the requested geometry on its image, which is not the floating frame, so a
+     * released window asked for it stands on a rectangle nothing vouches for, however often
+     * it is asked. This is @p floating where the window reaches it, and otherwise its corner
+     * with its size taken to this output's pixels and to the client's grid and back, as a
+     * request and its commit take it.
      */
     virtual RectF transientFloatingImage(const RectF &floating) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;

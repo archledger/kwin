@@ -5322,7 +5322,15 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
 
 RectF Window::transientFloatingFrame() const
 {
-    return m_transientOwnership ? transientFloatingImage(m_transientOwnership->floating) : RectF();
+    if (!m_transientOwnership) {
+        return RectF();
+    }
+    // An owned record's frame is the restoration's exact target, and so is a live
+    // restoration's. Only a released record is returned by the policy's own request.
+    const auto &ownership = *m_transientOwnership;
+    const bool released = ownership.phase == TransientOwnershipPhase::Restoring
+        && !(ownership.restoreAttempt && transientRestoreAttemptIsCurrent(ownership.generation, ownership.restoreAttempt->sequence));
+    return released ? transientFloatingImage(ownership.floating) : ownership.floating;
 }
 
 RectF Window::transientFloatingImage(const RectF &floating) const
