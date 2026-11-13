@@ -558,8 +558,7 @@ Rect OffscreenQuickView::geometry() const
 
 void OffscreenQuickView::setOpacity(qreal opacity)
 {
-    d->m_view->setOpacity(opacity);
-    d->m_item->setOpacity(d->m_view->opacity());
+    d->m_item->setOpacity(opacity);
 }
 
 qreal OffscreenQuickView::opacity() const

@@ -152,15 +152,9 @@ void OffscreenQuickViewTest::testOpacity()
     view.setOpacity(opacity);
     QCOMPARE(view.opacity(), opacity);
     QCOMPARE(item->opacity(), opacity);
-    // The fork's Plasma/6.8 fix propagates the opacity to the QWindow as well,
-    // while master's fix (upstream ff26dc46b3) deliberately leaves the platform
-    // window untouched because QWindow::setOpacity() noops here. Pin whichever
-    // behavior this build implements, so both branches stay covered.
-    if (view.window()->opacity() == opacity) {
-        QCOMPARE(view.window()->opacity(), opacity);
-    } else {
-        QCOMPARE(view.window()->opacity(), 1.0);
-    }
+    // The opacity is the item's, as in upstream's own fix (ff26dc46b3). The view's QWindow is
+    // left untouched: it has no platform window, so a value set there is stored and never used.
+    QCOMPARE(view.window()->opacity(), 1.0);
     QVERIFY(view.isVisible());
     QVERIFY(item->isVisible());
 }
@@ -174,6 +168,9 @@ void OffscreenQuickViewTest::testResynchronizeOpacity()
     QVERIFY(item);
     view.setOpacity(0.5);
     view.window()->setOpacity(0.25);
+    // A value written to the QWindow does not become the view's opacity.
+    QCOMPARE(view.opacity(), 0.5);
+    QCOMPARE(item->opacity(), 0.5);
     view.setOpacity(0.25);
     QCOMPARE(item->opacity(), 0.25);
     QCOMPARE(view.opacity(), 0.25);
