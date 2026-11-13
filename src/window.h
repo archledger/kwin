@@ -2170,6 +2170,12 @@ private:
         const quint64 initialGeometryGeneration;
         QPointer<TransientTileController> controller;
         TransientOwnershipPhase phase = TransientOwnershipPhase::Prepared;
+        // Set when the controller's admission has returned Accepted. Until then the provider's
+        // revision is part of the admission's proof and a record supersedes the admission;
+        // from then on only the provider's incarnation binds the record (the contract: "While K
+        // is reserved, accepted writes for other keys proceed normally", and "completion may
+        // re-record the restored frame subject to all normal guards").
+        bool admitted = false;
         TransientRequestProgress progress = TransientRequestProgress::NoRequest;
         quint64 nativeSequence = 0;
         bool executing = false;
@@ -2214,6 +2220,9 @@ private:
     // asynchronous commit's own headroom is separate.
     bool transientAdmissionEligible(const RectF &target) const;
     bool transientAdmissionHeadroom() const;
+    // The provider side of an ownership's currency: the admission's exact revision until the
+    // admission is done, the provider's incarnation after it (TransientOwnership::admitted).
+    bool transientProviderIsCurrent(const TransientOwnership &ownership) const;
     // Claim one explicit, normal-mode restore without requesting geometry. The result retains
     // the Window externally; the ownership record never stores its own lifetime checkpoint.
     // AppliedCurrent qualifies the claim/release continuation, not restoration completion.

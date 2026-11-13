@@ -123,6 +123,13 @@ public:
     {
         return m_provider && !provider.isNull() && provider == m_providerToken && revision == m_providerRevision;
     }
+    // The provider's incarnation alone: what binds a window once its admission is done. The
+    // revision is the admission's proof (isProviderCurrent); after it the provider goes on
+    // recording - other keys at any time, the owner's own restored frame - at newer revisions.
+    bool isProviderRegistered(const QUuid &provider) const
+    {
+        return m_provider && !provider.isNull() && provider == m_providerToken;
+    }
     bool trackWindow(const QUuid &window, const QString &key);
     // The key a window is bound under, or empty when it is not bound: read-only, so a
     // reloaded provider incarnation can ask which key an earlier one left a window under
