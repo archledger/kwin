@@ -26,15 +26,23 @@
 
 class QTimer;
 
+// The transient tiling's types, declared in a namespace block of the fork's own: a line of
+// ours among upstream's declarations below is a merge conflict with every edit beside it.
+namespace KWin
+{
+
+class TransientTile;
+class TransientTileController;
+class Workspace;
+
+}
+
 namespace KWin
 {
 
 class LogicalOutput;
 class Tile;
 class TileModel;
-class TransientTile;
-class TransientTileController;
-class Workspace;
 
 /**
  * Custom tiling zones management per output.
