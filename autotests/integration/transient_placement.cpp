@@ -49,6 +49,7 @@ private Q_SLOTS:
     void initTestCase();
     void init();
     void cleanup();
+    void testWorkspaceConstructsPlacementWriter();
     void testXdgPopup_data();
     void testXdgPopup();
     void testXdgPopupWithPanel();
@@ -72,10 +73,18 @@ void TransientPlacementTest::initTestCase()
     setenv("QT_QPA_PLATFORM", "wayland", true);
 }
 
+// The placement writer is Workspace's own: the facade answers registerProvider through
+// it, and a Workspace that never constructs it disables the whole native placement
+// memory and the tiler at runtime - silently, because every unit test constructs the
+// writer directly and the script-level tests mock the facade. This row pins the wiring.
+void TransientPlacementTest::testWorkspaceConstructsPlacementWriter()
+{
+    QVERIFY(workspace()->placementWriter() != nullptr);
+}
+
 void TransientPlacementTest::init()
 {
     QVERIFY(Test::setupWaylandConnection(Test::AdditionalWaylandInterface::LayerShellV1));
-
     workspace()->setActiveOutput(QPoint(640, 512));
     input()->pointer()->warp(QPoint(640, 512));
 }
