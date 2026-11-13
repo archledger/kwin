@@ -1421,7 +1421,8 @@ public:
      * that admitted the window ends that record once the window stands on a frame that is
      * known not to be automatic: its floating frame (the policy's own ordinary request for
      * transientFloatingFrame(), or the compositor's replay of it), or where the user's own
-     * interactive move or resize left it. Any other frame can be an automatic rectangle (the
+     * interactive move or resize left it and no later request has moved it. Any other frame
+     * can be an automatic rectangle (the
      * tile's frame the window was admitted to, the tile's rectangle a work-area re-check asks
      * for as it releases the window, either of them carried to another output) and is
      * answered AtManagedRectangle. Settled only for the provider that admitted the window
@@ -2217,9 +2218,12 @@ private:
         bool releaseWriterReady = false;
         bool committed = false;
         // A released record's window was moved or resized by the user's own interactive
-        // operation, which ended without being cancelled: where it stands is the user's
-        // placement, not an automatic rectangle (settleReleasedTransientOwnership).
-        bool placedByUser = false;
+        // operation, which ended without being cancelled: the window's geometry request
+        // generation at that end. While it is still the window's, where the window stands is
+        // the user's placement, not an automatic rectangle; any later request (the
+        // workspace's re-check, a script's) makes the evidence stale
+        // (settleReleasedTransientOwnership).
+        std::optional<quint64> placedByUser;
         QMetaObject::Connection closeCleanup;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
         std::unique_ptr<TransientTileRequest> request;

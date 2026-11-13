@@ -1055,8 +1055,11 @@ RectF XdgToplevelWindow::transientTileFrame(const RectF &tile) const
         const bool wide = image.width() > tile.width() && !samePixels(image.width(), tile.width(), scale);
         const bool tall = image.height() > tile.height() && !samePixels(image.height(), tile.height(), scale);
         if (!wide && !tall) {
-            // Inside the tile. Not reachable only where the client's size limits say so, and
-            // then no other size inside the tile is offered: the tile is refused.
+            // Inside the tile. Not reachable only where the client's size limits say so: a
+            // minimum above the tile, or a maximum below it. The fit is the tile's size on
+            // the window's pixels, never a smaller window in a corner of the tile (the
+            // request's frame is checked against the tile by that nearness,
+            // isTransientTileFrame), so such a tile is refused, as it was.
             const RectF frame(tile.topLeft(), image);
             return isTransientRestoreFrameFeasible(frame) ? frame : tile;
         }

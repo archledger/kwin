@@ -10400,19 +10400,23 @@ void TestXdgShellWindow::testTransientRequestFractional_data()
 {
     QTest::addColumn<QSizeF>("tileSize");
     QTest::addColumn<QSize>("minimum");
+    QTest::addColumn<QSize>("maximum");
     QTest::addColumn<QSizeF>("frameSize");
     // The output's pixel is 0.8 logical pixels: a 200x100 tile is on it.
-    QTest::newRow("snapped") << QSizeF(200, 100) << QSize() << QSizeF(200, 100);
+    QTest::newRow("snapped") << QSizeF(200, 100) << QSize() << QSize() << QSizeF(200, 100);
     // 201x101 is not (251.25 x 126.25 device pixels). A client asked for 201x101 is 251x126
     // device pixels, a 200.8 x 100.8 frame: the largest the window reaches inside the tile.
-    QTest::newRow("off-the-pixel-grid") << QSizeF(201, 101) << QSize() << QSizeF(200.8, 100.8);
+    QTest::newRow("off-the-pixel-grid") << QSizeF(201, 101) << QSize() << QSize() << QSizeF(200.8, 100.8);
     // One axis on the grid, the other not.
-    QTest::newRow("height-off-the-pixel-grid") << QSizeF(200, 101) << QSize() << QSizeF(200, 100.8);
+    QTest::newRow("height-off-the-pixel-grid") << QSizeF(200, 101) << QSize() << QSize() << QSizeF(200, 100.8);
     // The client's own grid is a whole logical pixel. A 202-wide client is 252.5 device pixels,
     // which is 253: a 202.4 frame, wider than the tile. The one that fits is 201 wide.
-    QTest::newRow("client-size-over-the-tile") << QSizeF(202, 100) << QSize() << QSizeF(200.8, 100);
+    QTest::newRow("client-size-over-the-tile") << QSizeF(202, 100) << QSize() << QSize() << QSizeF(200.8, 100);
     // Nothing inside the tile is a size the client accepts: refused, as before.
-    QTest::newRow("below-the-minimum") << QSizeF(201, 101) << QSize(201, 101) << QSizeF();
+    QTest::newRow("below-the-minimum") << QSizeF(201, 101) << QSize(201, 101) << QSize() << QSizeF();
+    // A maximum below the tile: the window could stand in a corner of it, but a fit is the
+    // tile's size on the window's pixels. Refused, as before.
+    QTest::newRow("above-the-maximum") << QSizeF(201, 101) << QSize() << QSize(190, 90) << QSizeF();
 }
 
 void TestXdgShellWindow::testTransientRequestFractional()
@@ -10423,6 +10427,7 @@ void TestXdgShellWindow::testTransientRequestFractional()
     // the request's target. A rectangle with no reachable size inside it is still refused.
     QFETCH(QSizeF, tileSize);
     QFETCH(QSize, minimum);
+    QFETCH(QSize, maximum);
     QFETCH(QSizeF, frameSize);
     const bool reachable = frameSize.isValid();
     Test::OutputInfo output;
@@ -10435,14 +10440,19 @@ void TestXdgShellWindow::testTransientRequestFractional()
     if (minimum.isValid()) {
         shell->set_min_size(minimum.width(), minimum.height());
     }
+    if (maximum.isValid()) {
+        shell->set_max_size(maximum.width(), maximum.height());
+    }
+    // A window larger than the tile, or at its maximum where it has one.
+    const QSize initial = maximum.isValid() ? maximum : QSize(220, 120);
     QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
     QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
-    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(220, 120), Qt::red);
+    Window *window = Test::renderAndWaitForShown(surface.get(), initial, Qt::red);
     QVERIFY(window);
     QVERIFY(!configure.isEmpty() || configure.wait());
     shell->xdgSurface()->ack_configure(configure.last().at(0).value<quint32>());
     configure.clear();
-    Test::render(surface.get(), QSize(220, 120), Qt::red);
+    Test::render(surface.get(), initial, Qt::red);
     QVERIFY(Test::waylandSync());
     QCOMPARE(window->nextTargetScale(), 1.25);
     RequestTestTile tile(window);
@@ -11381,6 +11391,7 @@ enum ReleasedBy {
     DesktopRemoved,
     KeyConflict,
     MovedByHand,
+    MovedByHandThenByARequest,
     MovedByARequest,
     RecheckedByTheWorkspace,
     SentToAnotherOutput,
@@ -11398,6 +11409,8 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
     QTest::newRow("desktop-removed") << int(DesktopRemoved) << 1.0 << QSize(200, 100);
     QTest::newRow("key-conflict") << int(KeyConflict) << 1.0 << QSize(200, 100);
     QTest::newRow("moved-by-hand") << int(MovedByHand) << 1.0 << QSize(200, 100);
+    // The user's move, then a request that is not the user's: the evidence is stale.
+    QTest::newRow("moved-by-hand-then-by-a-request") << int(MovedByHandThenByARequest) << 1.0 << QSize(200, 100);
     // A script's request, or the compositor's own: not the user's hand.
     QTest::newRow("moved-by-a-request") << int(MovedByARequest) << 1.0 << QSize(200, 100);
     // The workspace re-checks every window's position when the work area changes (a panel, a
@@ -11539,7 +11552,8 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         QVERIFY(facade.trackWindow(sibling));
         break;
     }
-    case MovedByHand: {
+    case MovedByHand:
+    case MovedByHandThenByARequest: {
         // The user's own move: its first step releases the master. While it lasts the
         // geometry is not settled; where it ends is the user's placement.
         QSignalSpy finished(master, &Window::interactiveMoveResizeFinished);
@@ -11555,6 +11569,10 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         master->keyPressEvent(Qt::Key_Enter);
         QCOMPARE(finished.count(), 1);
         QVERIFY(!master->isInteractiveMove());
+        if (release == MovedByHandThenByARequest) {
+            // The workspace's re-check, a script: a request after the user's hand let go.
+            master->moveResize(QRectF(300, 200, 260, 180));
+        }
         break;
     }
     case MovedByARequest:

@@ -1143,8 +1143,9 @@ void Window::finishInteractiveMoveResize(bool cancel)
     m_interactiveMoveResize.counter++;
     if (!cancel && m_transientOwnership && m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
         // The operation's own first request released the record; where it ended is the place
-        // the user chose. A cancelled one put the window back.
-        m_transientOwnership->placedByUser = true;
+        // the user chose, for as long as no later request moves the window. A cancelled one
+        // put the window back.
+        m_transientOwnership->placedByUser = m_geometryRequestGeneration;
     }
     Q_EMIT interactiveMoveResizeFinished();
 }
@@ -5296,7 +5297,10 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
     // the user's own move or resize left the window.
     const RectF frame = frameGeometry();
     const bool onFloating = sameFrameGeometry(frame, ownership.floating);
-    const bool placedByUser = ownership.placedByUser && !sameFrameGeometry(frame, ownership.target);
+    // The user's placement is evidence only while it is the window's last request: a later
+    // one (the workspace's re-check, a script's) has put the window somewhere nobody chose.
+    const bool placedByUser = ownership.placedByUser && *ownership.placedByUser == m_geometryRequestGeneration
+        && !sameFrameGeometry(frame, ownership.target);
     if (!onFloating && !placedByUser) {
         return TransientSettleResult::AtManagedRectangle;
     }
