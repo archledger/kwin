@@ -581,7 +581,7 @@ bool TransientTileController::admissionCurrent(Window *window, quint64 generatio
     }
     if (m_ownershipGeneration) {
         const auto &ownership = *window->m_transientOwnership;
-        if (!ownership.writer || !ownership.writer->isProviderCurrent(ownership.provider, ownership.providerRevision)
+        if (!window->transientProviderIsCurrent(ownership)
             || !sameFrame(ownership.target, m_tile->windowGeometry()) || !window->isTransientTileTargetFeasible(ownership.target)) {
             return false;
         }
@@ -697,6 +697,12 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
     if (guard && application.receipt.outcome == Window::TransientRequestOutcome::Applied
         && application.continuation.outcome == Window::AssignmentStepOutcome::AppliedCurrent
         && window->assignmentResultIsCurrent(application.continuation)) {
+        // The admission is done: its proof against the provider's revision ends here, after
+        // the application and not before it. The provider's later records (other keys, the
+        // owner's own restored frame) leave the ownership current.
+        if (window->m_transientOwnership) {
+            window->m_transientOwnership->admitted = true;
+        }
         return Result::Accepted;
     }
     window->revokeTransientOwnership(ownership);

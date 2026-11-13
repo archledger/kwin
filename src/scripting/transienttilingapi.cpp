@@ -5,6 +5,7 @@
 
 #include "transienttilingapi.h"
 
+#include "options.h"
 #include "tiles/tile.h"
 #include "tiles/tilemanager.h"
 #include "utils/common.h"
@@ -61,7 +62,27 @@ bool TransientTilingApi::trackWindow(Window *window, const QString &key)
     if (!writer || !window) {
         return false;
     }
-    return writer->trackWindow(window->internalId(), key.isEmpty() ? placementKeyForWindow(window) : key);
+    const QUuid id = window->internalId();
+    // Tracking reports a key conflict before it returns, and the conflict's handlers run then.
+    const QPointer<Window> guard(window);
+    if (!writer->trackWindow(id, key.isEmpty() ? placementKeyForWindow(window) : key)) {
+        return false;
+    }
+    if (!guard) {
+        writer->forgetWindow(id);
+        return false;
+    }
+    // The binding ends with the window. Only an ownership removes its own window's record, and
+    // a key has one window at a reservation: a window that closed without ever being admitted
+    // would stay bound and refuse the app's next window as its conflict. At the QObject's
+    // destruction, like the ownership's own cleanup, so the provider's close record still
+    // finds the window.
+    connect(window, &QObject::destroyed, writer, [writer, id]() {
+        if (!writer->forgetWindow(id) && !writer->windowBinding(id).isEmpty()) {
+            qCWarning(KWIN_CORE) << "Failed to remove transient placement tracking for" << id;
+        }
+    });
+    return true;
 }
 
 QString TransientTilingApi::windowBinding(Window *window)
@@ -157,7 +178,38 @@ int TransientTilingApi::admitTile(int generation, Window *window, const QString 
         key.isEmpty() ? placementKeyForWindow(window) : key,
         snap.providerRevision,
         snap.mapRevision);
+    if (result == TransientTileController::Result::Accepted) {
+        endTreeWhenVacated(controller);
+    }
     return static_cast<int>(result);
+}
+
+void TransientTilingApi::endTreeWhenVacated(TransientTileController *controller)
+{
+    // The tree exists for its one window, and the tiler reads a native teardown from
+    // treeChanged with no live tree. The controller keeps an emptied tree - a release of the
+    // window (its close, the explicit restore, a retired provider, a key conflict) is not the
+    // tree's end - so the tree is ended here once its window has left. Queued: the release
+    // that vacated the leaf is still on the stack when the leaf reports it.
+    disconnect(m_vacated);
+    const quint64 generation = controller->generation();
+    Tile *leaf = controller->tile();
+    if (!generation || !leaf) {
+        return;
+    }
+    m_vacated = connect(leaf, &Tile::windowRemoved, this, [this, generation]() {
+        endVacatedTree(generation);
+    }, Qt::QueuedConnection);
+}
+
+void TransientTilingApi::endVacatedTree(quint64 generation)
+{
+    // The live Workspace, not the one this facade was created for: the call is queued and can
+    // arrive during the compositor's teardown.
+    auto controller = Workspace::self() ? Workspace::self()->transientTileController() : nullptr;
+    if (controller && controller->generation() == generation && controller->tile() && controller->tile()->windows().isEmpty()) {
+        controller->clearTree(generation);
+    }
 }
 
 int TransientTilingApi::releaseTile(int generation)
@@ -167,6 +219,13 @@ int TransientTilingApi::releaseTile(int generation)
         return -1;
     }
     return static_cast<int>(controller->clearTree(generation));
+}
+
+void TransientTilingApi::restoreWindow(Window *window)
+{
+    if (m_workspace && window && !window->isDeleted()) {
+        m_workspace->performWindowOperation(window, Options::UntileOrRestoreOp);
+    }
 }
 
 QRectF TransientTilingApi::masterWindowRect() const
