@@ -6179,10 +6179,17 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
         moveResize(ensureSpecialStateGeometry(decision.geometry));
         setFullscreenGeometryRestore(moveToArea(m_fullscreenGeometryRestore, decision.oldScreenArea, decision.screenArea));
         setGeometryRestore(moveToArea(m_maximizeGeometryRestore, decision.oldScreenArea, decision.screenArea));
-        return;
+        break;
     case WorkspacePositionDecision::Kind::Geometry:
         moveResize(decision.geometry);
-        return;
+        break;
+    }
+    // A released record's floating frame follows the window's screen as the restore fields
+    // above do, and as it does on a transfer (sendToOutput): an output that was removed or
+    // resized takes its coordinates with it, and a floating frame left on them is one the
+    // policy could never return the window to. Untouched while the screen is the same.
+    if (!isDeleted() && decision.oldScreenArea != decision.screenArea && decision.oldScreenArea.isValid() && decision.screenArea.isValid()) {
+        rebaseTransientFloatingOnOutputTransfer(decision.oldScreenArea, decision.screenArea);
     }
 }
 

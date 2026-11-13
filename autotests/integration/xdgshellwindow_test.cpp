@@ -11384,6 +11384,7 @@ enum ReleasedBy {
     MovedByARequest,
     RecheckedByTheWorkspace,
     SentToAnotherOutput,
+    OutputRemoved,
     MaximizedAfterwards,
 };
 
@@ -11403,6 +11404,9 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
     // strut, an output's size), and asks a tiled one for its tile's rectangle.
     QTest::newRow("re-checked-by-the-workspace") << int(RecheckedByTheWorkspace) << 1.0 << QSize(200, 100);
     QTest::newRow("sent-to-another-output") << int(SentToAnotherOutput) << 1.0 << QSize(200, 100);
+    // The session's output is unplugged: the window is put on the other one, and its
+    // floating frame was on coordinates that are gone.
+    QTest::newRow("output-removed") << int(OutputRemoved) << 1.0 << QSize(200, 100);
     QTest::newRow("maximized-afterwards") << int(MaximizedAfterwards) << 1.0 << QSize(200, 100);
     // The output's pixel is 0.8: the floating frame is 200.8x100.8 and the tile's rectangle
     // (634 wide, 792.5 device pixels) is off the grid, so the automatic rectangle is the
@@ -11434,6 +11438,10 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     if (scale != 1.0) {
         Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1024), .scale = scale}});
         workspace()->setActiveOutput(QPoint(100, 100));
+    }
+    if (release == OutputRemoved) {
+        // The window opens on the second output, the one that goes.
+        workspace()->setActiveOutput(QPoint(1280 + 640, 512));
     }
     const TilingFacade facade;
     QVERIFY(facade.api);
@@ -11564,6 +11572,13 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         QVERIFY(master->moveResizeOutput() != output);
         break;
     }
+    case OutputRemoved: {
+        QCOMPARE(output->geometry(), Rect(1280, 0, 1280, 1024));
+        Test::setOutputConfig({Rect(0, 0, 1280, 1024)});
+        QCOMPARE(workspace()->outputs().count(), 1);
+        QCOMPARE(master->moveResizeOutput(), workspace()->outputs().constFirst());
+        break;
+    }
     }
     QTRY_VERIFY(!facade.hasTree());
     QVERIFY(master->m_transientOwnership);
@@ -11611,7 +11626,7 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         // frame the record holds, which followed the window to another output.
         expected = facade.floatingFrame(master);
         QVERIFY(expected.isValid());
-        QCOMPARE(exactFrame(expected, floating), release != SentToAnotherOutput);
+        QCOMPARE(exactFrame(expected, floating), release != SentToAnotherOutput && release != OutputRemoved);
         QCOMPARE(workspace()->outputAt(expected.center()), master->moveResizeOutput());
         master->moveResize(expected);
         // The client has not answered the request yet.
