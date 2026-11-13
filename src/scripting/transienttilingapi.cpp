@@ -228,6 +228,14 @@ void TransientTilingApi::restoreWindow(Window *window)
     }
 }
 
+int TransientTilingApi::settleWindow(Window *window, const QString &providerToken)
+{
+    if (!m_workspace || !window || window->isDeleted()) {
+        return -1;
+    }
+    return static_cast<int>(window->settleReleasedTransientOwnership(QUuid(providerToken)));
+}
+
 QRectF TransientTilingApi::masterWindowRect() const
 {
     auto controller = m_workspace ? m_workspace->transientTileController() : nullptr;

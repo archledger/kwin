@@ -945,6 +945,13 @@ bool XdgToplevelWindow::canStartTransientTileRequest(const RectF &target) const
     return !hasPendingNativeGeometry() && !requestedTile() && !tile() && isTransientTileTargetFeasible(target);
 }
 
+bool XdgToplevelWindow::isTransientGeometrySettled() const
+{
+    return m_isInitialized && readyForPainting() && !isInteractiveMoveResize() && !hasPendingNativeGeometry()
+        && !isFullScreen() && !isRequestedFullScreen() && maximizeMode() == MaximizeRestore && requestedMaximizeMode() == MaximizeRestore
+        && frameGeometry() == moveResizeGeometry(); // RectF: an exact comparison
+}
+
 bool XdgToplevelWindow::canStartTransientRestoreRequest(const RectF &target) const
 {
     // Pending admission geometry is allowed. Do not clear a pending configure gravity (one an

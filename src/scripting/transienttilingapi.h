@@ -112,6 +112,19 @@ public:
     Q_INVOKABLE void restoreWindow(Window *window);
 
     /**
+     * End the record of a window the native layer released without restoring it (a removed
+     * desktop or output, a second window of its app, a move of the window): the master the
+     * tiler has since given its floating frame back with an ordinary request, or one the user
+     * moved. The native layer settles it only for the provider that admitted the window, once
+     * the window's geometry is settled and it no longer stands on the automatic rectangle, so
+     * that rectangle never reaches the memory. Returns Window::TransientSettleResult: 0
+     * settled (the window can be admitted again), 1 nothing to settle, 2 another provider's,
+     * 3 not settled yet (ask again after the client's next commit), 4 still on the automatic
+     * rectangle, 5 refused by the writer; -1 without a window.
+     */
+    Q_INVOKABLE int settleWindow(Window *window, const QString &providerToken);
+
+    /**
      * The transient leaf's absolute window geometry (the master's placed rectangle,
      * including the tile padding and strut adjustments).
      */

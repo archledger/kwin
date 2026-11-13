@@ -1415,6 +1415,27 @@ public:
     };
     TransientRestoreConsumption consumeExplicitUntileOrRestore();
     /**
+     * The end of a released record that no explicit restoration will complete. A release that
+     * is not the explicit restore is detach-only: the window stays where it stands and its
+     * record (Restoring) keeps the automatic rectangle out of the placement memory. The policy
+     * that admitted the window ends that record once the window is somewhere else: back on its
+     * floating frame by the policy's own ordinary request, or where the user put it. Settled
+     * only for the provider that admitted the window, with no live restoration, in an ordinary
+     * mode outside every tile, with the native geometry settled (nothing scheduled, sent or
+     * acknowledged, the frame the requested geometry) and off the automatic rectangle; every
+     * other answer changes nothing. The writer finalizes as it does for a completed
+     * restoration: a deferred update for the key is applied, else the entry stays.
+     */
+    enum class TransientSettleResult {
+        Settled,
+        NotReleased,
+        StaleProvider,
+        Unsettled,
+        AtManagedRectangle,
+        Refused,
+    };
+    TransientSettleResult settleReleasedTransientOwnership(const QUuid &provider);
+    /**
      * NT04's read-only state/completion contract. The state query reflects the native record
      * only - no protocol logging and no timeout participates - for the placement policy that
      * must leave a restoring window alone. A suppressed (cancelled) record still holds its
@@ -1807,6 +1828,7 @@ Q_SIGNALS:
     void readyForPaintingChanged();
     void maximizeGeometryRestoreChanged();
     void transientRestorationCompleted(const QRectF &restoredFrame);
+    void transientReleaseSettled(const QRectF &frame);
     void fullscreenGeometryRestoreChanged();
     void offscreenRenderingChanged();
     void targetScaleChanged();
@@ -2405,6 +2427,8 @@ protected:
     quint64 requestedTransientTileGeneration() const;
     void commitTileFromConfigure(Tile *tile, quint64 transientGeneration);
     virtual bool canStartTransientTileRequest(const RectF &target) const;
+    // Nothing of the native geometry is in flight and the frame is the requested geometry.
+    virtual bool isTransientGeometrySettled() const;
     virtual bool canStartTransientRestoreRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;

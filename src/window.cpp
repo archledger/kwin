@@ -5247,6 +5247,48 @@ Window::TransientRestoreConsumption Window::consumeExplicitUntileOrRestore()
     return TransientRestoreConsumption::RestoreStopped;
 }
 
+Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUuid &provider)
+{
+    if (isDeleted() || !m_transientOwnership) {
+        return TransientSettleResult::NotReleased;
+    }
+    const auto &ownership = *m_transientOwnership;
+    const auto generation = ownership.generation;
+    // A released record whose tile request was made; a live restoration completes at its own
+    // boundary (completeTransientRestoration), a superseded or cancelled one never does.
+    if (ownership.phase != TransientOwnershipPhase::Restoring || ownership.releasing || ownership.executing
+        || ownership.request || m_activeTransientRequest || m_requestedTransientTileGeneration
+        || ownership.progress != TransientRequestProgress::Requested
+        || (ownership.restoreAttempt && transientRestoreAttemptIsCurrent(generation, ownership.restoreAttempt->sequence))) {
+        return TransientSettleResult::NotReleased;
+    }
+    if (provider.isNull() || provider != ownership.provider || !ownership.writer || !ownership.writer->isProviderRegistered(provider)
+        || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
+        return TransientSettleResult::StaleProvider;
+    }
+    // A maximized, full-screen or tiled window returns to the frame it had before, which for a
+    // released window is the automatic rectangle: its record waits for the ordinary state.
+    if (m_requestedTile || m_tile || !isTransientGeometrySettled()) {
+        return TransientSettleResult::Unsettled;
+    }
+    if (exactFrameGeometry(frameGeometry(), ownership.target) && !exactFrameGeometry(ownership.target, ownership.floating)) {
+        return TransientSettleResult::AtManagedRectangle;
+    }
+    if (ownership.writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+        return TransientSettleResult::Refused;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // As after a completed restoration, the close cleanup stays connected: the writer forgets
+    // the tracked window at its destruction.
+    const RectF frame = frameGeometry();
+    m_transientOwnership.reset();
+    Q_EMIT transientReleaseSettled(QRectF(frame));
+    return TransientSettleResult::Settled;
+}
+
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
 {
     return {};
@@ -5718,6 +5760,11 @@ bool Window::canStartTransientTileRequest(const RectF &target) const
 }
 
 bool Window::canStartTransientRestoreRequest(const RectF &target) const
+{
+    return false;
+}
+
+bool Window::isTransientGeometrySettled() const
 {
     return false;
 }

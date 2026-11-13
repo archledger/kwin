@@ -403,6 +403,8 @@ private Q_SLOTS:
     void testTransientTilingFacadeClosedSibling();
     void testTransientTilingFacadeMasterClosed();
     void testTransientTilingFacadeKeyConflict();
+    void testTransientTilingFacadeReleasedMaster_data();
+    void testTransientTilingFacadeReleasedMaster();
     void testTransientTilingFacadeProviderKeepsRecording_data();
     void testTransientTilingFacadeProviderKeepsRecording();
     void testControllerProviderRecordDuringApplication();
@@ -10527,6 +10529,13 @@ struct TilingFacade
         return QMetaObject::invokeMethod(api, "restoreWindow", Q_ARG(Window *, window));
     }
 
+    int settleWindow(Window *window, const QString &token) const
+    {
+        int result = notCallable;
+        QMetaObject::invokeMethod(api, "settleWindow", Q_RETURN_ARG(int, result), Q_ARG(Window *, window), Q_ARG(QString, token));
+        return result;
+    }
+
     QRectF masterWindowRect() const
     {
         QRectF rect;
@@ -10999,6 +11008,182 @@ void TestXdgShellWindow::testTransientTilingFacadeKeyConflict()
     QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
     QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Busy));
     QCOMPARE(facade.releaseTile(again.value(QStringLiteral("generation")).toInt()), int(TransientTileController::Result::Accepted));
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
+{
+    QTest::addColumn<int>("release");
+    QTest::newRow("desktop-removed") << 0;
+    QTest::newRow("key-conflict") << 1;
+    QTest::newRow("moved-by-hand") << 2;
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
+{
+    // A release that is not the explicit restore is detach-only: the master stays where it
+    // stands and its record is held, which keeps the automatic rectangle out of the memory.
+    // Nothing native ever ended that record, so the window kept the tile's size and could not
+    // be admitted again until it closed (the ThinkPad after a desktop removal, a second window
+    // of the app, a move of the master). The policy ends it: it gives the window its floating
+    // frame back with an ordinary request, or leaves it where the user put it, and asks the
+    // facade to settle the record. The native layer does that only when the window's geometry
+    // is settled and the window no longer stands on the automatic rectangle.
+    QFETCH(int, release);
+    using Settle = Window::TransientSettleResult;
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    auto desktops = VirtualDesktopManager::self();
+    const auto restoreDesktops = qScopeGuard([desktops]() {
+        desktops->setCount(1);
+    });
+    const QString key = QStringLiteral("org.example.facade.released.") + QString::fromLatin1(QTest::currentDataTag());
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *master = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(master);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    // The client's side of a configure: acknowledge the newest one and commit its size (the
+    // size it has where the configure leaves the choice to it).
+    QSize committed(200, 100);
+    const auto follow = [&]() {
+        if (configure.isEmpty() && !configure.wait()) {
+            return false;
+        }
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        const QSize asked = toplevelConfigure.last().at(0).value<QSize>();
+        if (!asked.isEmpty()) {
+            committed = asked;
+        }
+        Test::render(surface.get(), committed, Qt::blue);
+        return Test::waylandSync();
+    };
+    auto toplevel = static_cast<XdgToplevelWindow *>(master);
+    // Until nothing of the native geometry is in flight: a release, an activation or a
+    // deactivation each bring a configure of their own.
+    const auto answerAll = [&]() {
+        for (int i = 0; i < 6 && toplevel->hasPendingNativeGeometry(); ++i) {
+            if (!follow()) {
+                return false;
+            }
+        }
+        return !toplevel->hasPendingNativeGeometry();
+    };
+    const QRectF floating = master->frameGeometry();
+    QObject provider;
+    const QString token = facade.registerProvider(&provider);
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(master));
+    QCOMPARE(facade.record(token, 1, master, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+    // Nothing to settle: no record, then an owned one.
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::NotReleased));
+    auto output = master->moveResizeOutput();
+    desktops->setCount(2);
+    const auto first = desktops->currentDesktop(output);
+    const auto second = desktops->desktops().constLast();
+    QVERIFY(first != second);
+    const QVariantMap tree = facade.createTile(output, first, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(tree.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
+    const QRectF managed = facade.masterWindowRect();
+    QVERIFY(follow());
+    QVERIFY(master->tile());
+    QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::NotReleased));
+    QVERIFY(master->m_transientOwnership);
+
+    std::unique_ptr<KWayland::Client::Surface> siblingSurface;
+    std::unique_ptr<Test::XdgToplevel> siblingShell;
+    QRectF expected = floating;
+    int revision = 1;
+    if (release == 0) {
+        desktops->setCurrent(second);
+        desktops->removeVirtualDesktop(first);
+    } else if (release == 1) {
+        siblingSurface = Test::createSurface();
+        siblingShell = Test::createXdgToplevelSurface(siblingSurface.get());
+        siblingShell->set_app_id(key);
+        Window *sibling = Test::renderAndWaitForShown(siblingSurface.get(), QSize(220, 120), Qt::green);
+        QVERIFY(sibling);
+        QVERIFY(facade.trackWindow(sibling));
+    } else {
+        // The user's own move: the request itself releases the master, and its place wins.
+        expected = QRectF(300, 200, 260, 180);
+        master->moveResize(expected);
+    }
+    QTRY_VERIFY(!facade.hasTree());
+    QVERIFY(master->m_transientOwnership);
+    QCOMPARE(master->m_transientOwnership->phase, Window::TransientOwnershipPhase::Restoring);
+    QVERIFY(!master->tile());
+
+    // Only the provider that admitted the window settles its record.
+    QCOMPARE(facade.settleWindow(master, QUuid::createUuid().toString()), int(Settle::StaleProvider));
+    if (release != 2) {
+        // The release changed the window's states; until the client has answered that
+        // configure the geometry is not settled.
+        if (toplevel->hasPendingNativeGeometry()) {
+            QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+            QVERIFY(answerAll());
+        }
+        // Settled, but still on the automatic rectangle: the record stays, the memory's
+        // barrier with it.
+        QVERIFY2(exactFrame(master->frameGeometry(), managed), frameText(master->frameGeometry()).constData());
+        QCOMPARE(facade.settleWindow(master, token), int(Settle::AtManagedRectangle));
+        QVERIFY(master->m_transientOwnership);
+        // The policy gives the window its floating frame back: an ordinary request.
+        master->moveResize(floating);
+    }
+    // The client has not answered the request yet.
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));
+    QVERIFY(master->m_transientOwnership);
+    QVERIFY(answerAll());
+    QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
+    if (release == 2) {
+        // The provider records the place the user chose; the key is still reserved.
+        QCOMPARE(facade.record(token, ++revision, master, scriptRecord(expected), revision), int(TransientPlacementWriter::Result::Deferred));
+    }
+    QSignalSpy settled(master, &Window::transientReleaseSettled);
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::Settled));
+    QCOMPARE(settled.count(), 1);
+    QVERIFY(!master->m_transientOwnership);
+    QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
+    QVERIFY(exactFrame(facade.entry(key), scriptRecord(expected)));
+    QCOMPARE(facade.settleWindow(master, token), int(Settle::NotReleased));
+
+    // The window is free again: a new session admits it and the explicit restore returns it.
+    if (siblingSurface) {
+        siblingShell.reset();
+        siblingSurface.reset();
+        QVERIFY(Test::waylandSync());
+        QTRY_COMPARE(workspace()->windows().count(), 1);
+        // The master is the active window again; the client answers that configure.
+        QTRY_COMPARE(workspace()->activeWindow(), master);
+        QVERIFY(answerAll());
+    }
+    const auto desktop = desktops->currentDesktop(output);
+    const QVariantMap again = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), master, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(follow());
+    QVERIFY(master->tile());
+    QVERIFY(facade.restoreWindow(master));
+    QVERIFY(follow());
+    QVERIFY2(exactFrame(master->frameGeometry(), expected), frameText(master->frameGeometry()).constData());
+    QVERIFY(!master->m_transientOwnership);
+    QTRY_VERIFY(!facade.hasTree());
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeProviderKeepsRecording_data()
