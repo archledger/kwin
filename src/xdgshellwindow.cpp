@@ -1073,6 +1073,30 @@ RectF XdgToplevelWindow::transientTileFrame(const RectF &tile) const
     return tile;
 }
 
+RectF XdgToplevelWindow::transientFloatingImage(const RectF &floating) const
+{
+    // The frame itself wherever the window reaches it: on the output it was taken on, and on
+    // any other whose pixels it is on.
+    if (isDeleted() || !surface() || isTransientRestoreFrameFeasible(floating)) {
+        return floating;
+    }
+    const qreal scale = nextTargetScale();
+    for (qreal value : {floating.x(), floating.y(), floating.width(), floating.height(), scale}) {
+        if (!std::isfinite(value)) {
+            return floating;
+        }
+    }
+    if (floating.width() <= 0 || floating.height() <= 0 || scale <= 0) {
+        return floating;
+    }
+    // What a request for the frame publishes (dispatchMoveResize, then the commit): the size
+    // to the output's pixels, to the client's grid and back. The corner stays. Where even
+    // that is not reachable (the client's size limits) the frame is left as it is.
+    const QSizeF client = surface()->snappedSize(nextFrameSizeToClientSize(snapToPixels(floating.size(), scale)));
+    const RectF image(floating.topLeft(), nextClientSizeToFrameSize(snapToPixels(client, scale)));
+    return isTransientRestoreFrameFeasible(image) ? image : floating;
+}
+
 bool XdgToplevelWindow::isTransientTileFrame(const RectF &frame, const RectF &tile) const
 {
     if (Window::isTransientTileFrame(frame, tile)) {

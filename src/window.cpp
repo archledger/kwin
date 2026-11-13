@@ -5295,8 +5295,10 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
     // with a public request for the tile's rectangle as it is then, and a transfer to another
     // output carries the tile's size along. The record ends on the floating frame, or where
     // the user's own move or resize left the window.
+    // On an output of another scale than the one the floating frame was taken on, the
+    // window stands on that frame where it stands on its image there.
     const RectF frame = frameGeometry();
-    const bool onFloating = sameFrameGeometry(frame, ownership.floating);
+    const bool onFloating = sameFrameGeometry(frame, ownership.floating) || sameFrameGeometry(frame, transientFloatingImage(ownership.floating));
     // The user's placement is evidence only while it is the window's last request: a later
     // one (the workspace's re-check, a script's) has put the window somewhere nobody chose.
     const bool placedByUser = ownership.placedByUser && *ownership.placedByUser == m_geometryRequestGeneration
@@ -5320,7 +5322,12 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
 
 RectF Window::transientFloatingFrame() const
 {
-    return m_transientOwnership ? m_transientOwnership->floating : RectF();
+    return m_transientOwnership ? transientFloatingImage(m_transientOwnership->floating) : RectF();
+}
+
+RectF Window::transientFloatingImage(const RectF &floating) const
+{
+    return floating;
 }
 
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)

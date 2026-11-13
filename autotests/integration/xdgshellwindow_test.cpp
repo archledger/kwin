@@ -11395,6 +11395,7 @@ enum ReleasedBy {
     MovedByARequest,
     RecheckedByTheWorkspace,
     SentToAnotherOutput,
+    SentToAnOutputOfAnotherScale,
     OutputRemoved,
     MaximizedAfterwards,
 };
@@ -11430,6 +11431,12 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster_data()
     // window lands on its image, which is neither the fit it was admitted to nor inside the
     // tile.
     QTest::newRow("re-checked-by-the-workspace-at-125%") << int(RecheckedByTheWorkspace) << 1.25 << QSize(201, 101);
+    // From an output whose pixel is 0.8 to one whose pixel is 1: the floating frame is
+    // 200.8x100.8 and goes along as it is, but no window is 200.8 wide on whole pixels. A
+    // request for it lands on 201x101 and is never the frame, so the window's geometry never
+    // settled and its record stayed (a 133% laptop panel and a 100% second screen: the master
+    // sent across could not be tiled again until it was moved by hand).
+    QTest::newRow("sent-to-an-output-of-another-scale") << int(SentToAnOutputOfAnotherScale) << 1.25 << QSize(201, 101);
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
@@ -11448,7 +11455,11 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
     QFETCH(qreal, scale);
     QFETCH(QSize, client);
     using Settle = Window::TransientSettleResult;
-    if (scale != 1.0) {
+    if (release == SentToAnOutputOfAnotherScale) {
+        Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1024), .scale = scale},
+                               Test::OutputInfo{.geometry = Rect(1280, 0, 1280, 1024), .scale = 1.0}});
+        workspace()->setActiveOutput(QPoint(100, 100));
+    } else if (scale != 1.0) {
         Test::setOutputConfig({Test::OutputInfo{.geometry = Rect(0, 0, 1280, 1024), .scale = scale}});
         workspace()->setActiveOutput(QPoint(100, 100));
     }
@@ -11583,11 +11594,13 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         // tile's rectangle with a public request, which releases the master.
         master->checkWorkspacePosition();
         break;
-    case SentToAnotherOutput: {
+    case SentToAnotherOutput:
+    case SentToAnOutputOfAnotherScale: {
         const auto outputs = workspace()->outputs();
         QCOMPARE(outputs.count(), 2);
         master->sendToOutput(outputs.at(0) == output ? outputs.at(1) : outputs.at(0));
         QVERIFY(master->moveResizeOutput() != output);
+        QCOMPARE(master->moveResizeOutput()->scale() != scale, release == SentToAnOutputOfAnotherScale);
         break;
     }
     case OutputRemoved: {
@@ -11644,8 +11657,13 @@ void TestXdgShellWindow::testTransientTilingFacadeReleasedMaster()
         // frame the record holds, which followed the window to another output.
         expected = facade.floatingFrame(master);
         QVERIFY(expected.isValid());
-        QCOMPARE(exactFrame(expected, floating), release != SentToAnotherOutput && release != OutputRemoved);
+        QCOMPARE(exactFrame(expected, floating),
+                 release != SentToAnotherOutput && release != SentToAnOutputOfAnotherScale && release != OutputRemoved);
         QCOMPARE(workspace()->outputAt(expected.center()), master->moveResizeOutput());
+        if (release == SentToAnOutputOfAnotherScale) {
+            // The frame the window takes there: the floating size on that output's pixels.
+            QVERIFY2(exactFrame(QRectF(expected.topLeft(), QSizeF(201, 101)), expected), frameText(expected).constData());
+        }
         master->moveResize(expected);
         // The client has not answered the request yet.
         QCOMPARE(facade.settleWindow(master, token), int(Settle::Unsettled));

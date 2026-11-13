@@ -1445,7 +1445,8 @@ public:
     /**
      * The floating frame of this window's transient record, owned or released: where an
      * explicit restoration returns it, carried along when the window is sent to another
-     * output. Null without a record.
+     * output, as the window takes it on the output it is on (transientFloatingImage()).
+     * Null without a record.
      */
     RectF transientFloatingFrame() const;
     /**
@@ -2469,6 +2470,16 @@ protected:
      * caller's separate check (isTransientTileTargetFeasible).
      */
     virtual bool isTransientTileFrame(const RectF &frame, const RectF &tile) const;
+    /**
+     * The frame a request for a transient record's floating frame gives this window on the
+     * output it is on now. The floating frame was a frame of the window where it was taken.
+     * Carried to an output of another scale (sendToOutput, a removed output) its size is not
+     * on the pixels there: the window cannot take it, a request for it is never the frame,
+     * and the geometry of a window asked for it never settles. This is @p floating where the
+     * window reaches it, and otherwise its corner with its size taken to this output's
+     * pixels and to the client's grid and back, as a request and its commit take it.
+     */
+    virtual RectF transientFloatingImage(const RectF &floating) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;
     // a dispatcher reports what it staged or published through the stack-bound request.
     virtual bool supportsAssignmentGeometryRequest() const;
