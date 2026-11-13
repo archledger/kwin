@@ -299,15 +299,24 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             } else {
                 // The request is resolved here, with no configure and nothing for the client to
                 // commit: what is published is the request's image on the output's pixels, and
-                // the requested geometry follows it, as it does when a configure's commit lands
-                // (synchronizeCommittedGeometry). Left at the rectangle that was asked for, it
-                // would differ from the frame until the client's next commit, and the window
-                // would read as unsettled for that long. Half a pixel must not carry the
-                // center to another output: there the request stays as it was asked. A guarded
+                // the requested geometry follows it through the synchronization a configure's
+                // commit uses (synchronizeCommittedGeometry). Left at the rectangle that was
+                // asked for, it would differ from the frame until the client's next commit, and
+                // the window would read as unsettled for that long. Where half a pixel carries
+                // the image's center to another output, the synchronization takes the output
+                // and its properties with it, as it does for a committed frame. A guarded
                 // request keeps its rectangle on purpose: its caller compares the requested
                 // geometry with the rectangle it asked for (a tile's, a restoration's).
-                if (target != rect && workspace()->outputAt(target.center()) == moveResizeOutput()) {
-                    setMoveResizeGeometry(target);
+                if (target != rect) {
+                    const auto requestIsCurrent = [this, generation]() {
+                        return geometryRequestIsCurrent(generation) && transientGeometryRequestIsCurrent(generation);
+                    };
+                    // A refused synchronization leaves the request as it was asked; a newer
+                    // request from one of its callbacks ends this one.
+                    if (synchronizeConfigureGeometry(target, m_geometryRequestOrigin, requestIsCurrent).outcome != AssignmentStepOutcome::AppliedCurrent
+                        && !current()) {
+                        return;
+                    }
                 }
                 updateGeometry(target);
             }

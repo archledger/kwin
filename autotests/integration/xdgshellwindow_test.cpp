@@ -10588,18 +10588,20 @@ QByteArray frameText(const QRectF &frame)
 void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry_data()
 {
     QTest::addColumn<int>("outputs");
+    QTest::addColumn<qreal>("secondScale");
     QTest::addColumn<QRectF>("request");
     QTest::addColumn<bool>("anchored");
-    QTest::addColumn<bool>("synchronized");
+    QTest::addColumn<bool>("crosses");
     // A 361-wide client on a 4/3 output is 481 device pixels, a 360.75-wide frame: a request
     // for 361 asks the client for the size it has.
-    QTest::newRow("in-place") << 1 << QRectF(102, 102, 361, 240) << false << true;
-    QTest::newRow("moved") << 1 << QRectF(132, 123, 361, 240) << false << true;
+    QTest::newRow("in-place") << 1 << 4.0 / 3.0 << QRectF(102, 102, 361, 240) << false << false;
+    QTest::newRow("moved") << 1 << 4.0 / 3.0 << QRectF(132, 123, 361, 240) << false << false;
     // As during a resize from the top-left corner: the bottom-right corner stays, so the
     // published frame's top-left is not the request's.
-    QTest::newRow("bottom-right-kept") << 1 << QRectF(132, 123, 361, 240) << true << true;
+    QTest::newRow("bottom-right-kept") << 1 << 4.0 / 3.0 << QRectF(132, 123, 361, 240) << true << false;
     // The request's center belongs to the second output, its image's to the first.
-    QTest::newRow("center-on-an-output-boundary") << 2 << QRectF(1019.0625, 123, 361, 240) << false << false;
+    QTest::newRow("center-on-an-output-boundary") << 2 << 4.0 / 3.0 << QRectF(1019.0625, 123, 361, 240) << false << true;
+    QTest::newRow("center-on-a-boundary-to-another-scale") << 2 << 1.25 << QRectF(1019.0625, 123, 361, 240) << false << true;
 }
 
 void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
@@ -10607,15 +10609,16 @@ void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
     // An ordinary request for the client size the window already has is resolved without a
     // configure: its image on the output's pixels is published at once, and from then on that
     // image is the requested geometry, as after a configure's commit. Where the image's center
-    // would be on another output than the request's, the requested geometry stays as it was
-    // asked and no output changes under the request.
+    // is on another output than the request's, the request follows its image there, the
+    // output's properties with it, as a commit's synchronization would take it.
     QFETCH(int, outputs);
+    QFETCH(qreal, secondScale);
     QFETCH(QRectF, request);
     QFETCH(bool, anchored);
-    QFETCH(bool, synchronized);
+    QFETCH(bool, crosses);
     QList<Test::OutputInfo> config{Test::OutputInfo{.geometry = Rect(0, 0, 1200, 900), .scale = 4.0 / 3.0}};
     if (outputs == 2) {
-        config.append(Test::OutputInfo{.geometry = Rect(1200, 0, 1200, 900), .scale = 4.0 / 3.0});
+        config.append(Test::OutputInfo{.geometry = Rect(1200, 0, 1200, 900), .scale = secondScale});
     }
     Test::setOutputConfig(config);
     workspace()->setActiveOutput(QPoint(100, 100));
@@ -10626,6 +10629,7 @@ void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
     QVERIFY(window);
     QVERIFY(!configure.isEmpty() || configure.wait());
     shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
     Test::render(surface.get(), QSize(361, 240), Qt::blue);
     QVERIFY(Test::waylandSync());
     auto toplevel = static_cast<XdgToplevelWindow *>(window);
@@ -10638,27 +10642,35 @@ void TestXdgShellWindow::testConfigurelessRequestSynchronizesRequestedGeometry()
     if (anchored) {
         toplevel->m_configureGravity = Gravity::TopLeft;
     }
-    const QRectF image(request.topLeft(), before.size());
-    QCOMPARE(workspace()->outputAt(image.center()) == workspace()->outputAt(request.center()), synchronized);
+    const auto first = workspace()->outputAt(before.center());
+    QCOMPARE(workspace()->outputAt(request.center()) != first, crosses);
 
     window->moveResize(request);
+    // An output of another scale asks the client again; the client answers at the size it has.
+    for (int i = 0; i < 3 && toplevel->hasPendingNativeGeometry(); ++i) {
+        QVERIFY(!configure.isEmpty() || configure.wait());
+        shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+        configure.clear();
+        Test::render(surface.get(), QSize(361, 240), Qt::blue);
+        QVERIFY(Test::waylandSync());
+    }
     QVERIFY(!toplevel->hasPendingNativeGeometry());
     const QRectF frame = window->frameGeometry();
-    QCOMPARE(frame.size(), before.size());
     if (anchored) {
+        QCOMPARE(frame.size(), before.size());
         QCOMPARE(frame.x() + frame.width(), request.x() + request.width());
         QCOMPARE(frame.y() + frame.height(), request.y() + request.height());
         QVERIFY(frame.x() != request.x());
     } else {
-        QVERIFY2(exactFrame(frame, image), frameText(frame).constData());
+        QCOMPARE(frame.topLeft(), request.topLeft());
+        QVERIFY(frame != request);
     }
-    if (synchronized) {
-        QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
-        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(frame.center()));
-    } else {
-        QVERIFY2(exactFrame(window->moveResizeGeometry(), request), frameText(window->moveResizeGeometry()).constData());
-        QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(request.center()));
-        QVERIFY(window->moveResizeOutput() != workspace()->outputAt(frame.center()));
+    // Settled: what is published is what is requested, on the output the frame is on.
+    QVERIFY2(exactFrame(window->moveResizeGeometry(), frame), frameText(window->moveResizeGeometry()).constData());
+    QCOMPARE(window->moveResizeOutput(), workspace()->outputAt(frame.center()));
+    QCOMPARE(window->nextTargetScale(), window->moveResizeOutput()->scale());
+    if (crosses) {
+        QCOMPARE(window->moveResizeOutput(), first);
     }
 }
 
