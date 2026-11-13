@@ -130,6 +130,12 @@ public:
     QString windowBinding(const QUuid &window) const;
     // Called at QObject destruction, not before the window's close callbacks.
     bool forgetWindow(const QUuid &window);
+    // The memory's image of a native frame: x, y, width and height each rounded to a whole
+    // logical pixel, a half rounding up - the rule the provider records under (the placement
+    // script's Math.round). The memory holds whole pixels by contract and a native frame on a
+    // fractional-scale output need not be whole, so a reservation is made with the image of the
+    // floating frame; the frame itself would be refused, or would never equal its own entry.
+    static QRectF memoryFrame(const QRectF &frame);
     Result record(const QUuid &provider, quint64 revision, const Update &update);
     Result reserve(const QUuid &provider, const ReservationRequest &request);
     Result activateReservation(const QUuid &provider, const QUuid &window, const QString &generation);

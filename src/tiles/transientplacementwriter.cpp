@@ -190,6 +190,17 @@ bool TransientPlacementWriter::forgetWindow(const QUuid &window)
     return true;
 }
 
+QRectF TransientPlacementWriter::memoryFrame(const QRectF &frame)
+{
+    // The fractional part of a double is exact, so a half is decided on it: value + 0.5 would
+    // carry the largest double below a half up to one.
+    const auto round = [](qreal value) {
+        const qreal whole = std::floor(value);
+        return value - whole >= 0.5 ? whole + 1 : whole;
+    };
+    return QRectF(round(frame.x()), round(frame.y()), round(frame.width()), round(frame.height()));
+}
+
 TransientPlacementWriter::Result TransientPlacementWriter::record(const QUuid &provider, quint64 revision, const Update &update)
 {
     if (m_busy) {

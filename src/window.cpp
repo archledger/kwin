@@ -5060,13 +5060,17 @@ quint64 Window::prepareTransientOwnership(TransientPlacementWriter *writer, cons
     request->m_ownerGeneration = generation;
     request->m_sequence = 0;
     auto ownership = std::make_unique<TransientOwnership>(writer, provider, providerRevision, generation, std::move(request));
-    const auto result = writer->reserve(provider, {internalId(), QString::number(generation), ownership->floating, providerRevision, mapRevision, key});
+    // The writer holds whole logical pixels: the reservation is made with the memory's image of
+    // the floating frame. The exact frame stays in the ownership, for the native restore.
+    const auto result = writer->reserve(provider, {internalId(), QString::number(generation), TransientPlacementWriter::memoryFrame(ownership->floating), providerRevision, mapRevision, key});
     if (result != TransientPlacementWriter::Result::Accepted) {
         return 0;
     }
     // QObject::destroyed runs after Window's fields have gone: capture no Window state here.
     ownership->closeCleanup = connect(this, &QObject::destroyed, writer, [writer, id = internalId()]() {
-        if (!writer->forgetWindow(id)) {
+        // Whoever tracked the window may have bound its record to the window's lifetime itself
+        // (the scripting facade does) and removed it first.
+        if (!writer->forgetWindow(id) && !writer->windowBinding(id).isEmpty()) {
             qCWarning(KWIN_CORE) << "Failed to remove transient placement tracking for" << id;
         }
     });
