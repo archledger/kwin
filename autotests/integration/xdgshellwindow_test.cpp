@@ -402,6 +402,7 @@ private Q_SLOTS:
     void testTransientTilingFacadeFractionalScale();
     void testTransientTilingFacadeClosedSibling();
     void testTransientTilingFacadeMasterClosed();
+    void testTransientTilingFacadeRestoreAfterProviderRetired();
     void testTransientTilingFacadeScales_data();
     void testTransientTilingFacadeScales();
     void testTransientTilingFacadeBordersChangeWhenTiled();
@@ -8042,6 +8043,9 @@ void TestXdgShellWindow::testRestoreCompletion_data()
     QTest::newRow("published-position-only-completes") << 5;
     QTest::newRow("completes-after-controller-destroyed") << 6;
     QTest::newRow("key-released-for-second-window") << 7;
+    QTest::newRow("completes-after-provider-retired") << 8;
+    QTest::newRow("completes-after-provider-replaced") << 9;
+    QTest::newRow("published-completes-after-provider-retired") << 10;
 }
 
 void TestXdgShellWindow::testRestoreCompletion()
@@ -8051,7 +8055,7 @@ void TestXdgShellWindow::testRestoreCompletion()
     // restoring reservation completes. A superseded configure's late acknowledgement, a
     // cancelled attempt's configure, or no acknowledgement at all never completes anything.
     QFETCH(int, scenario);
-    const bool positionOnly = scenario == 5;
+    const bool positionOnly = scenario == 5 || scenario == 10;
     std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
     std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
     shell->set_app_id(QStringLiteral("org.example.restore-completion"));
@@ -8067,8 +8071,8 @@ void TestXdgShellWindow::testRestoreCompletion()
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
-    QObject provider;
-    const auto token = writer.registerProvider(&provider);
+    auto provider = std::make_unique<QObject>();
+    const auto token = writer.registerProvider(provider.get());
     const auto id = window->internalId();
     const auto key = QStringLiteral("org.example.restore-completion");
     QVERIFY(writer.trackWindow(id, key));
@@ -8114,6 +8118,17 @@ void TestXdgShellWindow::testRestoreCompletion()
         QVERIFY(window->m_transientOwnership->restoreAttempt);
         QVERIFY(window->m_transientOwnership->restoreAttempt->publishedWithoutConfigure);
         QVERIFY(writer.isReserved(id));
+        if (scenario == 10) {
+            // Row 8's retirement for the configure-less shape: the provider goes between the
+            // synchronous publication and the client's plain commit, which still completes it.
+            QVERIFY(window->m_transientOwnership->restoreAttempt->requestReturned);
+            controller.reset();
+            provider.reset();
+            QCoreApplication::processEvents(); // the writer's queued providerRetired
+            QVERIFY(!writer.isProviderRegistered(token));
+            QCOMPARE(window->settleReleasedTransientOwnership(token), Window::TransientSettleResult::NotReleased);
+            QCOMPARE(QRectF(window->transientFloatingFrame()), QRectF(floating));
+        }
         Test::render(surface.get(), managed.size().toSize(), Qt::green);
         QVERIFY(Test::waylandSync());
         QVERIFY(!window->m_transientOwnership);
@@ -8146,6 +8161,37 @@ void TestXdgShellWindow::testRestoreCompletion()
         // placement key for the next window of the same app.
         controller.reset();
     }
+    std::unique_ptr<QObject> replacement;
+    if (scenario == 8 || scenario == 9) {
+        // The policy that asked for the restore goes before the client answers it, as the
+        // placement script does when it is unloaded during a session (its teardown ends the
+        // session with the restore and the tree's release, then the script and with it the
+        // provider are destroyed; plasma-fusion#174). The request was made and returned while
+        // the provider was current: the restoration is the client's to answer, its target is
+        // the record's own floating frame, and the writer keeps the restoring reservation.
+        // It completes as any other: the floating frame with its position, the record and the
+        // reservation cleared. A replacement provider (a reloaded script) changes nothing.
+        QCOMPARE(window->m_transientOwnership->restoreAttempt->stage, Window::TransientRestoreStage::Returned);
+        QVERIFY(window->m_transientOwnership->restoreAttempt->requestReturned);
+        controller.reset();
+        provider.reset();
+        QCoreApplication::processEvents(); // the writer's queued providerRetired
+        QVERIFY(!writer.isProviderRegistered(token));
+        QUuid replacementToken;
+        if (scenario == 9) {
+            replacement = std::make_unique<QObject>();
+            replacementToken = writer.registerProvider(replacement.get());
+            QVERIFY(!replacementToken.isNull());
+        }
+        QVERIFY(writer.isReserved(id));
+        // The restoration is still live: a settle is refused as such (not as a stale provider),
+        // and the record's floating frame is the restoration's exact target.
+        QCOMPARE(window->settleReleasedTransientOwnership(token), Window::TransientSettleResult::NotReleased);
+        if (scenario == 9) {
+            QCOMPARE(window->settleReleasedTransientOwnership(replacementToken), Window::TransientSettleResult::NotReleased);
+        }
+        QCOMPARE(QRectF(window->transientFloatingFrame()), original);
+    }
     if (scenario == 2) {
         // An older configure (the admission tile configure's serial is long consumed; use the
         // maximize configure replayed through the event list as rows 16/37 do) acknowledged and
@@ -8173,7 +8219,7 @@ void TestXdgShellWindow::testRestoreCompletion()
     shell->xdgSurface()->ack_configure(restoreSerial);
     Test::render(surface.get(), original.size().toSize(), Qt::green);
     QVERIFY(Test::waylandSync());
-    if (scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7) {
+    if (scenario == 0 || scenario == 4 || scenario == 6 || scenario == 7 || scenario == 8 || scenario == 9) {
         // The qualifying commit completed the restoration: the record cleared and the writer's
         // restoring reservation completed with it.
         QVERIFY(!window->m_transientOwnership);
@@ -11319,6 +11365,99 @@ void TestXdgShellWindow::testTransientTilingFacadeMasterClosed()
     QTRY_VERIFY(!facade.hasTree());
     QVERIFY(!treeChanged.isEmpty());
     QCOMPARE(facade.generation(), 0);
+}
+
+void TestXdgShellWindow::testTransientTilingFacadeRestoreAfterProviderRetired()
+{
+    // plasma-fusion#174 through the facade, as the placement script's teardown goes: the
+    // master's explicit restore and the tree's release, then the script and with it its
+    // provider are destroyed, and a reloaded script registers a new one - all before the client
+    // answers the restore. The answer lands the window on its floating frame and completes the
+    // record, so the new provider can tile the window again. Before, the window kept the tile's
+    // position with the floating size and every admission answered busy until it closed.
+    const TilingFacade facade;
+    QVERIFY(facade.api);
+    QVERIFY(!facade.hasTree());
+    const auto releaseTree = qScopeGuard([&]() {
+        if (facade.hasTree()) {
+            facade.releaseTile(facade.generation());
+        }
+    });
+    const QString key = QStringLiteral("org.example.facade.retired");
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shell(Test::createXdgToplevelSurface(surface.get()));
+    shell->set_app_id(key);
+    QSignalSpy configure(shell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QSignalSpy toplevelConfigure(shell.get(), &Test::XdgToplevel::configureRequested);
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(window);
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QVERIFY(Test::waylandSync());
+    const QRectF floating = window->frameGeometry();
+    auto provider = std::make_unique<QObject>();
+    const QString token = facade.registerProvider(provider.get());
+    QVERIFY(!token.isEmpty());
+    QVERIFY(facade.trackWindow(window));
+    QCOMPARE(facade.record(token, 1, window, scriptRecord(floating), 1), int(TransientPlacementWriter::Result::Accepted));
+    auto output = window->moveResizeOutput();
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    const QVariantMap tree = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(tree.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    const int generation = tree.value(QStringLiteral("generation")).toInt();
+    QCOMPARE(facade.admitTile(generation, window, token), int(TransientTileController::Result::Accepted));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    configure.clear();
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->tile());
+    QVERIFY(QRectF(window->frameGeometry()) != floating);
+
+    // The script's teardown: the restore, then at once the tree's release (with the event loop
+    // run in between, the facade would end the vacated tree itself, queued).
+    QVERIFY(facade.restoreWindow(window));
+    QCOMPARE(facade.releaseTile(generation), int(TransientTileController::Result::Accepted));
+    QVERIFY(!facade.hasTree());
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    const quint32 restoreSerial = configure.last().at(0).toUInt();
+    const QSize restoreSize = toplevelConfigure.last().at(0).value<QSize>();
+    // The script goes, and a reloaded one registers.
+    provider.reset();
+    QCoreApplication::processEvents(); // the writer's queued providerRetired
+    QObject replacement;
+    const QString replacementToken = facade.registerProvider(&replacement);
+    QVERIFY(!replacementToken.isEmpty());
+    QVERIFY(replacementToken != token);
+    // Still in flight: the restoration holds the record, so a settle answers that it is not
+    // released, and the new provider cannot take the window over.
+    QCOMPARE(facade.settleWindow(window, replacementToken), int(Window::TransientSettleResult::NotReleased));
+    QCOMPARE(facade.floatingFrame(window), floating);
+    const QVariantMap early = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(early.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(early.value(QStringLiteral("generation")).toInt(), window, replacementToken), int(TransientTileController::Result::Busy));
+    QCOMPARE(facade.releaseTile(early.value(QStringLiteral("generation")).toInt()), int(TransientTileController::Result::Accepted));
+
+    // The client answers the restore.
+    shell->xdgSurface()->ack_configure(restoreSerial);
+    Test::render(surface.get(), restoreSize, Qt::green);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), floating);
+    QVERIFY(!window->m_transientOwnership);
+    QCOMPARE(facade.floatingFrame(window), QRectF());
+
+    // The new provider tiles the window again.
+    configure.clear();
+    const QVariantMap again = facade.createTile(output, desktop, QRectF(0, 0, 0.5, 1));
+    QCOMPARE(again.value(QStringLiteral("result")).toInt(), int(TransientTileController::Result::Accepted));
+    QCOMPARE(facade.admitTile(again.value(QStringLiteral("generation")).toInt(), window, replacementToken), int(TransientTileController::Result::Accepted));
+    QVERIFY(!configure.isEmpty() || configure.wait());
+    shell->xdgSurface()->ack_configure(configure.last().at(0).toUInt());
+    Test::render(surface.get(), toplevelConfigure.last().at(0).value<QSize>(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(window->tile());
 }
 
 void TestXdgShellWindow::testTransientTilingFacadeKeyConflict()
@@ -15076,6 +15215,9 @@ void TestXdgShellWindow::testTransientConfigurePlacement_data()
     QTest::newRow("ambiguous-ack-content-lineage") << 24;
     QTest::newRow("wrapped-admission-before-new-request") << 25;
     QTest::newRow("wrapped-restore-before-new-request") << 26;
+    QTest::newRow("manual-resize-after-provider-retired") << 27;
+    QTest::newRow("manual-move-after-provider-retired") << 28;
+    QTest::newRow("infeasible-after-provider-retired") << 29;
 }
 
 void TestXdgShellWindow::testTransientConfigurePlacement()
@@ -15174,7 +15316,27 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     }
     const RectF manual(90, 120, 300, 200);
     std::unique_ptr<Window::TransientOwnership> heldOwnership;
-    if (scenario == 2 || scenario == 8 || scenario == 9 || scenario == 25 || scenario == 26) {
+    if (scenario == 27 || scenario == 28 || scenario == 29) {
+        // Row 10's retirement, then what still stops the restoration with the provider gone: a
+        // newer manual resize (as row 2) or move (as row 3), or a state that no longer admits A
+        // with no request at all - the client's minimum size grown past A's width, which only
+        // the attempt's own state check sees. The configure is not placed and the record stays.
+        provider.reset();
+        QCoreApplication::processEvents(); // the writer's queued providerRetired
+        QVERIFY(!writer.isProviderRegistered(token));
+        QVERIFY(window->m_transientOwnership->restoreAttempt->requestReturned);
+    }
+    if (scenario == 29) {
+        shell->set_min_size(int(original.width()) + 100, 0);
+        surface->commit(KWayland::Client::Surface::CommitFlag::None);
+        QVERIFY(Test::waylandSync());
+        QVERIFY(window->minSize().width() > original.width());
+        QVERIFY(!window->m_transientOwnership->restoreAttempt->cancelled);
+        // Not current any more by the attempt's own state check alone, which the exception does
+        // not skip: a settle finds no live restoration and answers as to a stale provider.
+        QCOMPARE(window->settleReleasedTransientOwnership(token), Window::TransientSettleResult::StaleProvider);
+    }
+    if (scenario == 2 || scenario == 8 || scenario == 9 || scenario == 25 || scenario == 26 || scenario == 27) {
         configure.clear();
         window->moveResize(manual);
         QVERIFY(!configure.isEmpty() || configure.wait());
@@ -15187,9 +15349,15 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
         if (scenario == 8 || scenario == 9) {
             serial = configure.last().at(0).value<quint32>();
         }
-    } else if (scenario == 3) {
+    } else if (scenario == 3 || scenario == 28) {
         window->move(manual.topLeft());
     } else if (scenario == 10) {
+        // The provider goes after its restoration's request returned and before the client
+        // answers it (the placement script unloaded during a session, plasma-fusion#174). The
+        // restoration stays current: its configure places A and completes the record, as row
+        // 11's does after the tree is gone. A retirement while the request is being made still
+        // supersedes it (testTransientRestoreRequest, provider-first-callback and
+        // provider-final-callback).
         provider.reset();
     } else if (scenario == 11) {
         delete root.data();
@@ -15214,7 +15382,7 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     } else if (scenario == 24) {
         xdg->m_configureEvents.append(new XdgToplevelConfigure(*static_cast<XdgToplevelConfigure *>(xdg->m_configureEvents.last())));
     }
-    if (scenario == 2 || scenario == 3 || scenario == 8 || scenario == 9 || scenario == 25 || scenario == 26) {
+    if (scenario == 2 || scenario == 3 || scenario == 8 || scenario == 9 || scenario == 25 || scenario == 26 || scenario == 27 || scenario == 28) {
         QCOMPARE(window->m_geometryRequestOrigin.kind, Window::GeometryRequestOrigin::Kind::Ordinary);
     }
     Window::GeometryRequestOrigin expectedContentOrigin;
@@ -15247,7 +15415,7 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     if (scenario == 5) {
         content += QSize(20, 10);
     }
-    if (scenario == 5 || scenario == 6 || scenario == 7 || scenario == 11) {
+    if (scenario == 5 || scenario == 6 || scenario == 7 || scenario == 10 || scenario == 11) {
         expectedOrigin = original.topLeft();
     } else if (scenario == 8 || scenario == 9) {
         content = manual.size().toSize() + QSize(20, 10);
@@ -15377,12 +15545,12 @@ void TestXdgShellWindow::testTransientConfigurePlacement()
     if (scenario == 23) {
         window->finishInteractiveMoveResize(false);
     }
-    // Rows 5, 6, 7 and 11 commit the current restoration's own configure with placement
+    // Rows 5, 6, 7, 10 and 11 commit the current restoration's own configure with placement
     // authority at the shared block, and rows 1 and 13 publish configure-less restorations
     // whose client's next commit settles them: both boundaries complete the restoration and
     // clear the record with its reservation (testRestoreCompletion owns the contracts). Every
     // other row - including row 16's later in-flight claim - keeps the pending record below.
-    const bool completed = scenario == 1 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 11 || scenario == 13;
+    const bool completed = scenario == 1 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 10 || scenario == 11 || scenario == 13;
     QCOMPARE(bool(window->m_transientOwnership), !completed);
     if (!completed) {
         QCOMPARE(window->m_transientOwnership->generation, owner);
