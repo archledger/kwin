@@ -68,6 +68,18 @@ bool exactFrameGeometry(const RectF &left, const RectF &right)
     return left.x() == right.x() && left.y() == right.y() && left.width() == right.width() && left.height() == right.height();
 }
 
+// The same frame up to the arithmetic's last bits. Where an output's pixel is not a binary
+// fraction (125%, 150%), the frame a commit publishes and the rectangle that was asked for can
+// differ there; frames that are different on any output differ by far more. The tolerance is
+// in logical pixels (the comparison knows no output), below a thousandth of one.
+bool sameFrameGeometry(const RectF &left, const RectF &right)
+{
+    const auto same = [](qreal a, qreal b) {
+        return std::abs(a - b) < 1.0 / 1024;
+    };
+    return same(left.x(), right.x()) && same(left.y(), right.y()) && same(left.width(), right.width()) && same(left.height(), right.height());
+}
+
 quint64 nextAssociationChange(quint64 current)
 {
     // Saturate rather than allowing an old pending notification to match a wrapped identity.
@@ -1078,6 +1090,7 @@ bool Window::startInteractiveMoveResize()
     m_interactiveMoveResize.initialMaximizeMode = requestedMaximizeMode();
     m_interactiveMoveResize.initialQuickTileMode = requestedQuickTileMode();
     m_interactiveMoveResize.initialGeometryRestore = geometryRestore();
+    m_interactiveMoveResize.stepped = false;
 
     updateElectricGeometryRestore();
     performDelayedRaise();
@@ -1129,6 +1142,14 @@ void Window::finishInteractiveMoveResize(bool cancel)
     workspace()->outline()->hide();
 
     m_interactiveMoveResize.counter++;
+    if (!cancel && m_interactiveMoveResize.stepped && m_transientOwnership
+        && m_transientOwnership->phase == TransientOwnershipPhase::Restoring) {
+        // The operation's own first request released the record; where it ended is the place
+        // the user chose, for as long as no later request moves the window. A cancelled one
+        // put the window back, and one that moved nothing (a press held and released on a
+        // window an earlier release left on an automatic rectangle) chose no place.
+        m_transientOwnership->placedByUser = m_geometryRequestGeneration;
+    }
     Q_EMIT interactiveMoveResizeFinished();
 }
 
@@ -1223,6 +1244,7 @@ void Window::updateInteractiveMoveResize(const QPointF &global, Qt::KeyboardModi
                 }
             }
 
+            m_interactiveMoveResize.stepped = true;
             doInteractiveResizeSync(nextMoveResizeGeom);
             Q_EMIT interactiveMoveResizeStepped(nextMoveResizeGeom);
         }
@@ -1254,6 +1276,7 @@ void Window::updateInteractiveMoveResize(const QPointF &global, Qt::KeyboardModi
                 }
             }
 
+            m_interactiveMoveResize.stepped = true;
             move(nextMoveResizeGeom.topLeft());
             Q_EMIT interactiveMoveResizeStepped(nextMoveResizeGeom);
         }
@@ -4959,7 +4982,8 @@ Window::TransientTileRequest::TransientTileRequest(Window *window, Tile *tile, q
     , m_initialGeometryGeneration(window ? window->geometryRequestGeneration() : 0)
 {
     if (m_tile && m_manager && m_output && m_desktop) {
-        m_target = m_tile->windowGeometry();
+        // The window's frame in the tile: the tile's rectangle where the window reaches it.
+        m_target = window ? window->transientTileFrame(m_tile->windowGeometry()) : m_tile->windowGeometry();
     }
 }
 
@@ -5245,6 +5269,78 @@ Window::TransientRestoreConsumption Window::consumeExplicitUntileOrRestore()
         return TransientRestoreConsumption::RestoreStarted;
     }
     return TransientRestoreConsumption::RestoreStopped;
+}
+
+Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUuid &provider)
+{
+    if (isDeleted() || !m_transientOwnership) {
+        return TransientSettleResult::NotReleased;
+    }
+    const auto &ownership = *m_transientOwnership;
+    const auto generation = ownership.generation;
+    // A released record whose tile request was made; a live restoration completes at its own
+    // boundary (completeTransientRestoration), a superseded or cancelled one never does.
+    if (ownership.phase != TransientOwnershipPhase::Restoring || ownership.releasing || ownership.executing
+        || ownership.request || m_activeTransientRequest || m_requestedTransientTileGeneration
+        || ownership.progress != TransientRequestProgress::Requested
+        || (ownership.restoreAttempt && transientRestoreAttemptIsCurrent(generation, ownership.restoreAttempt->sequence))) {
+        return TransientSettleResult::NotReleased;
+    }
+    if (provider.isNull() || provider != ownership.provider || !ownership.writer || !ownership.writer->isProviderRegistered(provider)
+        || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
+        return TransientSettleResult::StaleProvider;
+    }
+    // A maximized, full-screen or tiled window returns to the frame it had before, which for a
+    // released window is the automatic rectangle: its record waits for the ordinary state.
+    if (m_requestedTile || m_tile || !isTransientGeometrySettled()) {
+        return TransientSettleResult::Unsettled;
+    }
+    // Positive evidence only. The rectangle recorded at the admission is not the only
+    // automatic one a released window can stand on: a work-area re-check releases the window
+    // with a public request for the tile's rectangle as it is then, and a transfer to another
+    // output carries the tile's size along. The record ends on the floating frame, or where
+    // the user's own move or resize left the window.
+    // On an output of another scale than the one the floating frame was taken on, the
+    // window stands on that frame where it stands on its image there.
+    const RectF frame = frameGeometry();
+    const bool onFloating = sameFrameGeometry(frame, ownership.floating) || sameFrameGeometry(frame, transientFloatingImage(ownership.floating));
+    // The user's placement is evidence only while it is the window's last request: a later
+    // one (the workspace's re-check, a script's) has put the window somewhere nobody chose.
+    const bool placedByUser = ownership.placedByUser && *ownership.placedByUser == m_geometryRequestGeneration
+        && !sameFrameGeometry(frame, ownership.target);
+    if (!onFloating && !placedByUser) {
+        return TransientSettleResult::AtManagedRectangle;
+    }
+    if (ownership.writer->completeRestore(internalId(), QString::number(generation)) != TransientPlacementWriter::Result::Accepted) {
+        return TransientSettleResult::Refused;
+    }
+    ref();
+    const auto lifetime = qScopeGuard([this]() {
+        unref();
+    });
+    // As after a completed restoration, the close cleanup stays connected: the writer forgets
+    // the tracked window at its destruction.
+    m_transientOwnership.reset();
+    Q_EMIT transientReleaseSettled(QRectF(frame));
+    return TransientSettleResult::Settled;
+}
+
+RectF Window::transientFloatingFrame() const
+{
+    if (!m_transientOwnership) {
+        return RectF();
+    }
+    // An owned record's frame is the restoration's exact target, and so is a live
+    // restoration's. Only a released record is returned by the policy's own request.
+    const auto &ownership = *m_transientOwnership;
+    const bool released = ownership.phase == TransientOwnershipPhase::Restoring
+        && !(ownership.restoreAttempt && transientRestoreAttemptIsCurrent(ownership.generation, ownership.restoreAttempt->sequence));
+    return released ? transientFloatingImage(ownership.floating) : ownership.floating;
+}
+
+RectF Window::transientFloatingImage(const RectF &floating) const
+{
+    return floating;
 }
 
 Window::TransientRestoreClaim Window::claimTransientRestoreWithMaximizeNormalization(quint64 generation)
@@ -5722,9 +5818,24 @@ bool Window::canStartTransientRestoreRequest(const RectF &target) const
     return false;
 }
 
+bool Window::isTransientGeometrySettled() const
+{
+    return false;
+}
+
 bool Window::isTransientTileTargetFeasible(const RectF &target) const
 {
     return false;
+}
+
+RectF Window::transientTileFrame(const RectF &tile) const
+{
+    return tile;
+}
+
+bool Window::isTransientTileFrame(const RectF &frame, const RectF &tile) const
+{
+    return exactFrameGeometry(frame, transientTileFrame(tile));
 }
 
 bool Window::transientRequestTargetIsCurrent(const TransientTileRequest &request) const
@@ -5738,7 +5849,7 @@ bool Window::transientRequestTargetIsCurrent(const TransientTileRequest &request
         || moveResizeOutput() != request.m_output || !request.m_tile->isActive() || !isOnDesktop(request.m_desktop)) {
         return false;
     }
-    return exactFrameGeometry(request.m_target, request.m_tile->windowGeometry())
+    return isTransientTileFrame(request.m_target, request.m_tile->windowGeometry())
         && request.m_output->geometryF().contains(request.m_target)
         && isTransientTileTargetFeasible(request.m_target);
 }
@@ -6092,10 +6203,17 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
         moveResize(ensureSpecialStateGeometry(decision.geometry));
         setFullscreenGeometryRestore(moveToArea(m_fullscreenGeometryRestore, decision.oldScreenArea, decision.screenArea));
         setGeometryRestore(moveToArea(m_maximizeGeometryRestore, decision.oldScreenArea, decision.screenArea));
-        return;
+        break;
     case WorkspacePositionDecision::Kind::Geometry:
         moveResize(decision.geometry);
-        return;
+        break;
+    }
+    // A released record's floating frame follows the window's screen as the restore fields
+    // above do, and as it does on a transfer (sendToOutput): an output that was removed or
+    // resized takes its coordinates with it, and a floating frame left on them is one the
+    // policy could never return the window to. Untouched while the screen is the same.
+    if (!isDeleted() && decision.oldScreenArea != decision.screenArea && decision.oldScreenArea.isValid() && decision.screenArea.isValid()) {
+        rebaseTransientFloatingOnOutputTransfer(decision.oldScreenArea, decision.screenArea);
     }
 }
 

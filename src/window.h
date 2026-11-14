@@ -1415,6 +1415,43 @@ public:
     };
     TransientRestoreConsumption consumeExplicitUntileOrRestore();
     /**
+     * The end of a released record that no explicit restoration will complete. A release that
+     * is not the explicit restore is detach-only: the window stays where it stands and its
+     * record (Restoring) keeps the automatic rectangle out of the placement memory. The policy
+     * that admitted the window ends that record once the window stands on a frame that is
+     * known not to be automatic: its floating frame (the policy's own ordinary request for
+     * transientFloatingFrame(), or the compositor's replay of it), or where the user's own
+     * interactive move or resize left it and no later request has moved it. Any other frame
+     * can be an automatic rectangle (the
+     * tile's frame the window was admitted to, the tile's rectangle a work-area re-check asks
+     * for as it releases the window, either of them carried to another output) and is
+     * answered AtManagedRectangle. Settled only for the provider that admitted the window
+     * (StaleProvider otherwise, also when the writer no longer holds the record's
+     * reservation), with no live restoration (NotReleased), in an ordinary mode outside
+     * every tile and with the native geometry settled: nothing scheduled, sent or
+     * acknowledged, the frame the requested geometry (Unsettled otherwise). Every answer but
+     * Settled changes nothing. The writer finalizes as it does for a completed restoration:
+     * a deferred update for the key is applied, else the entry stays.
+     */
+    enum class TransientSettleResult {
+        Settled,
+        NotReleased,
+        StaleProvider,
+        Unsettled,
+        AtManagedRectangle,
+        Refused,
+    };
+    TransientSettleResult settleReleasedTransientOwnership(const QUuid &provider);
+    /**
+     * The floating frame of this window's transient record. Of an owned record: where an
+     * explicit restoration returns the window, exactly. Of a released one: that frame,
+     * carried along when the window was sent to another output or its output went, as the
+     * window takes it on the output it is on now (transientFloatingImage()) - the rectangle
+     * the policy asks for to return the window, and on which the record settles. Null
+     * without a record.
+     */
+    RectF transientFloatingFrame() const;
+    /**
      * NT04's read-only state/completion contract. The state query reflects the native record
      * only - no protocol logging and no timeout participates - for the placement policy that
      * must leave a restoring window alone. A suppressed (cancelled) record still holds its
@@ -1807,6 +1844,7 @@ Q_SIGNALS:
     void readyForPaintingChanged();
     void maximizeGeometryRestoreChanged();
     void transientRestorationCompleted(const QRectF &restoredFrame);
+    void transientReleaseSettled(const QRectF &frame);
     void fullscreenGeometryRestoreChanged();
     void offscreenRenderingChanged();
     void targetScaleChanged();
@@ -2182,6 +2220,14 @@ private:
         bool releasing = false;
         bool releaseWriterReady = false;
         bool committed = false;
+        // A released record's window was moved or resized by the user's own interactive
+        // operation, which ended without being cancelled: the window's geometry request
+        // generation at that end. An operation that moved nothing leaves no mark. While the
+        // generation is still the window's, where the window stands is
+        // the user's placement, not an automatic rectangle; any later request (the
+        // workspace's re-check, a script's) makes the evidence stale
+        // (settleReleasedTransientOwnership).
+        std::optional<quint64> placedByUser;
         QMetaObject::Connection closeCleanup;
         std::shared_ptr<const TransientNoRequestProof> noRequestProof;
         std::unique_ptr<TransientTileRequest> request;
@@ -2405,8 +2451,40 @@ protected:
     quint64 requestedTransientTileGeneration() const;
     void commitTileFromConfigure(Tile *tile, quint64 transientGeneration);
     virtual bool canStartTransientTileRequest(const RectF &target) const;
+    // Nothing of the native geometry is in flight and the frame is the requested geometry.
+    virtual bool isTransientGeometrySettled() const;
     virtual bool canStartTransientRestoreRequest(const RectF &target) const;
     virtual bool isTransientTileTargetFeasible(const RectF &target) const;
+    /**
+     * The frame this window takes in a transient tile. A tile's rectangle is whole logical
+     * pixels; a frame is on the output's device pixels over a client size on the client's own
+     * grid, and at a fractional scale most whole rectangles are neither. The window takes the
+     * tile's top-left corner and the largest size it reaches inside the tile, which is the
+     * rectangle itself where that is reachable. A rectangle nothing inside which is reachable
+     * is returned as it is, and refused where its feasibility is checked.
+     */
+    virtual RectF transientTileFrame(const RectF &tile) const;
+    /**
+     * Whether @p frame is a frame this window takes in a tile of rectangle @p tile: the one
+     * transientTileFrame() gives now, or one it gave under other borders. A decoration that
+     * changes its borders when its window is tiled changes, in the middle of the admission,
+     * which sizes the client reaches; the request's frame is then still at the tile's corner
+     * and inside the tile, short of it by no more than a fit ever is. Reachability is the
+     * caller's separate check (isTransientTileTargetFeasible).
+     */
+    virtual bool isTransientTileFrame(const RectF &frame, const RectF &tile) const;
+    /**
+     * The frame a request for a transient record's floating frame gives this window on the
+     * output it is on now. The floating frame was a frame of the window where it was taken.
+     * Carried to an output of another scale (sendToOutput, a removed output) its size is not
+     * on the pixels there and the window cannot take it: a request for it ends with the
+     * frame and the requested geometry on its image, which is not the floating frame, so a
+     * released window asked for it stands on a rectangle nothing vouches for, however often
+     * it is asked. This is @p floating where the window reaches it, and otherwise its corner
+     * with its size taken to this output's pixels and to the client's grid and back, as a
+     * request and its commit take it.
+     */
+    virtual RectF transientFloatingImage(const RectF &floating) const;
     // Backend hooks of requestMoveResizeForAssignment(). Support is consulted before any mutation;
     // a dispatcher reports what it staged or published through the stack-bound request.
     virtual bool supportsAssignmentGeometryRequest() const;
@@ -2720,6 +2798,9 @@ protected:
         RectF initialScreenArea;
         QTimer *delayedTimer = nullptr;
         uint32_t counter = 0;
+        // Whether the operation has moved or resized the window: one that started and ended
+        // where the window stood (a press on the title bar held and released) chose no place.
+        bool stepped = false;
         MaximizeMode initialMaximizeMode;
         QuickTileMode initialQuickTileMode;
     } m_interactiveMoveResize;

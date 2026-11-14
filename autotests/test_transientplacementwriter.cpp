@@ -40,6 +40,8 @@ private Q_SLOTS:
     void reservationRequiresExactPersistedFrame();
     void memoryFrameIsTheProvidersWholePixelImage();
     void deferredManualWinnerSurvivesCompletion();
+    void restoredFrameDoesNotReplaceASiblingsUpdate_data();
+    void restoredFrameDoesNotReplaceASiblingsUpdate();
     void failedFlushIsNotRetriedByDestructor();
     void failedReservationDoesNotHoldKey();
     void duplicateGlobalKeyRefusesReservation();
@@ -290,6 +292,66 @@ void TransientPlacementWriterTest::deferredManualWinnerSurvivesCompletion()
     QCOMPARE(reopened.snapshot().entries.value(QStringLiteral("app")), manual);
     QCOMPARE(writer.record(token, 5, {owner, later, 32, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
     QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), later);
+}
+
+void TransientPlacementWriterTest::restoredFrameDoesNotReplaceASiblingsUpdate_data()
+{
+    QTest::addColumn<int>("order");
+    QTest::addColumn<bool>("destroyed");
+    QTest::newRow("restored-frame-after-the-sibling") << 0 << false;
+    QTest::newRow("restored-frame-after-the-sibling, owner destroyed") << 0 << true;
+    QTest::newRow("sibling-after-the-restored-frame") << 1 << false;
+    QTest::newRow("owner-moved-by-hand-after-the-sibling") << 2 << false;
+}
+
+void TransientPlacementWriterTest::restoredFrameDoesNotReplaceASiblingsUpdate()
+{
+    // While the owner restores, the key has one deferred slot. A sibling's manual update in it
+    // is the user's newer placement; the owner's own record of the frame it is restored to (the
+    // reservation's frame, which the provider re-records when it lands) is not, and must not
+    // take the slot from it whatever its sequence. A frame the released owner was moved to by
+    // hand is a manual update like any other: the latest wins.
+    QFETCH(int, order);
+    QFETCH(bool, destroyed);
+    using Result = TransientPlacementWriter::Result;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto owner = QUuid::createUuid();
+    const auto sibling = QUuid::createUuid();
+    const QRectF original(73, 91, 430, 310);
+    const QRectF manual(200, 100, 600, 400);
+    const QRectF moved(260, 140, 500, 380);
+    QVERIFY(writer.trackWindow(owner, QStringLiteral("app")));
+    QCOMPARE(writer.record(token, 1, {owner, original, 1, TransientPlacementWriter::Origin::Manual}), Result::Accepted);
+    QCOMPARE(writer.reserve(token, reservation(writer, owner, original)), Result::Accepted);
+    QCOMPARE(writer.activateReservation(token, owner, QStringLiteral("generation-1")), Result::Accepted);
+    QCOMPARE(writer.beginRestore(owner, QStringLiteral("generation-1")), Result::Accepted);
+    QVERIFY(writer.trackWindow(sibling, QStringLiteral("app")));
+    QRectF expected;
+    if (order == 0) {
+        QCOMPARE(writer.record(token, 2, {sibling, manual, 20, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        QCOMPARE(writer.record(token, 3, {owner, original, 30, TransientPlacementWriter::Origin::Manual}), Result::Suppressed);
+        expected = manual;
+    } else if (order == 1) {
+        QCOMPARE(writer.record(token, 2, {owner, original, 20, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        QCOMPARE(writer.record(token, 3, {sibling, manual, 30, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        expected = manual;
+    } else {
+        QCOMPARE(writer.record(token, 2, {sibling, manual, 20, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        QCOMPARE(writer.record(token, 3, {owner, moved, 30, TransientPlacementWriter::Origin::Manual}), Result::Deferred);
+        expected = moved;
+    }
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), original);
+    if (destroyed) {
+        QVERIFY(writer.forgetWindow(owner));
+    } else {
+        QCOMPARE(writer.completeRestore(owner, QStringLiteral("generation-1")), Result::Accepted);
+    }
+    QVERIFY(!writer.isReserved(owner));
+    QCOMPARE(writer.snapshot().entries.value(QStringLiteral("app")), expected);
 }
 
 void TransientPlacementWriterTest::failedFlushIsNotRetriedByDestructor()

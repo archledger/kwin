@@ -582,7 +582,8 @@ bool TransientTileController::admissionCurrent(Window *window, quint64 generatio
     if (m_ownershipGeneration) {
         const auto &ownership = *window->m_transientOwnership;
         if (!window->transientProviderIsCurrent(ownership)
-            || !sameFrame(ownership.target, m_tile->windowGeometry()) || !window->isTransientTileTargetFeasible(ownership.target)) {
+            || !window->isTransientTileFrame(ownership.target, m_tile->windowGeometry())
+            || !window->isTransientTileTargetFeasible(ownership.target)) {
             return false;
         }
         if (ownership.progress == Window::TransientRequestProgress::NoRequest
@@ -616,7 +617,7 @@ TransientTileController::Result TransientTileController::admit(quint64 generatio
     // then the headroom for the whole synchronous path and its failure cleanup, a known shortage
     // refused rather than superseded after a write.
     if (!window || !writer || !activity || key.isEmpty() || placementKey(window) != key || !freeOfNativeMembership(window)
-        || !window->transientAdmissionEligible(m_tile->windowGeometry())) {
+        || !window->transientAdmissionEligible(window->transientTileFrame(m_tile->windowGeometry()))) {
         return Result::Ineligible;
     }
     if (!window->transientAdmissionHeadroom()) {
