@@ -50,6 +50,20 @@ if [ ! -f "$OUT/SOURCES/macros.kwin.in" ]; then
     cp "$stock/macros.kwin.in" "$OUT/SOURCES/"
 fi
 
+# The spec to build from: the tag's sequence number written in as its default. The source
+# package carries this spec, and Copr rebuilds the source package from it alone (rpmbuild -bs
+# in mock, with no --define): with the repository's default every source package named the pf3
+# archive, and a pf4 build failed for a missing kwin-v6.8.2-pf3.tar.gz.
+built_spec="$OUT/SPECS/$(basename "$SPEC")"
+sed "s/^%{!?pf:%global pf [0-9]*}\$/%{!?pf:%global pf ${pfn}}/" "$SPEC" > "$built_spec"
+[ "$(grep -c -x "%{!?pf:%global pf ${pfn}}" "$built_spec")" = 1 ] ||
+    { echo "the spec has no single pf default line to set" >&2; exit 1; }
+# What a rebuild from the spec alone takes: the tag's own archive (the directory it unpacks is
+# named by the same number).
+grep -q -x "Source0: https://github.com/archledger/kwin/archive/${TAG}/kwin-${TAG}.tar.gz" <<<"$(rpmspec -P "$built_spec")" ||
+    { echo "the spec does not name ${archive} on its own" >&2; exit 1; }
+SPEC=$built_spec
+
 # SRPM=1 builds the source package only (what Copr takes); otherwise the binary packages.
 if [ "${SRPM:-0}" = 1 ]; then
     rpmbuild -bs --define "_topdir $OUT" --define "pf ${pfn}" "$SPEC"
