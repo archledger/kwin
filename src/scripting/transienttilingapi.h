@@ -116,8 +116,10 @@ public:
      * desktop or output, a second window of its app, a move of the window, a change of the
      * work area): the master the tiler has since given its floating frame back with an
      * ordinary request for floatingFrame(), or one the user moved or resized. The native
-     * layer settles it only for the provider that admitted the window, once the window's
-     * geometry is settled and the window stands on its floating frame or where the user's
+     * layer settles it only for the provider that admitted the window - or, once that one has
+     * retired, for the current provider (a reloaded script ends the records its predecessor
+     * left) - once the window's geometry is settled and the window stands on its floating
+     * frame or where the user's
      * own interactive move or resize left it; any other frame may be an automatic rectangle
      * and never reaches the memory. Returns Window::TransientSettleResult: 0 settled (the
      * window can be admitted again), 1 nothing to settle, 2 another provider's, 3 not settled
