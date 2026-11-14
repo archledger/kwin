@@ -1,7 +1,8 @@
 Name:    kwin
 Version: 6.8.2
 # The fork's sequence number on this upstream version: the source is the tag
-# v%%{version}-pf%%{pf}. build-fork-rpm.sh passes the tag's own number.
+# v%%{version}-pf%%{pf}. build-fork-rpm.sh writes the tag's own number here in the spec it
+# builds from, so the source package names its own archive when it is rebuilt alone (Copr).
 %{!?pf:%global pf 3}
 Release: 3%{?dist}.pf%{pf}
 Summary: KDE Window manager (the Plasma Fusion fork)
