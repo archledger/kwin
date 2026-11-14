@@ -2168,6 +2168,10 @@ private:
         const bool normalizeFullScreen;
         // A configure-less (published) restoration waits for the client's next plain commit.
         bool publishedWithoutConfigure = false;
+        // The request returned current: set at requestTransientRestore's success exit, after its
+        // last check. From then on the restoration is the client's to answer, and a provider
+        // that retires no longer supersedes it (transientRestoreAttemptIsCurrent).
+        bool requestReturned = false;
         // Backend state only: captured values, no record/stack references or retained Window.
         std::function<bool()> stateIsCurrent;
         bool cancelled = false;

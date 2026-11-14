@@ -5208,8 +5208,19 @@ bool Window::transientRestoreAttemptIsCurrent(quint64 generation, quint64 sequen
         || ownership.progress != TransientRequestProgress::Requested || m_requestedTile || m_tile || m_requestedTransientTileGeneration) {
         return false;
     }
-    if (!transientProviderIsCurrent(ownership)
-        || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
+    if (!ownership.writer || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
+        return false;
+    }
+    // A retired provider's authority ends with it, except over a restoration whose request it
+    // already made: once that request returned current (requestReturned), the configure is the
+    // client's to answer, its target is the record's own floating frame and nothing the
+    // provider supplies, and the writer keeps the restoring reservation through the retirement.
+    // Its answer is placed and completes the record as any other's. Without this, a policy that
+    // ends its session and goes at once (the placement script unloaded during a tiling session,
+    // plasma-fusion#174) leaves the window at the tile's position with its floating size, and
+    // its record restoring until it closes. A retirement while the request is being made, its
+    // own last check included, still supersedes it; every other rule here still applies.
+    if (!transientProviderIsCurrent(ownership) && !attempt.requestReturned) {
         return false;
     }
     // Bind this Window's membership, not global desktop/activity navigation. The detached tree
@@ -5557,6 +5568,11 @@ Window::AssignmentGeometryRequest Window::requestTransientRestore(TransientResto
         // carries the restoration origin, so no acknowledged commit can ever complete it. The
         // client's next plain commit settles the landed frame and is that shape's boundary.
         m_transientOwnership->restoreAttempt->publishedWithoutConfigure = true;
+    }
+    if (m_transientOwnership && m_transientOwnership->generation == generation && m_transientOwnership->restoreAttempt
+        && m_transientOwnership->restoreAttempt->sequence == sequence) {
+        // Current after the check above, which ran with the provider still deciding.
+        m_transientOwnership->restoreAttempt->requestReturned = true;
     }
     return request;
 }
