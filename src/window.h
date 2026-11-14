@@ -1425,9 +1425,10 @@ public:
      * can be an automatic rectangle (the
      * tile's frame the window was admitted to, the tile's rectangle a work-area re-check asks
      * for as it releases the window, either of them carried to another output) and is
-     * answered AtManagedRectangle. Settled only for the provider that admitted the window
-     * (StaleProvider otherwise, also when the writer no longer holds the record's
-     * reservation), with no live restoration (NotReleased), in an ordinary mode outside
+     * answered AtManagedRectangle. Settled only for the provider that admitted the window,
+     * or once that provider has retired for the writer's current one (StaleProvider
+     * otherwise, also when the writer no longer holds the record's reservation), with no
+     * live restoration (NotReleased), in an ordinary mode outside
      * every tile and with the native geometry settled: nothing scheduled, sent or
      * acknowledged, the frame the requested geometry (Unsettled otherwise). Every answer but
      * Settled changes nothing. The writer finalizes as it does for a completed restoration:

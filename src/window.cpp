@@ -5297,7 +5297,13 @@ Window::TransientSettleResult Window::settleReleasedTransientOwnership(const QUu
         || (ownership.restoreAttempt && transientRestoreAttemptIsCurrent(generation, ownership.restoreAttempt->sequence))) {
         return TransientSettleResult::NotReleased;
     }
-    if (provider.isNull() || provider != ownership.provider || !ownership.writer || !ownership.writer->isProviderRegistered(provider)
+    // The provider that admitted the window settles its record. Once that provider has
+    // retired (its script unloaded or reloaded before it settled anything), the writer's
+    // current provider may, under the same evidence below: nobody else could ever end the
+    // record, and the window could not be tiled again until it closed (plasma-fusion#175). A
+    // live restoration is still nobody's to settle (above).
+    if (provider.isNull() || !ownership.writer || !ownership.writer->isProviderRegistered(provider)
+        || (provider != ownership.provider && ownership.writer->isProviderRegistered(ownership.provider))
         || !ownership.writer->ownsRestoringReservation(internalId(), QString::number(generation))) {
         return TransientSettleResult::StaleProvider;
     }
