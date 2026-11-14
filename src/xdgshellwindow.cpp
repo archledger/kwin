@@ -53,6 +53,35 @@ namespace KWin
 static bool changeMaximizeRecursion = false;
 static bool isFiniteExtent(const RectF &rect);
 
+// Whether two logical lengths are the same number of an output's pixels. A size read back from
+// a rectangle is the difference of two corners, and a frame's size is a client size plus its
+// borders: wherever the output's pixel is not a binary fraction (0.8 at 125%, two thirds at
+// 150%) either differs in its last bits from the number the pixel grid itself gives, and an
+// exact comparison of the two refuses a frame the window has had all along. Sizes that are
+// different on the grid differ by a whole pixel; the tolerance is far below that and far above
+// the arithmetic's noise.
+static bool samePixels(qreal left, qreal right, qreal scale)
+{
+    return std::abs(left - right) * scale < 1.0 / 1024;
+}
+
+static bool samePixels(const QSizeF &left, const QSizeF &right, qreal scale)
+{
+    return samePixels(left.width(), right.width(), scale) && samePixels(left.height(), right.height(), scale);
+}
+
+// Smaller by a pixel's worth, not by the last bits of a read-back size.
+static bool belowPixels(qreal length, qreal limit, qreal scale)
+{
+    return length < limit && !samePixels(length, limit, scale);
+}
+
+// The same rectangle on an output's pixels.
+static bool samePixels(const RectF &left, const RectF &right, qreal scale)
+{
+    return samePixels(left.x(), right.x(), scale) && samePixels(left.y(), right.y(), scale) && samePixels(left.size(), right.size(), scale);
+}
+
 XdgSurfaceWindow::XdgSurfaceWindow(XdgSurfaceInterface *shellSurface)
     : WaylandWindow(shellSurface->surface())
     , m_shellSurface(shellSurface)
@@ -299,15 +328,24 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             } else {
                 // The request is resolved here, with no configure and nothing for the client to
                 // commit: what is published is the request's image on the output's pixels, and
-                // the requested geometry follows it, as it does when a configure's commit lands
-                // (synchronizeCommittedGeometry). Left at the rectangle that was asked for, it
-                // would differ from the frame until the client's next commit, and the window
-                // would read as unsettled for that long. Half a pixel must not carry the
-                // center to another output: there the request stays as it was asked. A guarded
+                // the requested geometry follows it through the synchronization a configure's
+                // commit uses (synchronizeCommittedGeometry). Left at the rectangle that was
+                // asked for, it would differ from the frame until the client's next commit, and
+                // the window would read as unsettled for that long. Where half a pixel carries
+                // the image's center to another output, the synchronization takes the output
+                // and its properties with it, as it does for a committed frame. A guarded
                 // request keeps its rectangle on purpose: its caller compares the requested
                 // geometry with the rectangle it asked for (a tile's, a restoration's).
-                if (target != rect && workspace()->outputAt(target.center()) == moveResizeOutput()) {
-                    setMoveResizeGeometry(target);
+                if (target != rect) {
+                    const auto requestIsCurrent = [this, generation]() {
+                        return geometryRequestIsCurrent(generation) && transientGeometryRequestIsCurrent(generation);
+                    };
+                    // A refused synchronization leaves the request as it was asked; a newer
+                    // request from one of its callbacks ends this one.
+                    if (synchronizeConfigureGeometry(target, m_geometryRequestOrigin, requestIsCurrent).outcome != AssignmentStepOutcome::AppliedCurrent
+                        && !current()) {
+                        return;
+                    }
                 }
                 updateGeometry(target);
             }
@@ -887,6 +925,18 @@ void XdgToplevelWindow::handleRoleCommit()
         }
     }
 
+    // A frame that answers a request is that request. It is put together where the window
+    // stands and then moved to the configure's place, so where the output's pixel is not a
+    // binary fraction its corners can be a last bit away from the rectangle the configure was
+    // sent for, though it is that rectangle on the output's pixels: a restoration from a tile
+    // at 542,362 came back 200.79999999999995 wide for a floating frame of 200.8 at 125%. The
+    // configure's own rectangle is published then, so a restoration returns the floating
+    // frame it saved bit for bit, and a tiled window stands on the frame it was admitted to.
+    if (placement && !fullscreen && !isInteractiveMove() && frameGeometry != placement->bounds
+        && samePixels(frameGeometry, placement->bounds, targetScale())) {
+        frameGeometry = placement->bounds;
+    }
+
     const bool synchronized = synchronizeCommittedGeometry(frameGeometry, origin, generation);
     if (!configureCommitIsCurrent(generation)) {
         return;
@@ -936,6 +986,13 @@ bool XdgToplevelWindow::canStartTransientTileRequest(const RectF &target) const
     return !hasPendingNativeGeometry() && !requestedTile() && !tile() && isTransientTileTargetFeasible(target);
 }
 
+bool XdgToplevelWindow::isTransientGeometrySettled() const
+{
+    return m_isInitialized && readyForPainting() && !isInteractiveMoveResize() && !hasPendingNativeGeometry()
+        && !isFullScreen() && !isRequestedFullScreen() && maximizeMode() == MaximizeRestore && requestedMaximizeMode() == MaximizeRestore
+        && frameGeometry() == moveResizeGeometry(); // RectF: an exact comparison
+}
+
 bool XdgToplevelWindow::canStartTransientRestoreRequest(const RectF &target) const
 {
     // Pending admission geometry is allowed. Do not clear a pending configure gravity (one an
@@ -964,6 +1021,104 @@ bool XdgToplevelWindow::isTransientTileTargetFeasible(const RectF &target) const
     return isTransientRestoreFrameFeasible(target);
 }
 
+RectF XdgToplevelWindow::transientTileFrame(const RectF &tile) const
+{
+    if (isDeleted() || !surface() || isTransientRestoreFrameFeasible(tile)) {
+        return tile;
+    }
+    const qreal scale = nextTargetScale();
+    const qreal clientScale = surface()->serverScale() * surface()->compositorToClientScale();
+    for (qreal value : {tile.x(), tile.y(), tile.width(), tile.height(), scale, clientScale}) {
+        if (!std::isfinite(value)) {
+            return tile;
+        }
+    }
+    if (tile.width() <= 0 || tile.height() <= 0 || scale <= 0 || clientScale <= 0) {
+        return tile;
+    }
+    // The size a request for the tile would publish is the tile's size taken to the output's
+    // pixels, to the client's grid and back (dispatchMoveResize, then the commit), and each of
+    // those roundings can go up: a 892-high tile at 133% under a 50.25 title bar asks the
+    // client for 842, which commits a 892.5-high frame. So the size is asked one device pixel
+    // smaller on an axis for as long as its image is larger than the tile there. An image is
+    // at most half a step of the client's grid and one device pixel over what was asked, which
+    // bounds the steps and keeps the fit within a step of that grid and two device pixels of
+    // the tile.
+    // Counted in whole device pixels, so that every step is one of the grid's own numbers.
+    // Bounded whatever the two scales are.
+    const int steps = int(std::min(std::ceil(scale / clientScale), 64.0)) + 2;
+    qreal width = std::round(tile.width() * scale);
+    qreal height = std::round(tile.height() * scale);
+    for (int step = 0; step <= steps && width > 0 && height > 0; ++step) {
+        const QSizeF client = surface()->snappedSize(nextFrameSizeToClientSize(QSizeF(width / scale, height / scale)));
+        const QSizeF image = nextClientSizeToFrameSize(snapToPixels(client, scale));
+        const bool wide = image.width() > tile.width() && !samePixels(image.width(), tile.width(), scale);
+        const bool tall = image.height() > tile.height() && !samePixels(image.height(), tile.height(), scale);
+        if (!wide && !tall) {
+            // Inside the tile. Not reachable only where the client's size limits say so: a
+            // minimum above the tile, or a maximum below it. The fit is the tile's size on
+            // the window's pixels, never a smaller window in a corner of the tile (the
+            // request's frame is checked against the tile by that nearness,
+            // isTransientTileFrame), so such a tile is refused, as it was.
+            const RectF frame(tile.topLeft(), image);
+            return isTransientRestoreFrameFeasible(frame) ? frame : tile;
+        }
+        if (wide) {
+            --width;
+        }
+        if (tall) {
+            --height;
+        }
+    }
+    return tile;
+}
+
+RectF XdgToplevelWindow::transientFloatingImage(const RectF &floating) const
+{
+    // The frame itself wherever the window reaches it: on the output it was taken on, and on
+    // any other whose pixels it is on.
+    if (isDeleted() || !surface() || isTransientRestoreFrameFeasible(floating)) {
+        return floating;
+    }
+    const qreal scale = nextTargetScale();
+    for (qreal value : {floating.x(), floating.y(), floating.width(), floating.height(), scale}) {
+        if (!std::isfinite(value)) {
+            return floating;
+        }
+    }
+    if (floating.width() <= 0 || floating.height() <= 0 || scale <= 0) {
+        return floating;
+    }
+    // What a request for the frame publishes (dispatchMoveResize, then the commit): the size
+    // to the output's pixels, to the client's grid and back. The corner stays. Where even
+    // that is not reachable (the client's size limits) the frame is left as it is.
+    const QSizeF client = surface()->snappedSize(nextFrameSizeToClientSize(snapToPixels(floating.size(), scale)));
+    const RectF image(floating.topLeft(), nextClientSizeToFrameSize(snapToPixels(client, scale)));
+    return isTransientRestoreFrameFeasible(image) ? image : floating;
+}
+
+bool XdgToplevelWindow::isTransientTileFrame(const RectF &frame, const RectF &tile) const
+{
+    if (Window::isTransientTileFrame(frame, tile)) {
+        return true;
+    }
+    if (isDeleted() || !surface() || frame.x() != tile.x() || frame.y() != tile.y()) {
+        return false;
+    }
+    const qreal scale = nextTargetScale();
+    const qreal clientScale = surface()->serverScale() * surface()->compositorToClientScale();
+    if (!std::isfinite(scale) || !std::isfinite(clientScale) || scale <= 0 || clientScale <= 0) {
+        return false;
+    }
+    // A fit is short of its tile by less than a step of the client's grid and two device
+    // pixels on an axis (transientTileFrame).
+    const qreal slack = 1 / clientScale + 2 / scale;
+    const auto fits = [scale, slack](qreal size, qreal extent) {
+        return (size <= extent || samePixels(size, extent, scale)) && extent - size < slack;
+    };
+    return fits(frame.width(), tile.width()) && fits(frame.height(), tile.height());
+}
+
 bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) const
 {
     for (qreal value : {target.x(), target.y(), target.width(), target.height()}) {
@@ -974,12 +1129,14 @@ bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) con
     if (target.width() <= 0 || target.height() <= 0) {
         return false;
     }
-    const auto constrained = constrainFrameSize(target.size());
-    if (constrained.width() != target.width() || constrained.height() != target.height()) {
+    // Every comparison here is of sizes on the output's pixels (samePixels): the target's is
+    // read back from a rectangle, the others are computed on the grid.
+    const qreal scale = nextTargetScale();
+    if (!samePixels(constrainFrameSize(target.size()), target.size(), scale)) {
         return false;
     }
-    const auto snappedFrame = snapToPixels(target.size(), nextTargetScale());
-    if (snappedFrame.width() != target.width() || snappedFrame.height() != target.height()) {
+    const auto snappedFrame = snapToPixels(target.size(), scale);
+    if (!samePixels(snappedFrame, target.size(), scale)) {
         return false;
     }
     // The size a configure can carry is on the client's own grid (whole logical pixels without
@@ -989,8 +1146,8 @@ bool XdgToplevelWindow::isTransientRestoreFrameFeasible(const RectF &target) con
     // snapped back to the output's pixels and decorated again - which is the path a geometry
     // request takes (moveResizeInternal, then the commit's clientGeometry).
     const auto client = surface()->snappedSize(nextFrameSizeToClientSize(snappedFrame));
-    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(client, nextTargetScale()));
-    return roundTrip.width() == target.width() && roundTrip.height() == target.height();
+    const auto roundTrip = nextClientSizeToFrameSize(snapToPixels(client, scale));
+    return samePixels(roundTrip, target.size(), scale);
 }
 
 std::function<bool()> XdgToplevelWindow::transientRestoreStateConstraint(const RectF &target, bool normalizeMaximize, bool geometryReady) const
@@ -1099,8 +1256,9 @@ Window::TransientRestoreClaim XdgToplevelWindow::claimTransientRestoreWithMaximi
         if (!isTransientRestoreFrameFeasible(target)) {
             return {};
         }
-    } else if (!isFiniteExtent(target) || target.width() < minSize().width() || target.height() < minSize().height()
-               || snapToPixels(target.size(), nextTargetScale()) != target.size()) {
+    } else if (!isFiniteExtent(target) || belowPixels(target.width(), minSize().width(), nextTargetScale())
+               || belowPixels(target.height(), minSize().height(), nextTargetScale())
+               || !samePixels(snapToPixels(target.size(), nextTargetScale()), target.size(), nextTargetScale())) {
         // Maximized or fullscreen borders are not the borders that A will use. These are only necessary
         // checks; exact frame/client feasibility follows the same-decoration response.
         return {};
@@ -2374,7 +2532,7 @@ std::optional<XdgToplevelWindow::OwnedFullScreen> XdgToplevelWindow::ownedFullSc
     if (!transientOwnershipIsCurrent(generation)) {
         return std::nullopt;
     }
-    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    const RectF managed = transientTileFrame(m_transientOwnership->tile->windowGeometry());
     if (!isFiniteExtent(managed)) {
         return std::nullopt;
     }
@@ -2686,9 +2844,12 @@ bool XdgToplevelWindow::ownedMaximizeFeasible(const RectF &managed, MaximizeMode
     if (released == MaximizeRestore) {
         return true;
     }
+    // Compared on the output's pixels: the constrained size is put together from a client size
+    // and its borders, the managed one is read back from a rectangle (samePixels).
     const QSizeF constrained = constrainFrameSize(managed.size());
-    return (!(released & MaximizeHorizontal) || constrained.width() == managed.width())
-        && (!(released & MaximizeVertical) || constrained.height() == managed.height());
+    const qreal scale = nextTargetScale();
+    return (!(released & MaximizeHorizontal) || samePixels(constrained.width(), managed.width(), scale))
+        && (!(released & MaximizeVertical) || samePixels(constrained.height(), managed.height(), scale));
 }
 
 std::optional<XdgToplevelWindow::OwnedMaximize> XdgToplevelWindow::ownedMaximizePlan(MaximizeMode mode, MaximizeMode oldMode, const RectF &restore) const
@@ -2706,7 +2867,7 @@ std::optional<XdgToplevelWindow::OwnedMaximize> XdgToplevelWindow::ownedMaximize
     if (!transientOwnershipIsCurrent(generation)) {
         return std::nullopt;
     }
-    const RectF managed = m_transientOwnership->tile->windowGeometry();
+    const RectF managed = transientTileFrame(m_transientOwnership->tile->windowGeometry());
     if (!ownedMaximizeFeasible(managed, mode, oldMode)) {
         return std::nullopt;
     }

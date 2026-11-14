@@ -239,8 +239,12 @@ protected:
     void doSetPreferredBufferTransform() override;
     void doSetPreferredColorDescription() override;
     bool canStartTransientTileRequest(const RectF &target) const override;
+    bool isTransientGeometrySettled() const override;
     bool canStartTransientRestoreRequest(const RectF &target) const override;
     bool isTransientTileTargetFeasible(const RectF &target) const override;
+    RectF transientTileFrame(const RectF &tile) const override;
+    bool isTransientTileFrame(const RectF &frame, const RectF &tile) const override;
+    RectF transientFloatingImage(const RectF &floating) const override;
     bool supportsAssignmentGeometryRequest() const override;
 
 private:
