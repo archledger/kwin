@@ -2,6 +2,6 @@
   "schema": 1,
   "repository": "https://github.com/KDE/kwin.git",
   "stable_ref": "refs/heads/Plasma/6.8",
-  "stable_commit": "de487557d8ebff5ae7ef3580862d7351a0d96a19",
+  "stable_commit": "3b29a938a3c27053ee124b51efbcac211b4e54e7",
   "preview_ref": "refs/heads/master"
 }
