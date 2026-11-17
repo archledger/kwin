@@ -112,3 +112,27 @@ same arguments, so a run that stopped goes on from where it stopped. To redo a s
 
   The candidates project already has the candidate's build, so it needs no second build of
   the same version.
+
+## A new series: the port branch
+
+The replay refuses a new series, so the delta for the next Plasma series is rebased by hand, and
+early, on a port branch: `port/X.Y` (now `port/6.9`), the latest candidate's commits rebased onto
+KDE master, from which KDE branches `Plasma/X.Y` at the series' first beta.
+
+- **The rebase** is the replay's own: `git rebase --onto MASTER vA.B.C candidate/A.B.C-pfN
+  --empty=drop --no-autosquash --no-update-refs --gpg-sign=KEY`. A conflict is resolved as the
+  fork's change applied to master's code: the fork's lines are kept, and a line master removed
+  stays removed. The resolutions are recorded with the run.
+- **The lane.** `DISTRO=kde-master .github/ci/suites.sh PORT_CHECKOUT WORK_DIR` builds and tests the
+  port branch in the KDE master image. KWin master can need a Plasma library newer than any
+  release (since KDE's `01a35d1f15`, kglobalacceld's activation token API), and no distribution
+  carries one. `kde-master-deps.txt` pins each such dependency to a commit of the day of the port's
+  master base, and `Containerfile.kde-master` builds it over Fedora 44's (`kde-master-build.sh`).
+  A dependency is pinned when the build stops on its API, and the pins move with the base.
+- **The workflow.** `port-preview.yml` runs the lane on `port/6.9` every Tuesday and on demand,
+  with this branch's tools; the port branch's own `.github` is not used. The upstream master
+  preview builds in the same image.
+- **Keeping it current.** The port branch is rebased again onto a later master, and a fork commit
+  that lands on `plasma-fusion` after the candidate it started from is cherry-picked onto it. At
+  KDE's branch point (Plasma 6.9: Beta 1, `v6.8.90`, 2027-01-19) it is rebased onto the beta tag,
+  and the result is the basis of the series' first candidate.
