@@ -52,7 +52,7 @@ else
         [ ! -d "$dir/lib/qt-6/qml" ] || NIXPKGS_QT6_QML_IMPORT_PATH=${NIXPKGS_QT6_QML_IMPORT_PATH:+$NIXPKGS_QT6_QML_IMPORT_PATH:}$dir/lib/qt-6/qml
     done
     export QT_PLUGIN_PATH NIXPKGS_QT6_QML_IMPORT_PATH
-    export XDG_DATA_DIRS=$XDG_DATA_DIRS:/usr/share
+    export XDG_DATA_DIRS=${XDG_DATA_DIRS:+$XDG_DATA_DIRS:}/usr/share
     mesa=$(readlink -f "$profile/lib/libGLX_mesa.so.0")
     export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}${mesa%/*}
     export __EGL_VENDOR_LIBRARY_DIRS=$profile/share/glvnd/egl_vendor.d LIBGL_DRIVERS_PATH=$profile/lib/dri

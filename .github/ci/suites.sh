@@ -106,9 +106,10 @@ run_test() {
 }
 stage=configure
 # A build directory records the system it was configured for and is not reused for another one. A build
-# directory without the record comes from before suites.sh built systems other than fedora44.
+# directory without the record comes from before suites.sh built systems other than fedora44. A failed
+# configure can leave a cache; it is removed, so the next run configures again.
 if [ ! -f "$bld/CMakeCache.txt" ]; then
-    container kwin_ci_configure >"$out/configure.log" 2>&1 || fail
+    container kwin_ci_configure >"$out/configure.log" 2>&1 || { rm -f "$bld/CMakeCache.txt"; fail; }
     printf '%s\n' "$distro" >"$bld/kwin-ci-distro"
 fi
 configured=$(cat "$bld/kwin-ci-distro" 2>/dev/null || echo fedora44)

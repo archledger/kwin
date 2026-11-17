@@ -139,8 +139,21 @@ class SuiteWrapperTest(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if 'cat' in args: raise SystemExit(0)\n"
             "open(os.environ['CAPTURE'],'w').write(json.dumps(args))\n"
+            "if os.environ.get('PARTIAL_CACHE'):\n"
+            "    # CMake can leave a cache behind when configuration fails.\n"
+            "    build=[a[:-len(':/build:rw,z')] for a in args if a.endswith(':/build:rw,z')][0]\n"
+            "    open(os.path.join(build,'CMakeCache.txt'),'w').write('partial\\n')\n"
             "raise SystemExit(99)\n"
         )
+
+    def test_failed_configure_leaves_no_cache_or_record(self):
+        self.install_image_builder()
+        result = self.run_wrapper(DISTRO="arch", PARTIAL_CACHE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("kwin_ci_configure", json.loads(self.capture.read_text())[-1])
+        self.assertIn("configure=1", (self.work / "out/STATUS").read_text())
+        self.assertFalse((self.work / "build/CMakeCache.txt").exists())
+        self.assertFalse((self.work / "build/kwin-ci-distro").exists())
 
     def build_container_args(self, image_user):
         self.install_image_builder()

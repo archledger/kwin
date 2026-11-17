@@ -28,7 +28,7 @@ RUN set -euo pipefail \
  && while read -r name; do refs="$refs $nixpkgs#$name"; done < /wanted-names.txt \
  && nx profile add --profile /nix/var/nix/profiles/kwin-ci $refs \
  && nx profile list --profile /nix/var/nix/profiles/kwin-ci --json \
-      | grep -oE '"(attrPath|originalUrl)":"[^"]*"' | LC_ALL=C sort > /profile-elements.txt \
+      | grep -oE '"(attrPath|originalUrl)":[[:space:]]*"[^"]*"' | tr -d ' \t' | LC_ALL=C sort > /profile-elements.txt \
  && while read -r name; do \
       printf '"attrPath":"legacyPackages.x86_64-linux.%s"\n"originalUrl":"%s"\n' "$name" "$nixpkgs"; \
     done < /wanted-names.txt | LC_ALL=C sort > /wanted-elements.txt \
