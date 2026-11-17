@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10,7 +11,7 @@ from pathlib import Path
 
 
 class SuiteWrapperTest(unittest.TestCase):
-    SYSTEMS = ("arch", "neon", "nixos")
+    SYSTEMS = ("arch", "neon", "nixos", "kde-master")
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -96,7 +97,8 @@ class SuiteWrapperTest(unittest.TestCase):
                     [args[i + 1] for i, arg in enumerate(args) if arg == "--build-arg"],
                     build_args,
                 )
-                helper = "fedora" if name.startswith("fedora") else name
+                # The KDE master image is Fedora 44's with KDE master dependencies: Fedora's env.sh.
+                helper = "fedora" if name.startswith("fedora") or name == "kde-master" else name
                 self.assertTrue((self.ci / recipe).is_file())
                 self.assertTrue((self.ci / f"env-{helper}.sh").is_file())
 
@@ -106,6 +108,7 @@ class SuiteWrapperTest(unittest.TestCase):
             {"DISTRO": "../Containerfile"},
             {"DISTRO": "arch", "MEMCHECK": "1"},
             {"DISTRO": "nixos", "MEMCHECK": "1"},
+            {"DISTRO": "kde-master", "MEMCHECK": "1"},
             {"KWIN_CI_RENDER": "gpu"},
         ):
             with self.subTest(**variables):
@@ -169,6 +172,8 @@ class SuiteWrapperTest(unittest.TestCase):
             (None, "fedora44", True),
             ("fedora44", "arch", False),
             (None, "nixos", False),
+            # The same Fedora base, other KDE libraries: a release build is no master build.
+            ("fedora44", "kde-master", False),
         ):
             with self.subTest(record=record, system=system):
                 self.capture.unlink(missing_ok=True)
@@ -219,6 +224,77 @@ class SuiteWrapperTest(unittest.TestCase):
         self.assertTrue(marker.exists())
         self.assertEqual(marker.read_text(), "keep")
         self.assertFalse(self.capture.exists())
+
+
+class KdeMasterLaneTest(unittest.TestCase):
+    """The KDE master lane (DISTRO=kde-master): the Fedora 44 image, the same steps, plus the pinned KDE
+    master dependencies (kde-master-deps.txt) that kde-master-build.sh builds into it."""
+
+    ci = Path(__file__).resolve().parent
+
+    @staticmethod
+    def instructions(path):
+        """A Containerfile's instructions, continuation lines joined, comments dropped."""
+        joined = re.sub(r"\\\n", " ", path.read_text())
+        return [line.strip() for line in joined.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+    def pins(self):
+        lines = (self.ci / "kde-master-deps.txt").read_text().splitlines()
+        return [line.split() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+    def test_recipe_is_the_fedora_recipe_plus_the_master_dependencies(self):
+        fedora = self.instructions(self.ci / "Containerfile")
+        master = self.instructions(self.ci / "Containerfile.kde-master")
+        # Every step of the Fedora image, in its order, then the dependencies, then Fedora's env.sh.
+        self.assertEqual(fedora[-1], "COPY env-fedora.sh /etc/kwin-ci/env.sh")
+        self.assertEqual(master[: len(fedora) - 1], fedora[:-1])
+        self.assertEqual(master[-1], fedora[-1])
+        extra = master[len(fedora) - 1 : -1]
+        self.assertEqual(extra[0], "COPY kde-master-deps.txt kde-master-build.sh /")
+        self.assertTrue(extra[1].startswith("RUN bash /kde-master-build.sh /kde-master-deps.txt /packages.tsv"))
+        self.assertEqual(len(extra), 2)
+
+    def test_dependencies_are_pinned_commits(self):
+        pins = self.pins()
+        self.assertTrue(pins)
+        for pin in pins:
+            with self.subTest(pin=pin):
+                self.assertEqual(len(pin), 2)
+                self.assertRegex(pin[0], r"^[a-z0-9][a-z0-9-]*$")
+                self.assertRegex(pin[1], r"^[0-9a-f]{40}$")
+        self.assertEqual(len({repo for repo, _ in pins}), len(pins))
+
+    def test_malformed_pin_stops_the_build_before_anything_is_fetched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "calls"
+            for tool in ("dnf", "git", "cmake", "rpm"):
+                (bin_dir / tool).write_text(f"#!/bin/sh\necho {tool} >> '{calls}'\n")
+                (bin_dir / tool).chmod(0o755)
+            packages = root / "packages.tsv"
+            packages.write_text("")
+            env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+            for pins in (
+                "kglobalacceld master\n",
+                "kglobalacceld 2795d026a61b3c539c1b90c9035846b84ef31619 extra\n",
+                "../kglobalacceld 2795d026a61b3c539c1b90c9035846b84ef31619\n",
+                "kglobalacceld 2795d026\n",
+                "# only a comment\n",
+            ):
+                with self.subTest(pins=pins):
+                    deps = root / "deps.txt"
+                    deps.write_text("kdecoration 0123456789abcdef0123456789abcdef01234567\n" + pins
+                                    if "comment" not in pins else pins)
+                    calls.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ["bash", str(self.ci / "kde-master-build.sh"), str(deps), str(packages)],
+                        capture_output=True, text=True, env=env, check=False,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse(calls.exists(), "a tool ran before the pins were checked")
+                    self.assertEqual(packages.read_text(), "")
 
 
 if __name__ == "__main__":

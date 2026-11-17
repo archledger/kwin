@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# KDE master's Plasma dependencies that KWin master needs beyond Fedora's release (DISTRO=kde-master).
+# One per line: the repository under https://invent.kde.org/plasma/ and the full commit, pinned to
+# the day of the KWin master commit a port branch is built on. Containerfile.kde-master builds each
+# as Fedora's own package does (rpm's %cmake_kf6) and installs it over Fedora's.
+#
+# kglobalacceld: KWin master 01a35d1f15 (2026-11-13, "Provide activation tokens to global
+# shortcuts") calls KGlobalAccelD::setActivationTokenCreator, which this commit adds.
+kglobalacceld 2795d026a61b3c539c1b90c9035846b84ef31619
