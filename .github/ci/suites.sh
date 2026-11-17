@@ -105,9 +105,14 @@ run_test() {
           '"$1"
 }
 stage=configure
+# A build directory records the system it was configured for and is not reused for another one. A build
+# directory without the record comes from before suites.sh built systems other than fedora44.
 if [ ! -f "$bld/CMakeCache.txt" ]; then
     container kwin_ci_configure >"$out/configure.log" 2>&1 || fail
+    printf '%s\n' "$distro" >"$bld/kwin-ci-distro"
 fi
+configured=$(cat "$bld/kwin-ci-distro" 2>/dev/null || echo fedora44)
+[ "$configured" = "$distro" ] || { echo "$bld is configured for $configured, not $distro" >&2; fail; }
 printf 'configure=0\n' >>"$out/STATUS"
 stage=build
 container "cmake --build /build --parallel $cpus --target $targets -- -k 0" >"$out/build.log" 2>&1 || {

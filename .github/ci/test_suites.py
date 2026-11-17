@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -127,22 +128,52 @@ class SuiteWrapperTest(unittest.TestCase):
             self.assertFalse(self.capture.exists())
         self.assertNotIn("renderDtest", result.stderr)
 
-    def build_container_args(self, image_user):
-        # A builder that succeeds and an image that names image_user; the first build container stops.
+    def install_image_builder(self):
+        # A builder that succeeds and an image that names IMAGE_USER; the first build container stops.
         (self.bin / "podman").write_text(
             "#!/usr/bin/python3\nimport json,os,sys\n"
             "args=sys.argv[1:]\n"
             "if args[0]=='build': raise SystemExit(0)\n"
             "if args[:2]==['image','inspect']:\n"
-            "    print(os.environ['IMAGE_USER'] if 'User' in args[-1] else 'sha256:fixture')\n"
+            "    print(os.environ.get('IMAGE_USER','') if 'User' in args[-1] else 'sha256:fixture')\n"
             "    raise SystemExit(0)\n"
             "if 'cat' in args: raise SystemExit(0)\n"
             "open(os.environ['CAPTURE'],'w').write(json.dumps(args))\n"
             "raise SystemExit(99)\n"
         )
+
+    def build_container_args(self, image_user):
+        self.install_image_builder()
         result = self.run_wrapper(IMAGE_USER=image_user)
         self.assertNotEqual(result.returncode, 0)
         return json.loads(self.capture.read_text())
+
+    def test_build_directory_is_not_reused_for_another_system(self):
+        self.install_image_builder()
+        build = self.work / "build"
+        for record, system, reused in (
+            ("arch", "arch", True),
+            (None, "fedora44", True),
+            ("fedora44", "arch", False),
+            (None, "nixos", False),
+        ):
+            with self.subTest(record=record, system=system):
+                self.capture.unlink(missing_ok=True)
+                shutil.rmtree(self.work, ignore_errors=True)
+                self.git("worktree", "prune")
+                build.mkdir(parents=True)
+                (build / "CMakeCache.txt").write_text("fixture\n")
+                if record:
+                    (build / "kwin-ci-distro").write_text(record + "\n")
+                result = self.run_wrapper(DISTRO=system)
+                self.assertNotEqual(result.returncode, 0)
+                if reused:
+                    # Configure is skipped and the first container is the build.
+                    self.assertIn("cmake --build", json.loads(self.capture.read_text())[-1])
+                else:
+                    self.assertFalse(self.capture.exists())
+                    self.assertIn("configure=1", (self.work / "out/STATUS").read_text())
+                    self.assertIn(f"configured for {record or 'fedora44'}, not {system}", result.stderr)
 
     def test_containers_run_as_the_invoking_user(self):
         for image_user in ("", "0:0", "neon"):
