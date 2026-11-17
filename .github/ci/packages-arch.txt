@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+# Packages of the Arch Linux image (Containerfile.arch). Lines starting with # are comments.
+# The official kwin PKGBUILD (gitlab.archlinux.org/archlinux/packaging/packages/kwin, pkgver 6.8.3):
+# depends
+aurorae
+breeze
+glibc
+iio-sensor-proxy
+plasma-activities
+kauth
+kcmutils
+kcolorscheme
+kconfig
+kcoreaddons
+kcrash
+kdbusaddons
+kdeclarative
+kdecoration
+kglobalaccel
+kglobalacceld
+kguiaddons
+ki18n
+kidletime
+kirigami
+kitemmodels
+knewstuff
+knighttime
+knotifications
+kpackage
+kquickcharts
+krunner
+kscreenlocker
+kservice
+ksvg
+kwayland
+kwidgetsaddons
+kwindowsystem
+kxmlgui
+lcms2
+libcanberra
+libdisplay-info
+libdrm
+libei
+libepoxy
+libevdev
+libgcc
+libinput
+libpipewire
+libqaccessibilityclient-qt6
+libstdc++
+libxcb
+libxcvt
+libxkbcommon
+mesa
+milou
+pipewire-session-manager
+libplasma
+qt6-5compat
+qt6-base
+qt6-declarative
+qt6-svg
+qt6-tools
+systemd-libs
+vulkan-icd-loader
+wayland
+xcb-util-keysyms
+xcb-util-wm
+# makedepends (the PKGBUILD has no checkdepends)
+extra-cmake-modules
+kdoctools
+krunner
+plasma-wayland-protocols
+python
+vulkan-headers
+wayland-protocols
+xorg-xwayland
+# The build environment makepkg assumes, and the generator the suites build with
+base-devel
+ninja
+# Arch's own KWin, as the Fedora images carry Fedora's
+kwin
+# Run time: the session bus tools, glxgears (X11Window starts it), the icon theme the test application
+# selects, the cursor theme /usr/share/icons/default inherits (Adwaita, as on Fedora), and fonts
+dbus
+mesa-utils
+breeze-icons
+adwaita-cursors
+noto-fonts

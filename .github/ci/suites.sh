@@ -1,15 +1,36 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
 # SPDX-License-Identifier: GPL-2.0-or-later
-# The fork's test image, as the ThinkPad qualification lane builds it: Fedora 44 with current updates,
-# the package names of the earlier KWin builder (packages-old-builder.txt) and the build dependencies
-# of Fedora's kwin source package. Packages that no longer exist are skipped and listed in /skipped.txt.
-# The image includes Fedora's own KWin; suites.sh hides its scripted effects and loads the built libkwin.
-# The build recipe and package list come from this trusted helper directory, never from the candidate
+# The fork's qualification suites in one system's test image. DISTRO selects it (default fedora44):
+# - fedora44, fedora45 (Containerfile): as the ThinkPad qualification lane builds it, Fedora with current
+#   updates, the package names of the earlier KWin builder (packages-old-builder.txt) and the build
+#   dependencies of Fedora's kwin source package. Packages that no longer exist are skipped and listed
+#   in /skipped.txt.
+# - arch, neon, nixos (Containerfile.<name>): that system's KWin build dependencies, its own KWin and the
+#   run-time tools; each records what it skipped in /skipped.txt.
+# Every image carries /etc/kwin-ci/env.sh (from env-<system>.sh here), sourced at the start of each build
+# and test container: the system's own packaging build flags and configure call, and its run-time paths.
+# The targets, suites, test runs and checks below are the same on every system. Each image includes its
+# system's own KWin; the suites hide its scripted effects and must load the built libkwin, no other.
+# The build recipe and package lists come from this trusted helper directory, never from the candidate
 # source, and the package version is parsed from the candidate without executing any of its code.
+# KWIN_CI_RENDER=software uses KWin's software render device over /dev/udmabuf, as on the hosted runners,
+# even when the host has a render node.
 set -euo pipefail
 (( $# == 2 )) || { echo "usage: $0 SOURCE_DIR WORK_DIR" >&2; exit 64; }
 ci=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+distro=${DISTRO:-fedora44}
+case $distro in
+fedora44 | fedora45) recipe=(-f "$ci/Containerfile" --build-arg "FEDORA_RELEASE=${distro#fedora}") ;;
+arch | neon | nixos) recipe=(-f "$ci/Containerfile.$distro") ;;
+*) echo "unknown DISTRO '$distro' (fedora44, fedora45, arch, neon or nixos)" >&2; exit 64 ;;
+esac
+# The Memcheck selection and its suppression were chosen on Fedora 44.
+[ "${MEMCHECK:-0}" != 1 ] || [ "$distro" = fedora44 ] || { echo "Memcheck runs on fedora44 only" >&2; exit 64; }
+case ${KWIN_CI_RENDER:-} in
+'' | software) ;;
+*) echo "KWIN_CI_RENDER is unset or software" >&2; exit 64 ;;
+esac
 src=$(cd "$1" && pwd)
 mkdir -p "$2"
 work=$(cd "$2" && pwd)
@@ -24,7 +45,7 @@ version=$(python3 "$ci/upstream.py" version "$tree")
 out=$work/out
 bld=$work/build
 mkdir -p "$out" "$bld" "$work/tmp" "$work/empty-effects"
-image=localhost/kwin-fork-ci:fedora44
+image=localhost/kwin-fork-ci:$distro
 suites='X11Window|DecorationInput|DontCrashEmptyDeco|DontCrashAuroraeDestroyDeco|Tiles|XdgShellWindow|QuickTiling|MoveResize|FractionalScaling|OutputChanges|Maximized|ScreenChanges|OffscreenQuickView|InternalWindow|TabBox|Placement|TransientPlacement|StartupDefaults|Rect|RectF|Fifo|HangDetectorShutdown|WindowThumbnailSource|LibinputConnection|TabletModeStartup'
 targets="kwin kill fakedecoshadows testWaylandSurface $(tr '|' '\n' <<<"$suites" | sed 's/^/test/' | tr '\n' ' ')"
 cpus=${CPUS:-4}
@@ -34,7 +55,8 @@ fail() {
     printf '%s=1\n' "$stage" >>"$out/STATUS"
     exit 1
 }
-node=$(find /dev/dri -maxdepth 1 -name 'renderD*' -print 2>/dev/null | sort | head -n 1)
+node=
+[ "${KWIN_CI_RENDER:-}" = software ] || node=$(find /dev/dri -maxdepth 1 -name 'renderD*' -print 2>/dev/null | sort | head -n 1)
 if [ -n "$node" ]; then
     dri=(--device="$node:$node:rw" --group-add=keep-groups)
 elif [ -w /dev/udmabuf ]; then
@@ -48,20 +70,29 @@ printf '%s\n' "${node:-/dev/udmabuf (software)}" >"$out/render-device.txt"
 printf 'device=0\n' >>"$out/STATUS"
 stage=image
 git -C "$src" rev-parse HEAD 'HEAD^{tree}' >"$out/source-commit.txt"
-podman build --pull=newer -t "$image" -f "$ci/Containerfile" "$ci" >"$out/image.log" 2>&1 || fail
+podman build --pull=newer -t "$image" "${recipe[@]}" "$ci" >"$out/image.log" 2>&1 || fail
 podman image inspect "$image" --format '{{.Id}}' >"$out/image-id.txt"
 for f in packages.tsv skipped.txt; do podman run --rm "$image" cat "/$f" >"$out/$f"; done
 printf 'image=0\n' >>"$out/STATUS"
 # shellcheck disable=SC2054 # the commas belong to the --tmpfs option value
 common=(--rm --userns=keep-id --network=none --ulimit core=1:1 --cap-drop=all --security-opt=no-new-privileges --read-only
     --cpus="$cpus" --memory=12g --memory-swap=12g --tmpfs /tmp:rw,nosuid,nodev,size=1g)
+# With --userns=keep-id, Podman 4 (the hosted runners') runs as the invoking user only when the image names
+# no user. The neon and NixOS images name one, so their containers get the invoking user explicitly.
+if [ -n "$(podman image inspect "$image" --format '{{.Config.User}}')" ]; then
+    common+=(--user "$(id -u):$(id -g)")
+fi
 container() {
-    # Fedora's linker specs (redhat-package-notes) read the package identity from the environment, as in rpmbuild.
-    podman run "${common[@]}" -e TMPDIR=/scratch -e RPM_ARCH=x86_64 -e RPM_PACKAGE_NAME=kwin -e RPM_PACKAGE_VERSION="$version" \
-        -e RPM_PACKAGE_RELEASE=1.fc44.ci -v "$tree:/source:ro,z" -v "$bld:/build:rw,z" -v "$work/tmp:/scratch:rw,z" \
-        --entrypoint bash "$image" -euc "$1"
+    # The image's env.sh sets the system's packaging build environment (on Fedora, the package identity
+    # that its linker specs read, as in rpmbuild) and defines kwin_ci_configure.
+    podman run "${common[@]}" -e TMPDIR=/scratch -e KWIN_CI_VERSION="$version" \
+        -v "$tree:/source:ro,z" -v "$bld:/build:rw,z" -v "$work/tmp:/scratch:rw,z" \
+        --entrypoint bash "$image" -euc '. /etc/kwin-ci/env.sh build
+          '"$1"
 }
 run_test() {
+    # The image's system KWin installs its scripted effects under /usr/share/kwin/effects (on NixOS, the
+    # system profile linked as /usr/share); the empty directory hides them.
     podman run "${common[@]}" "${dri[@]}" \
         -e HOME=/tmp/home -e XDG_CONFIG_HOME=/tmp/home/config -e XDG_CACHE_HOME=/tmp/home/cache \
         -e XDG_RUNTIME_DIR=/tmp/runtime -e LD_LIBRARY_PATH=/build/bin -e QT_QPA_PLATFORM=offscreen \
@@ -70,15 +101,19 @@ run_test() {
         -euc 'mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
           if [ ! -d /tmp/.X11-unix ]; then mkdir /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; fi
+          . /etc/kwin-ci/env.sh test
           '"$1"
 }
 stage=configure
+# A build directory records the system it was configured for and is not reused for another one. A build
+# directory without the record comes from before suites.sh built systems other than fedora44. A failed
+# configure can leave a cache; it is removed, so the next run configures again.
 if [ ! -f "$bld/CMakeCache.txt" ]; then
-    container "cmd=\$(rpm --define '_vpath_srcdir /source' --define '_vpath_builddir /build' \
-        --define 'name kwin' --define 'version $version' --define 'release 1.fc44.ci' \
-        --eval '%cmake_kf6 -G Ninja -DBUILD_TESTING=ON'); printf '%s\n' \"\$cmd\"; bash -euc \"\$cmd\"" \
-        >"$out/configure.log" 2>&1 || fail
+    container kwin_ci_configure >"$out/configure.log" 2>&1 || { rm -f "$bld/CMakeCache.txt"; fail; }
+    printf '%s\n' "$distro" >"$bld/kwin-ci-distro"
 fi
+configured=$(cat "$bld/kwin-ci-distro" 2>/dev/null || echo fedora44)
+[ "$configured" = "$distro" ] || { echo "$bld is configured for $configured, not $distro" >&2; fail; }
 printf 'configure=0\n' >>"$out/STATUS"
 stage=build
 container "cmake --build /build --parallel $cpus --target $targets -- -k 0" >"$out/build.log" 2>&1 || {
@@ -108,9 +143,11 @@ grep -E 'Test +#[0-9]+: (kwin|kwayland)-test[A-Za-z0-9]+ .*\*\*\*(Failed|Timeout
 (( rc == 0 )) || fail
 python3 "$ci/suite_results.py" --discovery "$out/test-inventory.json" --junit "$out/ctest.xml" \
     --log "$out/core.log" --libkwin-init "$out/libkwin-init.txt" --output "$out/test-validation.json" || fail
-# Every suite must have loaded the built libkwin and none Fedora's.
+# Every suite must have loaded the built libkwin and no other, such as the system's (/usr/lib64, /usr/lib,
+# /usr/lib/x86_64-linux-gnu or a /nix/store path).
 grep -q 'calling init: /build/bin/libkwin\.so' "$out/libkwin-init.txt" || { echo "built libkwin not loaded" >&2; fail; }
-if grep -qE 'calling init: /usr/lib(64)?/libkwin\.so' "$out/libkwin-init.txt"; then echo "Fedora's libkwin loaded" >&2; fail; fi
+others=$(grep -vE 'calling init: /build/bin/libkwin\.so' "$out/libkwin-init.txt" | grep -E 'calling init: .*libkwin\.so' || true)
+[ -z "$others" ] || { printf 'a libkwin other than the built one was loaded:\n%s\n' "$others" >&2; fail; }
 printf 'core=0\n' >>"$out/STATUS"
 if [ "${MEMCHECK:-0}" = 1 ]; then
     stage=memcheck

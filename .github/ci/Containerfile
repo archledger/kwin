@@ -4,7 +4,9 @@
 # the package names of the earlier KWin builder (packages-old-builder.txt) and the build dependencies
 # of Fedora's kwin source package. Packages that no longer exist are skipped and listed in /skipped.txt.
 # The image includes Fedora's own KWin; suites.sh hides its scripted effects and loads the built libkwin.
-FROM registry.fedoraproject.org/fedora:44
+# FEDORA_RELEASE selects the release (suites.sh passes 44 or 45); /etc/kwin-ci/env.sh is env-fedora.sh.
+ARG FEDORA_RELEASE=44
+FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE}
 COPY packages-old-builder.txt /packages-old-builder.txt
 RUN dnf -y upgrade --refresh \
  && dnf -y --setopt=install_weak_deps=False install --skip-unavailable $(cat /packages-old-builder.txt) 2>&1 | tee /install.log \
@@ -14,3 +16,4 @@ RUN rpm -qa --qf '%{NAME}\n' | LC_ALL=C sort -u > /installed-names.txt \
  && LC_ALL=C sort -u /packages-old-builder.txt > /old-names.txt \
  && LC_ALL=C comm -23 /old-names.txt /installed-names.txt > /skipped.txt \
  && rpm -qa --qf '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /packages.tsv
+COPY env-fedora.sh /etc/kwin-ci/env.sh

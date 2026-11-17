@@ -5,7 +5,9 @@
 # - commits: every fork commit (those not on an upstream Plasma/* mirror branch) carries exactly one
 #   Signed-off-by trailer and no other trailer, credits no AI tool, and has a signature GitHub verifies;
 # - suites: the 18 qualification suites in the ThinkPad lane's Fedora 44 container (.github/ci/suites.sh),
-#   with Valgrind Memcheck over the closure and reentry functions on the weekly run or on request.
+#   with Valgrind Memcheck over the closure and reentry functions on the weekly run or on request;
+# - distro-suites: the same suites, built with each system's own packaging flags, on the other systems
+#   that can build the 6.8 line (Fedora 45, Arch Linux, KDE neon, NixOS unstable); not required checks.
 # Candidate branches (candidate/**) are where a new tip is checked before plasma-fusion moves to it.
 
 name: fork CI
@@ -136,6 +138,78 @@ jobs:
         if: always()
         with:
           name: fork-ci-suites
+          path: ${{ runner.temp }}/ci/out
+          retention-days: 14
+          if-no-files-found: warn
+
+  distro-suites:
+    name: "KWin 18 suites (${{ matrix.name }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora45
+            name: Fedora 45
+          - distro: arch
+            name: Arch Linux
+          - distro: neon
+            name: KDE neon
+          - distro: nixos
+            name: NixOS unstable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Room for the image and the build (the runner's preinstalled toolchains are not used)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h / "$RUNNER_TEMP"
+
+      - name: KWin's software render device (KWin 6.8 composites only on a render device; runners have no GPU)
+        run: |
+          set -euo pipefail
+          [ -e /dev/udmabuf ] || sudo modprobe udmabuf
+          # The runner is a throwaway VM and the containers run as the runner user (rootless podman).
+          sudo chmod 0666 /dev/udmabuf
+          ls -l /dev/udmabuf
+          ls -l /dev/dri 2>/dev/null || echo "no /dev/dri: the suites use KWin's software device over /dev/udmabuf"
+
+      - name: Build and run the suites
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: .github/ci/suites.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/ci"
+
+      - name: Summary
+        if: always()
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          out=$RUNNER_TEMP/ci/out
+          {
+            if [ "$DISTRO" = nixos ]; then
+              printf 'nixpkgs revision (pinned in .github/ci/Containerfile.nixos): %s\n\n' \
+                "$(sed -n 's/^ARG NIXPKGS_REVISION=//p' .github/ci/Containerfile.nixos)"
+            fi
+            echo '```'
+            cat "$out/STATUS" "$out/render-device.txt" "$out/summary.txt" 2>/dev/null || echo "no results (see the logs)"
+            echo '```'
+            if [ -s "$out/repeats.txt" ]; then
+              echo 'Suites that needed a repeat (failed attempts):'
+              echo '```'; cat "$out/repeats.txt"; echo '```'
+            fi
+            if [ -s "$out/skipped.txt" ]; then
+              echo 'Listed packages the system does not have (skipped):'
+              echo '```'; cat "$out/skipped.txt"; echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fork-ci-suites-${{ matrix.distro }}
           path: ${{ runner.temp }}/ci/out
           retention-days: 14
           if-no-files-found: warn
