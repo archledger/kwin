@@ -8,6 +8,9 @@
 #   in /skipped.txt.
 # - arch, neon, nixos (Containerfile.<name>): that system's KWin build dependencies, its own KWin and the
 #   run-time tools; each records what it skipped in /skipped.txt.
+# - kde-master (Containerfile.kde-master): the Fedora 44 image plus the KDE master dependencies that KWin
+#   master needs beyond Fedora's release (kde-master-deps.txt, pinned commits), for a port branch to the
+#   next Plasma series (port/X.Y, CANDIDATES.md); its env.sh is Fedora's.
 # Every image carries /etc/kwin-ci/env.sh (from env-<system>.sh here), sourced at the start of each build
 # and test container: the system's own packaging build flags and configure call, and its run-time paths.
 # The targets, suites, test runs and checks below are the same on every system. Each image includes its
@@ -22,8 +25,8 @@ ci=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 distro=${DISTRO:-fedora44}
 case $distro in
 fedora44 | fedora45) recipe=(-f "$ci/Containerfile" --build-arg "FEDORA_RELEASE=${distro#fedora}") ;;
-arch | neon | nixos) recipe=(-f "$ci/Containerfile.$distro") ;;
-*) echo "unknown DISTRO '$distro' (fedora44, fedora45, arch, neon or nixos)" >&2; exit 64 ;;
+arch | neon | nixos | kde-master) recipe=(-f "$ci/Containerfile.$distro") ;;
+*) echo "unknown DISTRO '$distro' (fedora44, fedora45, arch, neon, nixos or kde-master)" >&2; exit 64 ;;
 esac
 # The Memcheck selection and its suppression were chosen on Fedora 44.
 [ "${MEMCHECK:-0}" != 1 ] || [ "$distro" = fedora44 ] || { echo "Memcheck runs on fedora44 only" >&2; exit 64; }

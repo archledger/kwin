@@ -45,6 +45,10 @@ jobs:
           sudo chmod 0666 /dev/udmabuf
 
       - name: Build and test with the trusted fork recipes
+        env:
+          # Master code needs KDE master's dependencies (Containerfile.kde-master); KWin master no longer
+          # builds against a release's kglobalacceld.
+          DISTRO: kde-master
         run: |
           "$GITHUB_WORKSPACE/.github/ci/suites.sh" \
             "$RUNNER_TEMP/upstream-preview/candidate" "$RUNNER_TEMP/upstream-preview/build"

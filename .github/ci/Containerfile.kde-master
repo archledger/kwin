@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The fork's KDE master test image (DISTRO=kde-master for suites.sh), for a port branch (port/X.Y): the
+# Fedora 44 test image's steps as Containerfile has them (test_suites.py keeps the two the same), then
+# the KDE master dependencies that KWin master needs beyond Fedora's release (kde-master-deps.txt), each
+# built from its pinned commit as Fedora's own package builds it (rpm's %cmake_kf6) and installed over
+# Fedora's (kde-master-build.sh). /packages.tsv lists them as kde-master:REPOSITORY with the commit.
+# /etc/kwin-ci/env.sh is env-fedora.sh.
+ARG FEDORA_RELEASE=44
+FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE}
+COPY packages-old-builder.txt /packages-old-builder.txt
+RUN dnf -y upgrade --refresh \
+ && dnf -y --setopt=install_weak_deps=False install --skip-unavailable $(cat /packages-old-builder.txt) 2>&1 | tee /install.log \
+ && dnf -y --setopt=install_weak_deps=False builddep --enablerepo=fedora-source --enablerepo=updates-source kwin \
+ && dnf clean all
+RUN rpm -qa --qf '%{NAME}\n' | LC_ALL=C sort -u > /installed-names.txt \
+ && LC_ALL=C sort -u /packages-old-builder.txt > /old-names.txt \
+ && LC_ALL=C comm -23 /old-names.txt /installed-names.txt > /skipped.txt \
+ && rpm -qa --qf '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /packages.tsv
+COPY kde-master-deps.txt kde-master-build.sh /
+RUN bash /kde-master-build.sh /kde-master-deps.txt /packages.tsv \
+ && LC_ALL=C sort -o /packages.tsv /packages.tsv
+COPY env-fedora.sh /etc/kwin-ci/env.sh

@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# A port branch (port/X.Y: the fork's delta rebased onto KDE master for the next Plasma series, CANDIDATES.md)
+# built and tested in the KDE master image (DISTRO=kde-master) with this branch's trusted tools. The port
+# branch is the source under test only; its own .github is not used.
+name: port branch on KDE master
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "The port branch (port/X.Y)"
+        type: string
+        default: "port/6.9"
+  schedule:
+    - cron: "17 4 * * 2" # Tuesdays 04:17 UTC
+  pull_request:
+    branches: ["plasma-fusion"]
+    paths:
+      # Every input of the lane: suites.sh, the Fedora recipe the master recipe follows, env.sh, the pins.
+      - ".github/ci/**"
+      - ".github/workflows/port-preview.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: port-preview-${{ github.ref }}-${{ inputs.branch || 'port/6.9' }}
+  cancel-in-progress: false
+
+jobs:
+  suites:
+    name: "KWin suites on KDE master (port branch)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The port branch, as the source under test
+        env:
+          BRANCH: ${{ inputs.branch || 'port/6.9' }}
+        run: |
+          set -euo pipefail
+          [[ $BRANCH =~ ^port/[0-9]+\.[0-9]+$ ]] || { echo "::error::not a port branch: $BRANCH"; exit 1; }
+          git init -q "$RUNNER_TEMP/port"
+          git -C "$RUNNER_TEMP/port" fetch -q --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/heads/$BRANCH"
+          git -C "$RUNNER_TEMP/port" checkout -q --detach FETCH_HEAD
+          git -C "$RUNNER_TEMP/port" log -1 --format='%H %s'
+
+      - name: Room for the image and the build, and KWin's software render device
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          [ -e /dev/udmabuf ] || sudo modprobe udmabuf
+          sudo chmod 0666 /dev/udmabuf
+
+      - name: Build and run the suites
+        env:
+          DISTRO: kde-master
+          # KWin's software render device over /dev/udmabuf, whatever /dev/dri the runner has.
+          KWIN_CI_RENDER: software
+        run: |
+          python3 -m unittest discover -s .github/ci -p 'test_*.py'
+          .github/ci/suites.sh "$RUNNER_TEMP/port" "$RUNNER_TEMP/ci"
+
+      - name: Summary
+        if: always()
+        run: |
+          out=$RUNNER_TEMP/ci/out
+          {
+            echo '```'
+            cat "$out/STATUS" "$out/render-device.txt" "$out/summary.txt" 2>/dev/null || echo "no results (see the logs)"
+            grep '^kde-master:' "$out/packages.tsv" 2>/dev/null || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: port-kde-master-suites
+          path: ${{ runner.temp }}/ci/out/
+          retention-days: 14
+          if-no-files-found: warn
