@@ -4,7 +4,7 @@
 */
 #include "kwin_wayland_test.h"
 
-#include "backends/virtual/virtual_egl_backend.h"
+#include "backends/virtual/virtual_layer.h"
 #include "compositor.h"
 #include "core/renderbackend.h"
 #include "effect/effectframe.h"
@@ -50,16 +50,15 @@ static QImage grabOutput(LogicalOutput *output)
     if (!view) {
         return {};
     }
-    auto layer = dynamic_cast<VirtualEglLayer *>(view->layer());
-    auto backend = dynamic_cast<EglBackend *>(Compositor::self()->backend());
-    if (!layer || !layer->texture() || !backend || !backend->openglContext()->makeCurrent()) {
+    auto layer = dynamic_cast<VirtualLayer *>(view->layer());
+    if (!layer) {
         return {};
     }
     if (layer->sourceRect() != RectF(view->deviceRect()) || layer->targetRect() != view->deviceRect()) {
         return {};
     }
-    // The virtual output target already flips the scene into OpenGL's buffer coordinates.
-    return layer->texture()->toImage();
+    // The layer's current buffer, as KDE's own tests read the virtual output (fractional_repaint_test).
+    return layer->download();
 }
 
 // Plasma/6.8 constructs a RenderTarget from a QImage; master only wraps
@@ -84,7 +83,7 @@ void emplaceEffectFrameTarget(ImageOptional &image, TargetOptional &target)
     } else {
         // A foreign wrapper owns nothing and performs no GL calls; it is static
         // so it never destructs mid-test, and its context is recorded while the
-        // shared context is current, the same way grabOutput() makes it current.
+        // shared context is current.
         static GLFramebuffer targetFramebuffer = []() {
             auto openglBackend = dynamic_cast<EglBackend *>(Compositor::self()->backend());
             openglBackend->openglContext()->makeCurrent();
