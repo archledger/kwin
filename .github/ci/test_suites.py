@@ -127,6 +127,37 @@ class SuiteWrapperTest(unittest.TestCase):
             self.assertFalse(self.capture.exists())
         self.assertNotIn("renderDtest", result.stderr)
 
+    def build_container_args(self, image_user):
+        # A builder that succeeds and an image that names image_user; the first build container stops.
+        (self.bin / "podman").write_text(
+            "#!/usr/bin/python3\nimport json,os,sys\n"
+            "args=sys.argv[1:]\n"
+            "if args[0]=='build': raise SystemExit(0)\n"
+            "if args[:2]==['image','inspect']:\n"
+            "    print(os.environ['IMAGE_USER'] if 'User' in args[-1] else 'sha256:fixture')\n"
+            "    raise SystemExit(0)\n"
+            "if 'cat' in args: raise SystemExit(0)\n"
+            "open(os.environ['CAPTURE'],'w').write(json.dumps(args))\n"
+            "raise SystemExit(99)\n"
+        )
+        result = self.run_wrapper(IMAGE_USER=image_user)
+        self.assertNotEqual(result.returncode, 0)
+        return json.loads(self.capture.read_text())
+
+    def test_containers_run_as_the_invoking_user(self):
+        for image_user in ("", "0:0", "neon"):
+            with self.subTest(image_user=image_user):
+                self.capture.unlink(missing_ok=True)
+                args = self.build_container_args(image_user)
+                self.assertEqual(args[0], "run")
+                self.assertIn("--userns=keep-id", args)
+                if image_user:
+                    self.assertEqual(
+                        args[args.index("--user") + 1], f"{os.getuid()}:{os.getgid()}"
+                    )
+                else:
+                    self.assertNotIn("--user", args)
+
     def test_render_node_is_used_by_default(self):
         self.image_build()
         self.assertEqual(

@@ -77,6 +77,11 @@ printf 'image=0\n' >>"$out/STATUS"
 # shellcheck disable=SC2054 # the commas belong to the --tmpfs option value
 common=(--rm --userns=keep-id --network=none --ulimit core=1:1 --cap-drop=all --security-opt=no-new-privileges --read-only
     --cpus="$cpus" --memory=12g --memory-swap=12g --tmpfs /tmp:rw,nosuid,nodev,size=1g)
+# With --userns=keep-id, Podman 4 (the hosted runners') runs as the invoking user only when the image names
+# no user. The neon and NixOS images name one, so their containers get the invoking user explicitly.
+if [ -n "$(podman image inspect "$image" --format '{{.Config.User}}')" ]; then
+    common+=(--user "$(id -u):$(id -g)")
+fi
 container() {
     # The image's env.sh sets the system's packaging build environment (on Fedora, the package identity
     # that its linker specs read, as in rpmbuild) and defines kwin_ci_configure.
