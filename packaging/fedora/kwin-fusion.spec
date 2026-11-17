@@ -21,10 +21,10 @@ Source10: macros.kwin.in
 
 ## upstream patches
 
-# Fedora's kwin-6.8.2-3 carries "compositor: handle possibly missing render device"
+# Fedora's kwin-6.8.2-3 carried "compositor: handle possibly missing render device"
 # (https://invent.kde.org/plasma/kwin/-/commit/c9d720793bbcef9483ab290673032d39441c0e6f) as a
-# patch. The fork's 6.8.2 line has that commit in its source (the stable import), so it is not
-# applied here a second time.
+# patch. The fork's 6.8.2 line has that commit in its source (the stable import), and KDE's
+# 6.8.3 has it too, so it is not applied here a second time.
 
 ## proposed patches
 
@@ -211,7 +211,8 @@ BuildArch:      noarch
 
 
 %prep
-# GitHub's archive of the tag v6.8.2-pfN unpacks to kwin-6.8.2-pfN.
+# GitHub's archive of the tag v<version>-pfN unpacks to kwin-<version>-pfN, and so does a
+# candidate commit's archive (build-fork-rpm.sh --commit).
 %autosetup -p1 -n %{name}-%{version}-pf%{pf}
 
 
