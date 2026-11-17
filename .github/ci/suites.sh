@@ -59,7 +59,11 @@ fail() {
     exit 1
 }
 node=
-[ "${KWIN_CI_RENDER:-}" = software ] || node=$(find /dev/dri -maxdepth 1 -name 'renderD*' -print 2>/dev/null | sort | head -n 1)
+if [ "${KWIN_CI_RENDER:-}" != software ]; then
+    # A host without /dev/dri has no render node: find fails there, and under pipefail that failure
+    # would end the script before the software device below.
+    node=$(find /dev/dri -maxdepth 1 -name 'renderD*' -print 2>/dev/null | sort | head -n 1 || true)
+fi
 if [ -n "$node" ]; then
     dri=(--device="$node:$node:rw" --group-add=keep-groups)
 elif [ -w /dev/udmabuf ]; then

@@ -213,6 +213,26 @@ class SuiteWrapperTest(unittest.TestCase):
             (self.work / "out/render-device.txt").read_text(), "/dev/dri/renderDtest\n"
         )
 
+    def test_host_without_dri_uses_the_software_device(self):
+        # GNU find on a missing starting point, as on a host without /dev/dri.
+        (self.bin / "find").write_text(
+            "#!/bin/sh\n"
+            "echo \"find: '/dev/dri': No such file or directory\" >&2\n"
+            "exit 1\n"
+        )
+        result = self.run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        out = self.work / "out"
+        if os.access("/dev/udmabuf", os.W_OK):
+            self.assertEqual(
+                (out / "render-device.txt").read_text(), "/dev/udmabuf (software)\n"
+            )
+            self.assertTrue(self.capture.exists())
+        else:
+            self.assertIn("device=1", (out / "STATUS").read_text())
+            self.assertIn("no writable /dev/udmabuf", result.stderr)
+            self.assertFalse(self.capture.exists())
+
     def test_existing_worktree_is_not_force_deleted(self):
         tree = self.work / "source"
         self.work.mkdir()
