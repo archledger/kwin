@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The fork's KDE neon test image (DISTRO=neon for suites.sh): neon's user edition (Plasma and neon's KWin
+# on Ubuntu 24.04) with current packages, the build dependencies of neon's kwin source package (apt-get
+# build-dep from neon's deb-src archive) and Ninja, the generator the suites build with. Nothing is skipped
+# (/skipped.txt stays empty). /etc/kwin-ci/env.sh (env-neon.sh) configures as neon's debian/rules does.
+FROM invent-registry.kde.org/neon/docker-images/plasma:user
+USER root
+# neon's apt pins prefer neon's own builds, also over a newer Ubuntu version (FreeRDP, for example), so an
+# upgrade that follows them can downgrade.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -y --allow-downgrades full-upgrade \
+ && DEBIAN_FRONTEND=noninteractive apt-get -y build-dep kwin \
+ && DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install ninja-build \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+# debhelper runs in /, the source package root that contains /source; its debian/ directory is the build
+# container's scratch space.
+RUN ln -s /scratch/debian /debian \
+ && : > /skipped.txt \
+ && dpkg-query -W -f '${Package}:${Architecture}\t${Version}\n' > /packages.unsorted \
+ && LC_ALL=C sort /packages.unsorted > /packages.tsv \
+ && rm /packages.unsorted
+COPY env-neon.sh /etc/kwin-ci/env.sh
+USER neon

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+# nixpkgs attributes of the NixOS image's system profile (Containerfile.nixos), all from the pinned revision;
+# the profile holds exactly these. Lines starting with # are comments.
+# The build environment itself is nixpkgs' own for kdePackages.kwin (nix print-dev-env) and is not listed here.
+# nixpkgs' own KWin, as the Fedora images carry Fedora's
+kdePackages.kwin
+# Xwayland: the X11 suites start it, and the fork's CMake requires the executable (env-nixos.sh)
+xwayland
+# Run time: the session bus tools and glxgears (X11Window starts it) on PATH, Mesa's drivers (llvmpipe),
+# and fonts
+dbus
+mesa-demos
+mesa
+noto-fonts

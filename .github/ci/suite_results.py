@@ -124,8 +124,12 @@ def validate(
         passed += success
     if "calling init: /build/bin/libkwin.so" not in libkwin_init:
         raise ValidationError("Built libkwin was not loaded by the test suites")
-    if re.search(r"calling init: /usr/lib(64)?/libkwin\.so", libkwin_init):
-        raise ValidationError("Fedora's libkwin was loaded by the test suites")
+    # Any other libkwin is the system's: /usr/lib64, /usr/lib, a multiarch directory or a /nix/store path.
+    for path in re.findall(r"calling init: (\S*libkwin\.so\S*)", libkwin_init):
+        if not path.startswith("/build/bin/libkwin.so"):
+            raise ValidationError(
+                f"A libkwin other than the built one was loaded by the test suites: {path}"
+            )
     return {
         "suites": len(cases),
         "passed": passed,

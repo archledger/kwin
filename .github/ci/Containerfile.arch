@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The fork's Arch Linux test image (DISTRO=arch for suites.sh): current packages and packages-arch.txt, which
+# lists the official kwin PKGBUILD's dependencies, base-devel, Arch's own KWin and the run-time tools. Names
+# that no longer resolve are skipped and listed in /skipped.txt. /etc/kwin-ci/env.sh (env-arch.sh) gives
+# makepkg's build flags and the PKGBUILD's configure call.
+FROM docker.io/library/archlinux:latest
+COPY packages-arch.txt /packages-arch.txt
+RUN set -o pipefail \
+ && pacman -Syu --noconfirm \
+ && grep -vE '^[[:space:]]*(#|$)' /packages-arch.txt | LC_ALL=C sort -u > /wanted-names.txt \
+ && : > /install-names.txt \
+ && : > /skipped.txt \
+ && while read -r name; do \
+      if pacman -Sp --noconfirm --print-format %n "$name" >/dev/null 2>&1; \
+      then echo "$name" >> /install-names.txt; else echo "$name" >> /skipped.txt; fi; \
+    done < /wanted-names.txt \
+ && pacman -S --noconfirm --needed $(cat /install-names.txt) \
+ && rm -rf /var/cache/pacman/pkg/*
+RUN set -o pipefail && pacman -Q | awk '{ print $1 "\t" $2 }' | LC_ALL=C sort > /packages.tsv
+COPY env-arch.sh /etc/kwin-ci/env.sh

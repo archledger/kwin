@@ -138,6 +138,23 @@ class SuiteResultsTest(unittest.TestCase):
         with self.assertRaises(suite_results.ValidationError):
             self.validate(libkwin_init=trace)
 
+    def test_every_system_libkwin_location_is_failure(self):
+        for path in (
+            "/usr/lib64/libkwin.so.6",
+            "/lib64/libkwin.so.6",
+            "/usr/lib/x86_64-linux-gnu/libkwin.so.6",
+            "/nix/store/c17lkkk8p8g8br95xgry3w9a0knqrim5-kwin-6.8.3/lib/libkwin.so.6",
+            "/build/bin/../lib/libkwin.so.6",
+        ):
+            with (
+                self.subTest(path=path),
+                self.assertRaises(suite_results.ValidationError),
+            ):
+                self.validate(
+                    libkwin_init="     25 calling init: /build/bin/libkwin.so.6\n"
+                    f"      1 calling init: {path}\n"
+                )
+
     def test_built_libkwin_trace_passes(self):
         result = self.validate(
             libkwin_init="     3 calling init: /build/bin/libkwin.so.6\n"

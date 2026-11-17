@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# The fork's NixOS test image (DISTRO=nixos for suites.sh), from one pinned nixpkgs revision. NIXPKGS_REVISION
+# is a nixos-unstable revision (https://channels.nixos.org/nixos-unstable/git-revision); move it on purpose.
+# - /etc/kwin-ci/devenv.sh: nixpkgs' build environment of kdePackages.kwin (nix print-dev-env), so the build
+#   and test containers run no Nix command and need no network. /etc/kwin-ci/env.sh is env-nixos.sh.
+# - /nix/var/nix/profiles/kwin-ci: the system profile, exactly the attributes in packages-nixos.txt from the
+#   pinned revision (checked below), linked as /usr/share. Nothing is skipped (/skipped.txt stays empty).
+# - /etc/dbus-1: the bus configuration NixOS generates (makeDBusConf from the pinned revision: the dbus
+#   package's share/dbus-1/session.conf with its includes replaced by service directories), where nixpkgs'
+#   dbus-daemon reads it; the session bus is checked with dbus-run-session -- true, with the profile's
+#   programs on PATH as in the test containers (dbus-run-session starts dbus-daemon from PATH).
+# - /packages.tsv: the revision, then every store path of both closures.
+FROM docker.io/nixos/nix:latest
+ARG NIXPKGS_REVISION=d5cc6833999746cffdfe0598f7bc801a57b887a9
+COPY packages-nixos.txt /packages-nixos.txt
+RUN set -euo pipefail \
+ && case $NIXPKGS_REVISION in '' | *[!0-9a-f]*) echo "NIXPKGS_REVISION is not a commit" >&2; exit 1 ;; esac \
+ && [ ${#NIXPKGS_REVISION} -eq 40 ] \
+ && nixpkgs=github:NixOS/nixpkgs/$NIXPKGS_REVISION \
+ && nx() { nix --extra-experimental-features 'nix-command flakes' "$@"; } \
+ && nix --version \
+ && mkdir -p /etc/kwin-ci \
+ && nx print-dev-env --profile /nix/var/nix/profiles/kwin-dev "$nixpkgs#kdePackages.kwin" > /etc/kwin-ci/devenv.sh \
+ && grep -vE '^[[:space:]]*(#|$)' /packages-nixos.txt > /wanted-names.txt \
+ && : > /skipped.txt \
+ && refs= \
+ && while read -r name; do refs="$refs $nixpkgs#$name"; done < /wanted-names.txt \
+ && nx profile add --profile /nix/var/nix/profiles/kwin-ci $refs \
+ && nx profile list --profile /nix/var/nix/profiles/kwin-ci --json \
+      | grep -oE '"(attrPath|originalUrl)":"[^"]*"' | LC_ALL=C sort > /profile-elements.txt \
+ && while read -r name; do \
+      printf '"attrPath":"legacyPackages.x86_64-linux.%s"\n"originalUrl":"%s"\n' "$name" "$nixpkgs"; \
+    done < /wanted-names.txt | LC_ALL=C sort > /wanted-elements.txt \
+ && { [ "$(cat /profile-elements.txt)" = "$(cat /wanted-elements.txt)" ] \
+      || { echo "the profile does not hold exactly packages-nixos.txt from $nixpkgs" >&2; exit 1; }; } \
+ && [ -x /nix/var/nix/profiles/kwin-ci/bin/Xwayland ] \
+ && nx build --out-link /etc/kwin-ci/fonts.conf --expr \
+      "with (builtins.getFlake \"$nixpkgs\").legacyPackages.x86_64-linux; makeFontsConf { fontDirectories = [ noto-fonts ]; }" \
+ && nx build --out-link /etc/dbus-1 --expr \
+      "with (builtins.getFlake \"$nixpkgs\").legacyPackages.x86_64-linux; makeDBusConf.override { serviceDirectories = [ dbus ]; }" \
+ && PATH=/nix/var/nix/profiles/kwin-ci/bin:$PATH dbus-run-session -- true \
+ && echo "session bus check: dbus-run-session -- true exited 0 with /etc/dbus-1/session.conf from $(readlink /etc/dbus-1)" \
+ && rm /usr/share \
+ && ln -s /nix/var/nix/profiles/kwin-ci/share /usr/share \
+ && [ -d /usr/share/kwin/effects ] \
+ && { printf 'nixpkgs\t%s\n' "$NIXPKGS_REVISION"; \
+      nix-store -qR /nix/var/nix/profiles/kwin-dev /nix/var/nix/profiles/kwin-ci | while read -r path; do \
+        name=${path#/nix/store/}; printf '%s\t%s\n' "${name#*-}" "$path"; done | LC_ALL=C sort; } > /packages.tsv
+COPY env-nixos.sh /etc/kwin-ci/env.sh

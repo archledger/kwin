@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 class SuiteWrapperTest(unittest.TestCase):
+    SYSTEMS = ("arch", "neon", "nixos")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -21,9 +23,8 @@ class SuiteWrapperTest(unittest.TestCase):
         self.git("config", "commit.gpgsign", "false")
         (self.repo / "CMakeLists.txt").write_text('set(PROJECT_VERSION "6.8.80")\n')
         (self.repo / ".github/ci").mkdir(parents=True)
-        (self.repo / ".github/ci/Containerfile").write_text(
-            "Untrusted candidate recipe\n"
-        )
+        for name in ("Containerfile", *(f"Containerfile.{d}" for d in self.SYSTEMS)):
+            (self.repo / ".github/ci" / name).write_text("Untrusted candidate recipe\n")
         self.git("add", ".")
         self.git("commit", "-qm", "fixture")
         self.bin = self.root / "bin"
@@ -45,12 +46,15 @@ class SuiteWrapperTest(unittest.TestCase):
             ["git", "-C", str(self.repo), *args], text=True, stderr=subprocess.PIPE
         )
 
-    def run_wrapper(self):
+    def run_wrapper(self, **variables):
         env = dict(
             os.environ,
             PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
             CAPTURE=str(self.capture),
         )
+        for name in ("DISTRO", "MEMCHECK", "KWIN_CI_RENDER"):
+            env.pop(name, None)
+        env.update(variables)
         return subprocess.run(
             ["bash", str(self.ci / "suites.sh"), str(self.repo), str(self.work)],
             capture_output=True,
@@ -59,15 +63,75 @@ class SuiteWrapperTest(unittest.TestCase):
             check=False,
         )
 
-    def test_image_recipe_comes_from_trusted_helper_directory(self):
-        result = self.run_wrapper()
+    def image_build(self, **variables):
+        result = self.run_wrapper(**variables)
         self.assertNotEqual(
             result.returncode, 0
         )  # The fake builder always stops before building.
         args = json.loads(self.capture.read_text())
         self.assertEqual(args[0], "build")
         self.assertEqual(Path(args[-1]), self.ci)
+        return args
+
+    def test_image_recipe_comes_from_trusted_helper_directory(self):
+        args = self.image_build()
         self.assertEqual(Path(args[args.index("-f") + 1]), self.ci / "Containerfile")
+        self.assertEqual(args[args.index("-t") + 1], "localhost/kwin-fork-ci:fedora44")
+        self.assertEqual(args[args.index("--build-arg") + 1], "FEDORA_RELEASE=44")
+
+    def test_each_system_builds_its_own_trusted_recipe(self):
+        expected = {
+            "fedora44": ("Containerfile", ["FEDORA_RELEASE=44"]),
+            "fedora45": ("Containerfile", ["FEDORA_RELEASE=45"]),
+            **{name: (f"Containerfile.{name}", []) for name in self.SYSTEMS},
+        }
+        for name, (recipe, build_args) in expected.items():
+            with self.subTest(system=name):
+                self.capture.unlink(missing_ok=True)
+                args = self.image_build(DISTRO=name)
+                self.assertEqual(Path(args[args.index("-f") + 1]), self.ci / recipe)
+                self.assertEqual(args[args.index("-t") + 1], f"localhost/kwin-fork-ci:{name}")
+                self.assertEqual(
+                    [args[i + 1] for i, arg in enumerate(args) if arg == "--build-arg"],
+                    build_args,
+                )
+                helper = "fedora" if name.startswith("fedora") else name
+                self.assertTrue((self.ci / recipe).is_file())
+                self.assertTrue((self.ci / f"env-{helper}.sh").is_file())
+
+    def test_unknown_system_or_option_is_refused_before_any_work(self):
+        for variables in (
+            {"DISTRO": "debian"},
+            {"DISTRO": "../Containerfile"},
+            {"DISTRO": "arch", "MEMCHECK": "1"},
+            {"DISTRO": "nixos", "MEMCHECK": "1"},
+            {"KWIN_CI_RENDER": "gpu"},
+        ):
+            with self.subTest(**variables):
+                result = self.run_wrapper(**variables)
+                self.assertEqual(result.returncode, 64)
+                self.assertFalse(self.capture.exists())
+                self.assertFalse(self.work.exists())
+
+    def test_software_render_device_ignores_the_render_node(self):
+        result = self.run_wrapper(KWIN_CI_RENDER="software")
+        self.assertNotEqual(result.returncode, 0)
+        out = self.work / "out"
+        if os.access("/dev/udmabuf", os.W_OK):
+            self.assertEqual(
+                (out / "render-device.txt").read_text(), "/dev/udmabuf (software)\n"
+            )
+            self.assertTrue(self.capture.exists())
+        else:
+            self.assertIn("device=1", (out / "STATUS").read_text())
+            self.assertFalse(self.capture.exists())
+        self.assertNotIn("renderDtest", result.stderr)
+
+    def test_render_node_is_used_by_default(self):
+        self.image_build()
+        self.assertEqual(
+            (self.work / "out/render-device.txt").read_text(), "/dev/dri/renderDtest\n"
+        )
 
     def test_existing_worktree_is_not_force_deleted(self):
         tree = self.work / "source"
