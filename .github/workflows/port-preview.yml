@@ -17,8 +17,8 @@ on:
   pull_request:
     branches: ["plasma-fusion"]
     paths:
-      - ".github/ci/Containerfile.kde-master"
-      - ".github/ci/kde-master-*"
+      # Every input of the lane: suites.sh, the Fedora recipe the master recipe follows, env.sh, the pins.
+      - ".github/ci/**"
       - ".github/workflows/port-preview.yml"
 
 permissions:
@@ -58,6 +58,8 @@ jobs:
       - name: Build and run the suites
         env:
           DISTRO: kde-master
+          # KWin's software render device over /dev/udmabuf, whatever /dev/dri the runner has.
+          KWIN_CI_RENDER: software
         run: |
           python3 -m unittest discover -s .github/ci -p 'test_*.py'
           .github/ci/suites.sh "$RUNNER_TEMP/port" "$RUNNER_TEMP/ci"
