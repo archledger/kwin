@@ -119,7 +119,8 @@ The replay refuses a new series, so the delta for the next Plasma series is reba
 early, on a port branch: `port/X.Y` (now `port/6.9`), the latest candidate's commits rebased onto
 KDE master, from which KDE branches `Plasma/X.Y` at the series' first beta.
 
-- **The rebase** is the replay's own: `git rebase --onto MASTER vA.B.C candidate/A.B.C-pfN
+- **The rebase** is the replay's own, on a branch of its own, so the candidate branch stays as it
+  is: `git switch -c port/X.Y candidate/A.B.C-pfN`, then `git rebase --onto MASTER vA.B.C
   --empty=drop --no-autosquash --no-update-refs --gpg-sign=KEY`. A conflict is resolved as the
   fork's change applied to master's code: the fork's lines are kept, and a line master removed
   stays removed. The resolutions are recorded with the run.
