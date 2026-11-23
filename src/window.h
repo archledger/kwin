@@ -51,6 +51,7 @@ namespace KWin
 
 class PlasmaWindowInterface;
 class SurfaceInterface;
+class BackendOutput;
 class Group;
 class LogicalOutput;
 class ClientMachine;
@@ -2674,6 +2675,7 @@ protected:
     RectF moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea);
     RectF ensureSpecialStateGeometry(const RectF &geometry);
 
+    void observeOffscreenFrameCallbackBackend(BackendOutput *backend);
     LogicalOutput *updateOffscreenFrameCallbackTimer();
     void maybeSendFrameCallback();
 
@@ -2847,6 +2849,9 @@ protected:
     bool m_lockScreenOverlay = false;
     uint32_t m_offscreenRenderCount = 0;
     QTimer m_offscreenFramecallbackTimer;
+    QPointer<BackendOutput> m_offscreenFrameCallbackBackend;
+    QMetaObject::Connection m_offscreenFrameModeConnection;
+    QMetaObject::Connection m_offscreenFrameEnabledConnection;
 
     QString m_tag;
     QString m_description;

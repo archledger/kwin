@@ -18,10 +18,12 @@
 #include "client_machine.h"
 #include "compositor.h"
 #include "core/output.h"
+#include "core/outputbackend.h"
 #include "decorations/decoratedwindow.h"
 #include "decorations/decorationpalette.h"
 #include "focuschain.h"
 #include "input.h"
+#include "main.h"
 #include "outline.h"
 #include "placement.h"
 #include "pointer_input.h"
@@ -561,6 +563,7 @@ void Window::markAsDeleted()
     Q_ASSERT(!m_deleted);
     invalidateTransientRestoreAttempt();
     m_deleted = true;
+    observeOffscreenFrameCallbackBackend(nullptr);
     m_offscreenFramecallbackTimer.stop();
     workspace()->addDeleted(this);
 }
@@ -6753,6 +6756,7 @@ void Window::unrefOffscreenRendering()
     Q_ASSERT(m_offscreenRenderCount);
     m_offscreenRenderCount--;
     if (m_offscreenRenderCount == 0) {
+        observeOffscreenFrameCallbackBackend(nullptr);
         m_offscreenFramecallbackTimer.stop();
         Q_EMIT offscreenRenderingChanged();
     }
@@ -6763,17 +6767,38 @@ bool Window::isOffscreenRendering() const
     return m_offscreenRenderCount > 0;
 }
 
+void Window::observeOffscreenFrameCallbackBackend(BackendOutput *backend)
+{
+    if (m_offscreenFrameCallbackBackend == backend) {
+        return;
+    }
+    disconnect(m_offscreenFrameModeConnection);
+    disconnect(m_offscreenFrameEnabledConnection);
+    m_offscreenFrameCallbackBackend = backend;
+    if (backend) {
+        // The mode or enabled state can change without a workspace reassignment.
+        const auto update = [this]() {
+            updateOffscreenFrameCallbackTimer();
+        };
+        m_offscreenFrameModeConnection = connect(backend, &BackendOutput::currentModeChanged, this, update);
+        m_offscreenFrameEnabledConnection = connect(backend, &BackendOutput::enabledChanged, this, update);
+    }
+}
+
 LogicalOutput *Window::updateOffscreenFrameCallbackTimer()
 {
-    // Windows kept for animations can outlive their output. Confirm membership before
-    // using the window's output association, and stop until a usable output is assigned.
-    LogicalOutput *frameOutput = output();
-    if (!isOffscreenRendering() || isDeleted() || !frameOutput || !workspace()->outputs().contains(frameOutput)
-        || !frameOutput->backendOutput()->isEnabled()) {
-        m_offscreenFramecallbackTimer.stop();
-        return nullptr;
+    // Workspace reconciliation can lag backend retirement. The workspace owns the
+    // placeholder itself, so it never appears in the output backend's list.
+    LogicalOutput *frameOutput = nullptr;
+    if (isOffscreenRendering() && !isDeleted() && workspace()->outputs().contains(output())) {
+        frameOutput = output();
     }
-    const auto refreshRate = frameOutput->refreshRate();
+    BackendOutput *backend = frameOutput ? frameOutput->backendOutput() : nullptr;
+    if (backend && !backend->isPlaceholder() && !kwinApp()->outputBackend()->outputs().contains(backend)) {
+        backend = nullptr;
+    }
+    observeOffscreenFrameCallbackBackend(backend);
+    const auto refreshRate = backend && backend->isEnabled() ? backend->refreshRate() : 0;
     if (refreshRate == 0) {
         m_offscreenFramecallbackTimer.stop();
         return nullptr;
