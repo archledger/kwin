@@ -154,6 +154,11 @@ public:
      * @returns the current GraphicsBuffer, might be @c nullptr.
      */
     GraphicsBuffer *buffer() const;
+    /**
+     * Whether the transaction being reported by committed() included a buffer attachment.
+     * Re-attaching the same buffer counts, even though bufferChanged() is not emitted.
+     */
+    bool commitHasBufferAttachment() const;
     QPointF offset() const;
     /**
      * Returns the current size of the surface, in surface coordinates.

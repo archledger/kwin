@@ -340,6 +340,8 @@ private Q_SLOTS:
     void testRemoveActiveOutputBeforeInitialCommit();
     void testRemoveActiveOutputBeforeMap();
     void testRequestedGeometrySettlesOnCommit();
+    void testSuspendedResizeSurvivesCommitWithoutNewBuffer_data();
+    void testSuspendedResizeSurvivesCommitWithoutNewBuffer();
     void testRequestedGeometryAfterMappingDestroysWindow();
     void testRequestedGeometryReentrantMove();
     void testGeometrySupersession_data();
@@ -4652,6 +4654,68 @@ void TestXdgShellWindow::testRequestedGeometrySettlesOnCommit()
     QCOMPARE(window->frameGeometry(), RectF(position, QSizeF(350, 250)));
     QCOMPARE(window->property("requestedGeometry").value<RectF>(), window->frameGeometry());
     QCOMPARE(requestedGeometryChangedSpy.count(), 1);
+}
+
+void TestXdgShellWindow::testSuspendedResizeSurvivesCommitWithoutNewBuffer_data()
+{
+    QTest::addColumn<QSize>("replacementSize");
+    QTest::newRow("state-only") << QSize();
+    QTest::newRow("new-buffer-old-size") << QSize(300, 200);
+    QTest::newRow("new-buffer-different-size") << QSize(250, 150);
+}
+
+void TestXdgShellWindow::testSuspendedResizeSurvivesCommitWithoutNewBuffer()
+{
+    QFETCH(QSize, replacementSize);
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    QSignalSpy toplevelSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+    QSignalSpy surfaceSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    const QSize oldSize(300, 200);
+    Window *window = Test::renderAndWaitForShown(surface.get(), oldSize, Qt::red);
+    QVERIFY(window);
+    QVERIFY(surfaceSpy.wait());
+    shellSurface->xdgSurface()->ack_configure(surfaceSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), oldSize, Qt::red);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(!window->isSuspended());
+
+    window->setSuspended(true);
+    QVERIFY(surfaceSpy.wait());
+    shellSurface->xdgSurface()->ack_configure(surfaceSpy.last().at(0).value<quint32>());
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+
+    const QRectF restore(window->pos(), QSizeF(200, 100));
+    window->moveResize(restore);
+    QVERIFY(surfaceSpy.wait());
+    QCOMPARE(toplevelSpy.last().at(0).toSize(), restore.size().toSize());
+    QCOMPARE(QRectF(window->moveResizeGeometry()), restore);
+
+    // A suspended client may confirm the state without delivering replacement content.
+    shellSurface->xdgSurface()->ack_configure(surfaceSpy.last().at(0).value<quint32>());
+    if (replacementSize.isValid()) {
+        Test::render(surface.get(), replacementSize, Qt::blue);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->frameGeometry().size(), QSizeF(replacementSize));
+        QCOMPARE(window->moveResizeGeometry(), window->frameGeometry());
+        return;
+    }
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry().size(), QSizeF(oldSize));
+    QCOMPARE(QRectF(window->moveResizeGeometry()), restore);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->moveResizeGeometry()), restore);
+
+    window->setSuspended(false);
+    QVERIFY(surfaceSpy.wait());
+    QCOMPARE(toplevelSpy.last().at(0).toSize(), restore.size().toSize());
+    shellSurface->xdgSurface()->ack_configure(surfaceSpy.last().at(0).value<quint32>());
+    Test::render(surface.get(), restore.size().toSize(), Qt::blue);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(QRectF(window->frameGeometry()), restore);
 }
 
 void TestXdgShellWindow::testRequestedGeometryAfterMappingDestroysWindow()
