@@ -937,7 +937,15 @@ void XdgToplevelWindow::handleRoleCommit()
         frameGeometry = placement->bounds;
     }
 
-    const bool synchronized = synchronizeCommittedGeometry(frameGeometry, origin, generation);
+    // A suspended toplevel can acknowledge a resize with a state-only commit while retaining
+    // its current content size. Keep the ordinary requested size so resuming can configure
+    // it again; a new attachment or changed content size still settles normally.
+    const bool keepSuspendedResize = isSuspended()
+        && origin.kind == GeometryRequestOrigin::Kind::Ordinary
+        && !surface()->commitHasBufferAttachment()
+        && samePixels(frameGeometry.size(), m_frameGeometry.size(), targetScale())
+        && !samePixels(frameGeometry.size(), moveResizeGeometry().size(), targetScale());
+    const bool synchronized = keepSuspendedResize || synchronizeCommittedGeometry(frameGeometry, origin, generation);
     if (!configureCommitIsCurrent(generation)) {
         return;
     }

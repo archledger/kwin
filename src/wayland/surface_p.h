@@ -180,6 +180,7 @@ public:
     std::optional<RegionF> effectivePointerConfinement;
     RegionF opaqueRegion;
     GraphicsBufferRef bufferRef;
+    bool bufferAttachmentInCommit = false;
     Region bufferDamage;
     bool mapped = false;
     qreal serverScale = 1.0;
