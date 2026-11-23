@@ -45,6 +45,11 @@ static bool trackedPlacementIsAutomatic(const Window *window)
     return window->hasTransientOwnershipRecord();
 }
 
+static bool trackedGeometryIsAutomatic(const Window *window)
+{
+    return trackedPlacementIsAutomatic(window) || window->hasAutomaticStackPlacement();
+}
+
 void PlacementTracker::add(Window *window)
 {
     if (window->isUnmanaged() || window->isAppletPopup() || window->isSpecialWindow()) {
@@ -71,7 +76,7 @@ void PlacementTracker::add(Window *window)
     connect(window, &Window::fullscreenGeometryRestoreChanged, this, [this, window]() {
         saveFullscreenGeometryRestore(window);
     });
-    if (!trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
+    if (!trackedGeometryIsAutomatic(window)) {
         WindowData data = dataForWindow(window);
         m_data[m_currentKey][window] = data;
     }
@@ -101,9 +106,8 @@ void PlacementTracker::restore(const QString &key)
     inhibit();
     for (const auto window : std::as_const(m_savedWindows)) {
         const auto it = dataMap.find(window);
-        if (it == dataMap.end()) {
-        }
-        if (it != dataMap.end()) {
+        // A mode or interaction may have been saved before the first ordinary geometry.
+        if (it != dataMap.end() && it->geometry.isValid()) {
             const WindowData &newData = it.value();
 
             const auto checkQuickTileMode = [window](QuickTileMode oldMode) {
@@ -150,7 +154,7 @@ void PlacementTracker::restore(const QString &key)
             }
         }
         // ensure data in current map is always up to date
-        if (!trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
+        if (!trackedGeometryIsAutomatic(window)) {
             dataMap[window] = dataForWindow(window);
         }
     }
@@ -165,10 +169,15 @@ void PlacementTracker::init(const QString &key)
 
 void PlacementTracker::saveGeometry(Window *window)
 {
-    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
+    if (m_inhibitCount == 0 && !trackedGeometryIsAutomatic(window)) {
         auto &data = m_data[m_currentKey][window];
-        data.geometry = window->moveResizeGeometry();
-        data.outputUuid = window->moveResizeOutput()->uuid();
+        if (!data.geometry.isValid()) {
+            // A new layout first seen with a stack cell need not have a placement yet.
+            data = dataForWindow(window);
+        } else {
+            data.geometry = window->moveResizeGeometry();
+            data.outputUuid = window->moveResizeOutput()->uuid();
+        }
     }
 }
 

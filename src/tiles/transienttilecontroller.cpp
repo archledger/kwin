@@ -615,6 +615,7 @@ TransientTileController::Result TransientTileController::placeStackWindow(quint6
     }
     if (!window || window == m_window || window->isDeleted() || !window->isNormalWindow()
         || window->isTransient() || window->isMinimized() || window->hasTransientOwnershipRecord()
+        || window->tile() || window->requestedTile()
         || window->desktops().size() != 1 || window->desktops().constFirst() != m_desktop
         || window->moveResizeOutput() != m_manager->output()
         || (!m_activity.isEmpty() && !window->isOnActivity(m_activity))

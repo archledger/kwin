@@ -303,6 +303,14 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
         }
         return !guarded || assignmentResultIsCurrent(guarded->result);
     };
+    const auto refreshStackContentOrigin = [this]() {
+        const auto origin = m_configureEvents.isEmpty() ? m_lastContentOrigin : m_configureEvents.constLast()->origin;
+        if (origin.kind == GeometryRequestOrigin::Kind::StackPlacement && origin != m_geometryRequestOrigin) {
+            // Without a new configure the client would keep committing in the old stack
+            // lineage, even on a later spontaneous resize. Let it adopt the new request.
+            scheduleConfigure();
+        }
+    };
     Q_EMIT frameGeometryAboutToChange();
     if (!current()) {
         if (guarded) {
@@ -324,6 +332,7 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             const RectF snappedRect = RectF(rect.topLeft(), nextClientSizeToFrameSize(snapToPixels(roundedClientSize, nextTargetScale())));
             const RectF target = m_configureGravity.apply(snappedRect, rect);
             if (guarded) {
+                refreshStackContentOrigin();
                 publishForAssignment(target, *guarded);
             } else {
                 // The request is resolved here, with no configure and nothing for the client to
@@ -347,6 +356,7 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
                         return;
                     }
                 }
+                refreshStackContentOrigin();
                 updateGeometry(target);
             }
         } else {
@@ -369,6 +379,7 @@ void XdgSurfaceWindow::dispatchMoveResize(const RectF &rect, MoveResizeMode mode
             configureEvent->gravity = Gravity::BottomRight;
         }
         const RectF target(rect.topLeft(), size());
+        refreshStackContentOrigin();
         if (guarded) {
             publishForAssignment(target, *guarded);
         } else {

@@ -4119,7 +4119,8 @@ void Window::move(const QPointF &point)
         return;
     }
 
-    const RectF rect = RectF(point, m_moveResizeGeometry.size());
+    // A move does not adopt the size of an automatic cell the client has not drawn yet.
+    const RectF rect(point, hasAutomaticStackPlacement() ? size() : m_moveResizeGeometry.size());
 
     performMoveResize(rect, MoveResizeMode::Move);
 }
@@ -4130,7 +4131,8 @@ void Window::resize(const QSizeF &size)
         return;
     }
 
-    const RectF rect = RectF(m_moveResizeGeometry.topLeft(), size);
+    // An ordinary resize likewise keeps the visible origin, not an uncommitted stack position.
+    const RectF rect(hasAutomaticStackPlacement() ? pos() : m_moveResizeGeometry.topLeft(), size);
 
     performMoveResize(rect, MoveResizeMode::Resize);
 }
@@ -5419,7 +5421,7 @@ Window::ConfigurePlacementPolicy Window::configurePlacementPolicy(const Geometry
     }
     if (origin.kind == GeometryRequestOrigin::Kind::StackPlacement
         && origin != m_geometryRequestOrigin) {
-        // Late automatic content may arrive, but a newer ordinary placement is authoritative.
+        // Late automatic content may arrive, but the newer request has placement authority.
         return ConfigurePlacementPolicy::ContentOnly;
     }
     if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {
@@ -6237,7 +6239,13 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
         setGeometryRestore(moveToArea(m_maximizeGeometryRestore, decision.oldScreenArea, decision.screenArea));
         break;
     case WorkspacePositionDecision::Kind::Geometry:
-        moveResize(decision.geometry);
+        // Rearrangement can translate a stack cell, but it does not make it user geometry.
+        // Carry that origin through to the placement tracker's new output-layout snapshot.
+        if (workspace()->inRearrange() && hasAutomaticStackPlacement()) {
+            performMoveResize(decision.geometry, MoveResizeMode::MoveResize, GeometryRequestOrigin::Kind::StackPlacement);
+        } else {
+            moveResize(decision.geometry);
+        }
         break;
     }
     // A released record's floating frame follows the window's screen as the restore fields
