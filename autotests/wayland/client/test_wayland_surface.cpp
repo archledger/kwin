@@ -49,6 +49,7 @@ private Q_SLOTS:
     void testDamage();
     void testFrameCallback();
     void testAttachBuffer();
+    void testCommitBufferAttachment();
     void testOpaque();
     void testInput();
     void testScale();
@@ -505,6 +506,42 @@ void TestWaylandSurface::testAttachBuffer()
 
     // TODO: add signal test on release
     buffer->unref();
+}
+
+void TestWaylandSurface::testCommitBufferAttachment()
+{
+    using namespace KWin;
+    QSignalSpy serverSurfaceCreated(m_compositorInterface, &CompositorInterface::surfaceCreated);
+    std::unique_ptr<KWayland::Client::Surface> surface(m_compositor->createSurface());
+    QVERIFY(serverSurfaceCreated.wait());
+    auto serverSurface = serverSurfaceCreated.first().first().value<SurfaceInterface *>();
+    QVERIFY(serverSurface);
+    QSignalSpy committedSpy(serverSurface, &SurfaceInterface::committed);
+    QSignalSpy bufferChangedSpy(serverSurface, &SurfaceInterface::bufferChanged);
+    QList<bool> attachments;
+    connect(serverSurface, &SurfaceInterface::committed, this, [&] {
+        attachments.append(serverSurface->commitHasBufferAttachment());
+    });
+
+    QImage image(20, 10, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::black);
+    auto buffer = m_shm->createBuffer(image);
+    surface->attachBuffer(buffer);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(committedSpy.wait());
+    QCOMPARE(bufferChangedSpy.count(), 1);
+
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(committedSpy.wait());
+    QCOMPARE(bufferChangedSpy.count(), 1);
+
+    // Re-attaching the same buffer is still an attachment, with no bufferChanged signal.
+    surface->attachBuffer(buffer);
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(committedSpy.wait());
+    QCOMPARE(bufferChangedSpy.count(), 1);
+    QCOMPARE(attachments, (QList<bool>{true, false, true}));
+    QVERIFY(!serverSurface->commitHasBufferAttachment());
 }
 
 void TestWaylandSurface::testOpaque()
