@@ -97,6 +97,13 @@ public:
                                const QString &providerToken);
 
     /**
+     * Moves a stack member without saving the automatic cell as its floating placement.
+     * The active tree generation and its provider must match. Returns the controller result.
+     */
+    Q_INVOKABLE int placeStackWindow(int generation, Window *window, const QRectF &cell,
+                                     const QString &providerToken);
+
+    /**
      * Releases the tree (the script's teardown). Returns the controller's Result enum.
      */
     Q_INVOKABLE int releaseTile(int generation);

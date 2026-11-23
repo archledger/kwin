@@ -4119,7 +4119,8 @@ void Window::move(const QPointF &point)
         return;
     }
 
-    const RectF rect = RectF(point, m_moveResizeGeometry.size());
+    // A move does not adopt the size of an automatic cell the client has not drawn yet.
+    const RectF rect(point, hasAutomaticStackPlacement() ? size() : m_moveResizeGeometry.size());
 
     performMoveResize(rect, MoveResizeMode::Move);
 }
@@ -4130,7 +4131,8 @@ void Window::resize(const QSizeF &size)
         return;
     }
 
-    const RectF rect = RectF(m_moveResizeGeometry.topLeft(), size);
+    // An ordinary resize likewise keeps the visible origin, not an uncommitted stack position.
+    const RectF rect(hasAutomaticStackPlacement() ? pos() : m_moveResizeGeometry.topLeft(), size);
 
     performMoveResize(rect, MoveResizeMode::Resize);
 }
@@ -4161,7 +4163,12 @@ void Window::geometryResizeSubmitted(quint64 generation)
     }
 }
 
-void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
+bool Window::hasAutomaticStackPlacement() const
+{
+    return m_geometryRequestOrigin.kind == GeometryRequestOrigin::Kind::StackPlacement;
+}
+
+void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, GeometryRequestOrigin::Kind origin)
 {
     // Public geometry intent: a native request in flight is cancelled, never inherited.
     cancelTransientRequest();
@@ -4177,7 +4184,7 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
         mode = MoveResizeMode::MoveResize;
     }
     const auto generation = ++m_geometryRequestGeneration;
-    m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::Ordinary, generation, 0, 0};
+    m_geometryRequestOrigin = {origin, generation, 0, 0};
     m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
     const auto finish = qScopeGuard([this, generation]() {
         // An obsolete stack frame must not clear a newer request's pending submission.
@@ -5412,6 +5419,11 @@ Window::ConfigurePlacementPolicy Window::configurePlacementPolicy(const Geometry
     if (isDeleted()) {
         return ConfigurePlacementPolicy::ContentOnly;
     }
+    if (origin.kind == GeometryRequestOrigin::Kind::StackPlacement
+        && origin != m_geometryRequestOrigin) {
+        // Late automatic content may arrive, but the newer request has placement authority.
+        return ConfigurePlacementPolicy::ContentOnly;
+    }
     if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {
         // Preserve ordinary and owned behavior outside explicit restoration. A lost restore
         // record must not turn its old request into ordinary placement authority.
@@ -6227,7 +6239,13 @@ void Window::checkWorkspacePosition(RectF oldGeometry, LogicalOutput *oldOutput)
         setGeometryRestore(moveToArea(m_maximizeGeometryRestore, decision.oldScreenArea, decision.screenArea));
         break;
     case WorkspacePositionDecision::Kind::Geometry:
-        moveResize(decision.geometry);
+        // Rearrangement can translate a stack cell, but it does not make it user geometry.
+        // Carry that origin through to the placement tracker's new output-layout snapshot.
+        if (workspace()->inRearrange() && hasAutomaticStackPlacement()) {
+            performMoveResize(decision.geometry, MoveResizeMode::MoveResize, GeometryRequestOrigin::Kind::StackPlacement);
+        } else {
+            moveResize(decision.geometry);
+        }
         break;
     }
     // A released record's floating frame follows the window's screen as the restore fields

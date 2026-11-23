@@ -1399,6 +1399,8 @@ public:
     {
         return m_transientOwnership != nullptr;
     }
+    // The last requested frame is a stack cell, not a user's saved placement.
+    bool hasAutomaticStackPlacement() const;
     /**
      * The explicit untile-or-restore action's consumption. Only an owned record may claim one
      * qualified restoration attempt; a record already Restoring (an attempt or a release in
@@ -1876,6 +1878,7 @@ private:
         enum class Kind {
             Unclassified,
             Ordinary,
+            StackPlacement,
             OwnedGeometry,
             Restoration,
         };
@@ -2449,7 +2452,7 @@ protected:
         MoveResize = Move | Resize,
     };
     virtual void moveResizeInternal(const RectF &rect, MoveResizeMode mode) = 0;
-    void performMoveResize(const RectF &rect, MoveResizeMode mode);
+    void performMoveResize(const RectF &rect, MoveResizeMode mode, GeometryRequestOrigin::Kind origin = GeometryRequestOrigin::Kind::Ordinary);
     bool geometryRequestIsCurrent(quint64 generation) const;
     void geometryResizeSubmitted(quint64 generation);
     bool transientGeometryRequestIsCurrent(quint64 generation) const;

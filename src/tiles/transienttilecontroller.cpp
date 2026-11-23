@@ -600,6 +600,56 @@ bool TransientTileController::admissionCurrent(Window *window, quint64 generatio
             && window->m_transientOwnership->writer->ownsReservation(window->internalId(), QString::number(m_ownershipGeneration)));
 }
 
+TransientTileController::Result TransientTileController::placeStackWindow(quint64 generation, Window *window, const RectF &cell,
+                                                                          const QUuid &provider)
+{
+    if (!generation || generation != m_generation || !m_window) {
+        return Result::StaleGeneration;
+    }
+    if (m_mutating || !m_membershipPublished || !m_window->m_transientOwnership
+        || !admissionCurrent(m_window, generation)) {
+        return Result::Busy;
+    }
+    if (provider != m_window->m_transientOwnership->provider) {
+        return Result::Refused;
+    }
+    if (!window || window == m_window || window->isDeleted() || !window->isNormalWindow()
+        || window->isTransient() || window->isMinimized() || window->hasTransientOwnershipRecord()
+        || window->tile() || window->requestedTile()
+        || window->desktops().size() != 1 || window->desktops().constFirst() != m_desktop
+        || window->moveResizeOutput() != m_manager->output()
+        || (!m_activity.isEmpty() && !window->isOnActivity(m_activity))
+        || !window->isMovable() || !window->isResizable() || window->isFullScreen() || window->isInteractiveMoveResize()
+        || window->requestedMaximizeMode() != MaximizeMode::MaximizeRestore || !freeOfNativeMembership(window)) {
+        return Result::Ineligible;
+    }
+    for (qreal value : {cell.x(), cell.y(), cell.width(), cell.height()}) {
+        if (!std::isfinite(value)) {
+            return Result::InvalidGeometry;
+        }
+    }
+    if (cell.isEmpty() || !workspace()->clientArea(MaximizeArea, m_manager->output()).contains(cell)) {
+        return Result::InvalidGeometry;
+    }
+    const auto before = window->geometryRequestGeneration();
+    if (before == std::numeric_limits<quint64>::max()) {
+        return Result::GenerationExhausted;
+    }
+    const QPointer<TransientTileController> controller(this);
+    const auto master = m_window;
+    const auto ownership = m_ownershipGeneration;
+    QPointer<Window> guard(window);
+    window->performMoveResize(cell, Window::MoveResizeMode::MoveResize, Window::GeometryRequestOrigin::Kind::StackPlacement);
+    // Geometry notifications may end the tree or place a newer cell. Check the admitted
+    // tree as well as the request, without blocking teardown or same-tree placements.
+    if (!controller || !guard || !guard->geometryRequestIsCurrent(before + 1) || !guard->hasAutomaticStackPlacement()
+        || !controller->m_membershipPublished || controller->m_ownershipGeneration != ownership
+        || !controller->admissionCurrent(master, generation)) {
+        return Result::Superseded;
+    }
+    return Result::Accepted;
+}
+
 TransientTileController::Result TransientTileController::admit(quint64 generation, Window *window, TransientPlacementWriter *writer,
                                                                const QUuid &provider, const QString &key, quint64 providerRevision, quint64 mapRevision)
 {

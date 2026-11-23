@@ -49,6 +49,7 @@ public:
     Result clearTree(quint64 generation);
     Result admit(quint64 generation, Window *window, TransientPlacementWriter *writer, const QUuid &provider,
                  const QString &key, quint64 providerRevision, quint64 mapRevision);
+    Result placeStackWindow(quint64 generation, Window *window, const RectF &cell, const QUuid &provider);
 
     quint64 generation() const;
     Tile *rootTile() const;
