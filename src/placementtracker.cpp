@@ -71,7 +71,7 @@ void PlacementTracker::add(Window *window)
     connect(window, &Window::fullscreenGeometryRestoreChanged, this, [this, window]() {
         saveFullscreenGeometryRestore(window);
     });
-    if (!trackedPlacementIsAutomatic(window)) {
+    if (!trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
         WindowData data = dataForWindow(window);
         m_data[m_currentKey][window] = data;
     }
@@ -150,7 +150,7 @@ void PlacementTracker::restore(const QString &key)
             }
         }
         // ensure data in current map is always up to date
-        if (!trackedPlacementIsAutomatic(window)) {
+        if (!trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
             dataMap[window] = dataForWindow(window);
         }
     }
@@ -165,7 +165,7 @@ void PlacementTracker::init(const QString &key)
 
 void PlacementTracker::saveGeometry(Window *window)
 {
-    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window)) {
+    if (m_inhibitCount == 0 && !trackedPlacementIsAutomatic(window) && !window->hasAutomaticStackPlacement()) {
         auto &data = m_data[m_currentKey][window];
         data.geometry = window->moveResizeGeometry();
         data.outputUuid = window->moveResizeOutput()->uuid();

@@ -4161,7 +4161,12 @@ void Window::geometryResizeSubmitted(quint64 generation)
     }
 }
 
-void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
+bool Window::hasAutomaticStackPlacement() const
+{
+    return m_geometryRequestOrigin.kind == GeometryRequestOrigin::Kind::StackPlacement;
+}
+
+void Window::performMoveResize(const RectF &rect, MoveResizeMode mode, GeometryRequestOrigin::Kind origin)
 {
     // Public geometry intent: a native request in flight is cancelled, never inherited.
     cancelTransientRequest();
@@ -4177,7 +4182,7 @@ void Window::performMoveResize(const RectF &rect, MoveResizeMode mode)
         mode = MoveResizeMode::MoveResize;
     }
     const auto generation = ++m_geometryRequestGeneration;
-    m_geometryRequestOrigin = {GeometryRequestOrigin::Kind::Ordinary, generation, 0, 0};
+    m_geometryRequestOrigin = {origin, generation, 0, 0};
     m_geometryResizePending = (uint(mode) & uint(MoveResizeMode::Resize)) != 0;
     const auto finish = qScopeGuard([this, generation]() {
         // An obsolete stack frame must not clear a newer request's pending submission.
@@ -5410,6 +5415,11 @@ Window::TransientRestoreClaim Window::claimTransientRestoreWithState(quint64 gen
 Window::ConfigurePlacementPolicy Window::configurePlacementPolicy(const GeometryRequestOrigin &origin) const
 {
     if (isDeleted()) {
+        return ConfigurePlacementPolicy::ContentOnly;
+    }
+    if (origin.kind == GeometryRequestOrigin::Kind::StackPlacement
+        && origin != m_geometryRequestOrigin) {
+        // Late automatic content may arrive, but a newer ordinary placement is authoritative.
         return ConfigurePlacementPolicy::ContentOnly;
     }
     if (!m_transientOwnership || !m_transientOwnership->restoreAttempt) {

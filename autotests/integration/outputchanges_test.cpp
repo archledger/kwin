@@ -126,6 +126,8 @@ private Q_SLOTS:
     void testQuickTiledWindowRestoredAfterEnablingOutput();
     void testTransientOwnedWindowRestoredAfterEnablingOutput_data();
     void testTransientOwnedWindowRestoredAfterEnablingOutput();
+    void testStackPlacementOutputHistory_data();
+    void testStackPlacementOutputHistory();
     void testQuickTileUntileWindowRestoredAfterEnablingOutput();
     void testCustomTiledWindowRestoredAfterEnablingOutput_data();
     void testCustomTiledWindowRestoredAfterEnablingOutput();
@@ -792,6 +794,147 @@ void OutputChangesTest::testTransientOwnedWindowRestoredAfterEnablingOutput()
     QCOMPARE(window->quickTileMode(), QuickTileFlag::None);
     QCOMPARE(window->requestedQuickTileMode(), QuickTileMode(QuickTileFlag::None));
     QCOMPARE(window->geometryRestore(), floatingA);
+}
+
+void OutputChangesTest::testStackPlacementOutputHistory_data()
+{
+    QTest::addColumn<bool>("automatic");
+    QTest::addColumn<bool>("lateCommit");
+    QTest::addColumn<bool>("newerOrdinary");
+    QTest::newRow("script-stack-cell") << true << false << false;
+    QTest::newRow("ordinary-geometry") << false << false << false;
+    QTest::newRow("stack-cell-committed-after-output-loss") << true << true << false;
+    QTest::newRow("newer-ordinary-move") << true << false << true;
+}
+
+void OutputChangesTest::testStackPlacementOutputHistory()
+{
+    QFETCH(bool, automatic);
+    QFETCH(bool, lateCommit);
+    QFETCH(bool, newerOrdinary);
+    const auto outputs = kwinApp()->outputBackend()->outputs();
+    QCOMPARE(outputs.size(), 2);
+    const auto bothOutputsKey = workspace()->outputLayoutId();
+    const RectF floating(42, 67, 420, 300);
+    const RectF cell(650, 25, 600, 440);
+    const RectF ordinary(66, 78, 360, 240);
+
+    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
+    shellSurface->set_app_id(QStringLiteral("org.example.stack-window"));
+    auto window = Test::renderAndWaitForShown(surface.get(), floating.size().toSize(), Qt::blue);
+    QVERIFY(window);
+    window->move(floating.topLeft());
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(window->frameGeometry(), floating);
+    QCOMPARE(window->output()->backendOutput(), outputs[0]);
+
+    std::unique_ptr<KWayland::Client::Surface> masterSurface(Test::createSurface());
+    std::unique_ptr<Test::XdgToplevel> masterShell(Test::createXdgToplevelSurface(masterSurface.get()));
+    const auto key = QStringLiteral("org.example.stack-master");
+    masterShell->set_app_id(key);
+    auto master = Test::renderAndWaitForShown(masterSurface.get(), QSize(100, 50), Qt::red);
+    QVERIFY(master);
+    QSignalSpy masterSpy(masterShell->xdgSurface(), &Test::XdgSurface::configureRequested);
+    QVERIFY(masterSpy.wait());
+    masterShell->xdgSurface()->ack_configure(masterSpy.last().at(0).value<quint32>());
+    Test::render(masterSurface.get(), QSize(100, 50), Qt::red);
+    QVERIFY(Test::waylandSync());
+
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    TransientPlacementWriter writer(directory.filePath(QStringLiteral("placementrc")));
+    QObject provider;
+    const auto token = writer.registerProvider(&provider);
+    const auto id = master->internalId();
+    QVERIFY(writer.trackWindow(id, key));
+    QCOMPARE(writer.record(token, 1, {id, QRectF(master->frameGeometry()), 1, TransientPlacementWriter::Origin::Manual}), TransientPlacementWriter::Result::Accepted);
+    TransientTileController controller;
+    const auto output = master->moveResizeOutput();
+    auto manager = workspace()->tileManager(output);
+    auto desktop = VirtualDesktopManager::self()->currentDesktop(output);
+    QCOMPARE(controller.createTree(manager, desktop, RectF(0, 0, 0.5, 1)), TransientTileController::Result::Accepted);
+    const auto state = writer.snapshot();
+    const auto generation = controller.generation();
+    const auto masterTile = controller.tile()->windowGeometry();
+    QCOMPARE(controller.admit(generation, master, &writer, token, key, state.providerRevision, state.mapRevision), TransientTileController::Result::Accepted);
+    QVERIFY(masterSpy.wait());
+    masterShell->xdgSurface()->ack_configure(masterSpy.last().at(0).value<quint32>());
+    Test::render(masterSurface.get(), masterTile.size().toSize(), Qt::red);
+    QVERIFY(Test::waylandSync());
+    QCOMPARE(master->frameGeometry(), masterTile);
+
+    QSignalSpy toplevelSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+    QSignalSpy surfaceSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    const auto waitForConfigure = [&](const RectF &geometry) {
+        const QSize size = geometry.size().toSize();
+        return QTest::qWaitFor([&] {
+            return !surfaceSpy.isEmpty() && !toplevelSpy.isEmpty() && toplevelSpy.last().at(0).value<QSize>() == size;
+        });
+    };
+    const auto commit = [&](const RectF &geometry) {
+        if (!waitForConfigure(geometry)) {
+            return false;
+        }
+        shellSurface->xdgSurface()->ack_configure(surfaceSpy.last().at(0).value<quint32>());
+        Test::render(surface.get(), geometry.size().toSize(), Qt::cyan);
+        return Test::waylandSync() && window->frameGeometry() == geometry;
+    };
+    QCOMPARE(controller.placeStackWindow(generation + 1, window, cell, token), TransientTileController::Result::StaleGeneration);
+    QCOMPARE(controller.placeStackWindow(generation, window, cell, QUuid::createUuid()), TransientTileController::Result::Refused);
+    QCOMPARE(window->moveResizeGeometry(), floating);
+    if (automatic) {
+        QCOMPARE(controller.placeStackWindow(generation, window, cell, token), TransientTileController::Result::Accepted);
+    } else {
+        window->moveResize(cell);
+    }
+    quint32 lateSerial = 0;
+    if (lateCommit) {
+        QVERIFY(waitForConfigure(cell));
+        lateSerial = surfaceSpy.last().at(0).value<quint32>();
+        QCOMPARE(window->frameGeometry(), floating);
+    } else {
+        QVERIFY(commit(cell));
+    }
+    if (newerOrdinary) {
+        toplevelSpy.clear();
+        surfaceSpy.clear();
+        window->moveResize(ordinary);
+        QVERIFY(commit(ordinary));
+        QVERIFY(!window->hasAutomaticStackPlacement());
+    }
+
+    OutputConfiguration disable;
+    disable.changeSet(outputs[1])->enabled = false;
+    QVERIFY(workspace()->applyOutputConfiguration(disable));
+    QVERIFY(workspace()->outputLayoutId() != bothOutputsKey);
+    QCOMPARE(window->output()->backendOutput(), outputs[0]);
+    toplevelSpy.clear();
+    surfaceSpy.clear();
+    window->moveResize(floating);
+    QVERIFY(!window->hasAutomaticStackPlacement());
+    if (lateCommit) {
+        // The restored size was already on screen, so this is a configureless ordinary
+        // request. The old configure's late buffer can supply content but not the request.
+        QCOMPARE(window->frameGeometry(), floating);
+        shellSurface->xdgSurface()->ack_configure(lateSerial);
+        Test::render(surface.get(), cell.size().toSize(), Qt::cyan);
+        QVERIFY(Test::waylandSync());
+        QCOMPARE(window->moveResizeGeometry(), floating);
+        QCOMPARE(window->pos(), floating.topLeft());
+        toplevelSpy.clear();
+        surfaceSpy.clear();
+        window->moveResize(floating);
+    }
+    QVERIFY(commit(floating));
+    QVERIFY(!window->hasAutomaticStackPlacement());
+
+    OutputConfiguration enable;
+    enable.changeSet(outputs[1])->enabled = true;
+    QVERIFY(workspace()->applyOutputConfiguration(enable));
+    QCOMPARE(workspace()->outputLayoutId(), bothOutputsKey);
+    QCOMPARE(window->moveResizeGeometry(), newerOrdinary ? ordinary : automatic ? floating
+                                                                                : cell);
 }
 
 void OutputChangesTest::testQuickTileUntileWindowRestoredAfterEnablingOutput()

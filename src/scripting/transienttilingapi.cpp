@@ -184,6 +184,16 @@ int TransientTilingApi::admitTile(int generation, Window *window, const QString 
     return static_cast<int>(result);
 }
 
+int TransientTilingApi::placeStackWindow(int generation, Window *window, const QRectF &cell,
+                                         const QString &providerToken)
+{
+    auto controller = m_workspace ? m_workspace->transientTileController() : nullptr;
+    if (!controller || generation <= 0) {
+        return -1;
+    }
+    return static_cast<int>(controller->placeStackWindow(generation, window, cell, QUuid(providerToken)));
+}
+
 void TransientTilingApi::endTreeWhenVacated(TransientTileController *controller)
 {
     // The tree exists for its one window, and the tiler reads a native teardown from
