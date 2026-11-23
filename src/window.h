@@ -2674,6 +2674,7 @@ protected:
     RectF moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea);
     RectF ensureSpecialStateGeometry(const RectF &geometry);
 
+    LogicalOutput *updateOffscreenFrameCallbackTimer();
     void maybeSendFrameCallback();
 
     void updateNextTargetScale();

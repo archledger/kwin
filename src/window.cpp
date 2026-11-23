@@ -131,6 +131,16 @@ Window::Window()
         Q_EMIT hasApplicationMenuChanged(hasApplicationMenu());
     });
     connect(&m_offscreenFramecallbackTimer, &QTimer::timeout, this, &Window::maybeSendFrameCallback);
+    connect(this, &Window::outputChanged, this, [this]() {
+        if (isOffscreenRendering()) {
+            updateOffscreenFrameCallbackTimer();
+        }
+    });
+    connect(workspace(), &Workspace::outputsChanged, this, [this]() {
+        if (isOffscreenRendering()) {
+            updateOffscreenFrameCallbackTimer();
+        }
+    });
 }
 
 Window::~Window()
@@ -551,6 +561,7 @@ void Window::markAsDeleted()
     Q_ASSERT(!m_deleted);
     invalidateTransientRestoreAttempt();
     m_deleted = true;
+    m_offscreenFramecallbackTimer.stop();
     workspace()->addDeleted(this);
 }
 
@@ -6732,7 +6743,7 @@ void Window::refOffscreenRendering()
 {
     m_offscreenRenderCount++;
     if (m_offscreenRenderCount == 1) {
-        m_offscreenFramecallbackTimer.start(1'000'000 / output()->refreshRate());
+        updateOffscreenFrameCallbackTimer();
         Q_EMIT offscreenRenderingChanged();
     }
 }
@@ -6752,16 +6763,51 @@ bool Window::isOffscreenRendering() const
     return m_offscreenRenderCount > 0;
 }
 
+LogicalOutput *Window::updateOffscreenFrameCallbackTimer()
+{
+    // Windows kept for animations can outlive their output. Confirm membership before
+    // using the window's output association, and stop until a usable output is assigned.
+    LogicalOutput *frameOutput = output();
+    if (!isOffscreenRendering() || isDeleted() || !frameOutput || !workspace()->outputs().contains(frameOutput)
+        || !frameOutput->backendOutput()->isEnabled()) {
+        m_offscreenFramecallbackTimer.stop();
+        return nullptr;
+    }
+    const auto refreshRate = frameOutput->refreshRate();
+    if (refreshRate == 0) {
+        m_offscreenFramecallbackTimer.stop();
+        return nullptr;
+    }
+
+    const int interval = std::max(1u, 1'000'000u / refreshRate);
+    if (!m_offscreenFramecallbackTimer.isActive() || m_offscreenFramecallbackTimer.interval() != interval) {
+        m_offscreenFramecallbackTimer.start(interval);
+    }
+    return frameOutput;
+}
+
 void Window::maybeSendFrameCallback()
 {
-    if (m_windowItem && !m_windowItem->isVisible()) {
-        ref();
-        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch());
-        m_windowItem->framePainted(nullptr, output(), nullptr, timestamp);
-        // update refresh rate, it might have changed
-        m_offscreenFramecallbackTimer.start(1'000'000 / output()->refreshRate());
-        unref();
+    if (!m_windowItem || m_windowItem->isVisible()) {
+        return;
     }
+    LogicalOutput *frameOutput = updateOffscreenFrameCallbackTimer();
+    if (!frameOutput) {
+        return;
+    }
+
+    // Painting can synchronously change window and output state.
+    BackendOutput *backend = frameOutput->backendOutput();
+    ref();
+    frameOutput->ref();
+    backend->ref();
+    const auto lifetime = qScopeGuard([this, frameOutput, backend]() {
+        unref();
+        frameOutput->unref();
+        backend->unref();
+    });
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch());
+    m_windowItem->framePainted(nullptr, frameOutput, nullptr, timestamp);
 }
 
 qreal Window::targetScale() const

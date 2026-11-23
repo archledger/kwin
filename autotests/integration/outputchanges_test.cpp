@@ -13,6 +13,7 @@
 #include "core/session.h"
 #include "outputconfigurationstore.h"
 #include "pointer_input.h"
+#include "scene/windowitem.h"
 #include "scripting/scripting.h"
 #include "scripting/transienttilingapi.h"
 #include "scripting/workspace_wrapper.h"
@@ -119,6 +120,7 @@ private Q_SLOTS:
     void cleanup();
 
     void testWindowSticksToOutputAfterOutputIsDisabled();
+    void testOffscreenFramesFollowWindowToEnabledOutput();
     void testWindowSticksToOutputAfterAnotherOutputIsDisabled();
     void testWindowSticksToOutputAfterOutputIsMoved_data();
     void testWindowSticksToOutputAfterOutputIsMoved();
@@ -233,6 +235,38 @@ void OutputChangesTest::testWindowSticksToOutputAfterOutputIsDisabled()
 
     // The window will be sent to the second output, which is at (0, 0).
     QCOMPARE(window->frameGeometry(), RectF(0 + 42, 0 + 67, 100, 50));
+}
+
+void OutputChangesTest::testOffscreenFramesFollowWindowToEnabledOutput()
+{
+    const auto outputs = kwinApp()->outputBackend()->outputs();
+    const auto surface = Test::createSurface();
+    const auto shellSurface = Test::createXdgToplevelSurface(surface.get());
+    auto *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    window->move(QPoint(1280 + 42, 67));
+    QCOMPARE(window->output(), workspace()->findOutput(outputs[1]));
+    window->setMinimized(true);
+    QTRY_VERIFY(!window->windowItem()->isVisible());
+    window->refOffscreenRendering();
+    const auto stopRendering = qScopeGuard([window] {
+        window->unrefOffscreenRendering();
+    });
+
+    QSignalSpy frameCallback(surface.get(), &KWayland::Client::Surface::frameRendered);
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QTRY_COMPARE(frameCallback.count(), 1);
+
+    OutputConfiguration config;
+    config.changeSet(outputs[1])->enabled = false;
+    QVERIFY(workspace()->applyOutputConfiguration(config));
+    QCOMPARE(window->output(), workspace()->findOutput(outputs[0]));
+    QVERIFY(!window->windowItem()->isVisible());
+
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QTRY_COMPARE(frameCallback.count(), 2);
 }
 
 void OutputChangesTest::testWindowSticksToOutputAfterAnotherOutputIsDisabled()
