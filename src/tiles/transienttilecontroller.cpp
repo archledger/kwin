@@ -635,9 +635,16 @@ TransientTileController::Result TransientTileController::placeStackWindow(quint6
     if (before == std::numeric_limits<quint64>::max()) {
         return Result::GenerationExhausted;
     }
+    const QPointer<TransientTileController> controller(this);
+    const auto master = m_window;
+    const auto ownership = m_ownershipGeneration;
     QPointer<Window> guard(window);
     window->performMoveResize(cell, Window::MoveResizeMode::MoveResize, Window::GeometryRequestOrigin::Kind::StackPlacement);
-    if (!guard || !guard->geometryRequestIsCurrent(before + 1) || !guard->hasAutomaticStackPlacement()) {
+    // Geometry notifications may end the tree or place a newer cell. Check the admitted
+    // tree as well as the request, without blocking teardown or same-tree placements.
+    if (!controller || !guard || !guard->geometryRequestIsCurrent(before + 1) || !guard->hasAutomaticStackPlacement()
+        || !controller->m_membershipPublished || controller->m_ownershipGeneration != ownership
+        || !controller->admissionCurrent(master, generation)) {
         return Result::Superseded;
     }
     return Result::Accepted;

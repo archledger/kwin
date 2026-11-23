@@ -811,6 +811,8 @@ enum class StackHistoryScenario {
     SpontaneousResize,
     Rearrange,
     UntileInFlight,
+    ReleaseInCallback,
+    PlacementInCallback,
 };
 
 void OutputChangesTest::testStackPlacementOutputHistory_data()
@@ -825,6 +827,8 @@ void OutputChangesTest::testStackPlacementOutputHistory_data()
     QTest::newRow("spontaneous-resize-after-move") << StackHistoryScenario::SpontaneousResize;
     QTest::newRow("rearrange-keeps-stack-origin") << StackHistoryScenario::Rearrange;
     QTest::newRow("untile-in-flight") << StackHistoryScenario::UntileInFlight;
+    QTest::newRow("release-in-placement-callback") << StackHistoryScenario::ReleaseInCallback;
+    QTest::newRow("newer-placement-in-callback") << StackHistoryScenario::PlacementInCallback;
 }
 
 void OutputChangesTest::testStackPlacementOutputHistory()
@@ -838,6 +842,7 @@ void OutputChangesTest::testStackPlacementOutputHistory()
     const auto bothOutputsKey = workspace()->outputLayoutId();
     const RectF floating(42, 67, 420, 300);
     const RectF cell(650, 25, 600, 440);
+    const RectF alternate(90, 99, 480, 320);
     const RectF ordinary(66, 78, 360, 240);
     const RectF moved(ordinary.topLeft(), floating.size());
     const RectF resized(floating.topLeft(), ordinary.size());
@@ -936,6 +941,36 @@ void OutputChangesTest::testStackPlacementOutputHistory()
     QCOMPARE(placeStackWindow(generation, master, QRectF(cell), token), int(Result::Ineligible));
     QCOMPARE(placeStackWindow(generation, window, QRectF(1250, 25, 600, 440), token), int(Result::InvalidGeometry));
     QCOMPARE(window->moveResizeGeometry(), floating);
+    if (scenario == StackHistoryScenario::ReleaseInCallback || scenario == StackHistoryScenario::PlacementInCallback) {
+        const bool releaseInCallback = scenario == StackHistoryScenario::ReleaseInCallback;
+        const RectF newerCell(630, 35, 610, 430);
+        bool entered = false;
+        int nested = -1;
+        const auto connection = connect(window, &Window::requestedGeometryChanged, this, [&] {
+            if (entered) {
+                return;
+            }
+            entered = true;
+            if (releaseInCallback) {
+                QMetaObject::invokeMethod(api, "releaseTile", Q_RETURN_ARG(int, nested), Q_ARG(int, generation));
+            } else {
+                nested = placeStackWindow(generation, window, QRectF(newerCell), token);
+            }
+        });
+        const auto disconnect = qScopeGuard([connection] {
+            QObject::disconnect(connection);
+        });
+        const int outer = placeStackWindow(generation, window, QRectF(cell), token);
+        QCOMPARE(nested, int(Result::Accepted));
+        bool hasTree = false;
+        QVERIFY(QMetaObject::invokeMethod(api, "hasTree", Q_RETURN_ARG(bool, hasTree)));
+        QCOMPARE(hasTree, !releaseInCallback);
+        QCOMPARE(outer, int(Result::Superseded));
+        QCOMPARE(window->moveResizeGeometry(), releaseInCallback ? cell : newerCell);
+        // A request already staged under that tree stays automatic after teardown.
+        QVERIFY(window->hasAutomaticStackPlacement());
+        return;
+    }
     if (scenario == StackHistoryScenario::UntileInFlight) {
         auto quickTile = workspace()->tileManager(window->moveResizeOutput())->quickTile(QuickTileFlag::Left);
         QVERIFY(quickTile);
@@ -1000,11 +1035,8 @@ void OutputChangesTest::testStackPlacementOutputHistory()
         surfaceSpy.clear();
         window->move(movedCell.topLeft());
         QCOMPARE(window->frameGeometry(), movedCell);
-        QVERIFY(Test::waylandSync());
-        // If the compositor sent a new configure, let the client settle that request first.
-        if (!surfaceSpy.isEmpty()) {
-            QVERIFY(commit(movedCell));
-        }
+        // The move needs a configure to replace the stack origin even though the size matches.
+        QVERIFY(commit(movedCell));
         Test::render(surface.get(), ordinary.size().toSize(), Qt::yellow);
         QVERIFY(Test::waylandSync());
         QCOMPARE(window->size(), ordinary.size());
@@ -1034,7 +1066,9 @@ void OutputChangesTest::testStackPlacementOutputHistory()
     }
     toplevelSpy.clear();
     surfaceSpy.clear();
-    window->moveResize(floating);
+    // Park at a different rectangle so remaining in the one-output position is not a pass.
+    const RectF oneOutputPlacement = scenario == StackHistoryScenario::Automatic || lateCommit ? alternate : floating;
+    window->moveResize(lateCommit ? floating : oneOutputPlacement);
     QVERIFY(!window->hasAutomaticStackPlacement());
     if (lateCommit) {
         // The restored size was already on screen, so the ordinary request moves the frame
@@ -1047,13 +1081,11 @@ void OutputChangesTest::testStackPlacementOutputHistory()
         QCOMPARE(window->pos(), floating.topLeft());
         toplevelSpy.clear();
         surfaceSpy.clear();
-        window->moveResize(floating);
+        window->moveResize(oneOutputPlacement);
     }
-    QVERIFY(commit(floating));
+    QVERIFY(commit(oneOutputPlacement));
     QVERIFY(!window->hasAutomaticStackPlacement());
 
-    QVERIFY(workspace()->applyOutputConfiguration(enable));
-    QCOMPARE(workspace()->outputLayoutId(), bothOutputsKey);
     RectF expected = floating;
     switch (scenario) {
     case StackHistoryScenario::Ordinary:
@@ -1071,7 +1103,15 @@ void OutputChangesTest::testStackPlacementOutputHistory()
     default:
         break;
     }
+    toplevelSpy.clear();
+    surfaceSpy.clear();
+    QVERIFY(workspace()->applyOutputConfiguration(enable));
+    QCOMPARE(workspace()->outputLayoutId(), bothOutputsKey);
     QCOMPARE(window->moveResizeGeometry(), expected);
+    if (window->frameGeometry() != expected) {
+        QVERIFY(commit(expected));
+    }
+    QCOMPARE(window->frameGeometry(), expected);
 }
 
 void OutputChangesTest::testQuickTileUntileWindowRestoredAfterEnablingOutput()
