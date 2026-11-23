@@ -624,7 +624,8 @@ void SurfaceState::mergeInto(SurfaceState *target)
 
 void SurfaceInterfacePrivate::applyState(SurfaceState *next)
 {
-    const bool bufferChanged = (next->committed & SurfaceState::Field::Buffer) && (current->buffer != next->buffer);
+    const bool bufferAttached = bool(next->committed & SurfaceState::Field::Buffer);
+    const bool bufferChanged = bufferAttached && (current->buffer != next->buffer);
     const bool opaqueRegionChanged = (next->committed & SurfaceState::Field::Opaque);
     const bool transformChanged = (next->committed & SurfaceState::Field::BufferTransform) && (current->bufferTransform != next->bufferTransform);
     const bool shadowChanged = (next->committed & SurfaceState::Field::Shadow);
@@ -769,7 +770,13 @@ void SurfaceInterfacePrivate::applyState(SurfaceState *next)
         extension->applyState(state.get());
     }
 
+    const bool previousAttachment = std::exchange(bufferAttachmentInCommit, bufferAttached);
+    const QPointer<SurfaceInterface> guard(q);
     Q_EMIT q->committed();
+    // Nested committed() calls must not change the outer signal's transaction metadata.
+    if (guard) {
+        bufferAttachmentInCommit = previousAttachment;
+    }
 }
 
 bool SurfaceInterfacePrivate::computeEffectiveMapped() const
@@ -878,6 +885,11 @@ OutputTransform SurfaceInterface::bufferTransform() const
 GraphicsBuffer *SurfaceInterface::buffer() const
 {
     return d->bufferRef.get();
+}
+
+bool SurfaceInterface::commitHasBufferAttachment() const
+{
+    return d->bufferAttachmentInCommit;
 }
 
 QPointF SurfaceInterface::offset() const
