@@ -109,24 +109,23 @@ void WindowScreenCastSource::setNextPresentationTimestamp(std::chrono::nanosecon
     // TODO use the timestamp for rendering, once we have a SceneView to do that with
 }
 
-Region WindowScreenCastSource::render(QImage *target, const Region &bufferDamage)
+ScreenCastSource::RenderResult WindowScreenCastSource::render(QImage *target, const Region &bufferDamage)
 {
     const auto offscreenTexture = GLTexture::allocate(GL_RGBA8, target->size());
     if (!offscreenTexture) {
-        return Region{};
+        return {};
     }
     offscreenTexture->setContentTransform(OutputTransform::FlipY);
 
     GLFramebuffer offscreenTarget(offscreenTexture.get());
-    const Region damage = render(&offscreenTarget, Region::infinite());
-    if (damage.isEmpty()) {
-        return {};
+    const auto result = render(&offscreenTarget, Region::infinite());
+    if (result.status == RenderResult::Status::Finished) {
+        grabTexture(offscreenTexture.get(), target);
     }
-    grabTexture(offscreenTexture.get(), target);
-    return damage;
+    return result;
 }
 
-Region WindowScreenCastSource::render(GLFramebuffer *target, const Region &bufferDamage)
+ScreenCastSource::RenderResult WindowScreenCastSource::render(GLFramebuffer *target, const Region &bufferDamage)
 {
     RenderTarget renderTarget(target);
     RenderViewport viewport(boundingRect(), devicePixelRatio(), renderTarget, QPoint());
@@ -141,16 +140,16 @@ Region WindowScreenCastSource::render(GLFramebuffer *target, const Region &buffe
     glClear(GL_COLOR_BUFFER_BIT);
     for (const auto &window : m_windows) {
         if (!renderer->renderItem(renderTarget, viewport, window->windowItem(), Scene::PAINT_WINDOW_TRANSFORMED, Region::infinite(), WindowPaintData{}, {}, {})) {
-            return {};
+            return {RenderResult::Status::FailedAfterStart};
         }
     }
     if (m_renderCursor && scene->cursorItem()->isVisible()) {
         if (!renderer->renderItem(renderTarget, viewport, scene->cursorItem(), 0, Region::infinite(), WindowPaintData{}, {}, {})) {
-            return {};
+            return {RenderResult::Status::FailedAfterStart};
         }
     }
     renderer->endFrame();
-    return Rect(QPoint(), target->size());
+    return {RenderResult::Status::Finished, Rect(QPoint(), target->size())};
 }
 
 uint WindowScreenCastSource::refreshRate() const

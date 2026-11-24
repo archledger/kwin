@@ -13,10 +13,12 @@
 #include "effect/effectloader.h"
 #include "effect/offscreenquickview.h"
 #include "effect/quickeffect.h"
+#include "input.h"
 #include "opengl/eglbackend.h"
 #include "opengl/eglcontext.h"
 #include "opengl/glframebuffer.h"
 #include "opengl/gltexture.h"
+#include "pointer_input.h"
 #include "scene/item.h"
 #include "scene/itemrenderer_opengl.h"
 #include "scene/surfaceitem.h"
@@ -27,6 +29,9 @@
 #include "window.h"
 
 #include <KConfigGroup>
+#include <KWayland/Client/pointer.h>
+#include <KWayland/Client/seat.h>
+#include <KWayland/Client/shm_pool.h>
 #include <KWayland/Client/surface.h>
 #include <QDir>
 #include <QFile>
@@ -171,6 +176,7 @@ private Q_SLOTS:
     void testComposition();
     void testEffectFrame();
     void testRendererRefusesToStart();
+    void testCursorCaptureRendererRefusesToStart();
 };
 
 class FailingItemRenderer : public ItemRendererOpenGL
@@ -196,6 +202,82 @@ public:
     bool failBegin = false;
     bool sawRenderTarget = false;
 };
+
+class CursorCaptureRenderer : public FailingItemRenderer
+{
+public:
+    using FailingItemRenderer::FailingItemRenderer;
+
+    bool beginFrame(const RenderTarget &target, const RenderViewport &viewport) override
+    {
+        const bool started = FailingItemRenderer::beginFrame(target, viewport);
+        if (failBegin) {
+            // Define every pixel of the private test target even on the refusal path.
+            // A baseline build that reads it back can only see this synthetic color.
+            if (!sawRenderTarget || !target.texture()) {
+                qFatal("Missing synthetic cursor render target");
+            }
+            QImage sentinel(target.texture()->size(), QImage::Format_RGBA8888_Premultiplied);
+            sentinel.fill(Qt::magenta);
+            target.texture()->update(sentinel, Region(Rect(sentinel.rect())));
+            if (glGetError() != GL_NO_ERROR) {
+                qFatal("Could not initialize the synthetic cursor render target");
+            }
+        }
+        return started;
+    }
+};
+
+void OffscreenQuickViewTest::testCursorCaptureRendererRefusesToStart()
+{
+    QVERIFY(Test::setupWaylandConnection(Test::AdditionalWaylandInterface::Seat));
+    QVERIFY(Test::waitForWaylandPointer());
+    std::unique_ptr<KWayland::Client::Pointer> pointer(Test::waylandSeat()->createPointer());
+    QVERIFY(pointer && pointer->isValid());
+    QSignalSpy entered(pointer.get(), &KWayland::Client::Pointer::entered);
+
+    input()->pointer()->warp(QPointF(0, 0));
+    auto surface = Test::createSurface();
+    auto toplevel = Test::createXdgToplevelSurface(surface.get());
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(window);
+    input()->pointer()->warp(window->clientGeometry().center());
+    QTRY_VERIFY(!entered.isEmpty());
+
+    auto cursorSurface = Test::createSurface();
+    QSignalSpy cursorRendered(cursorSurface.get(), &KWayland::Client::Surface::frameRendered);
+    QImage cursor(QSize(10, 10), QImage::Format_RGBA8888_Premultiplied);
+    cursor.fill(Qt::red);
+    cursorSurface->attachBuffer(Test::waylandShmPool()->createBuffer(cursor));
+    cursorSurface->damage(cursor.rect());
+    cursorSurface->commit();
+    const QPoint hotspot(4, 5);
+    pointer->setCursor(cursorSurface.get(), hotspot);
+    QTRY_VERIFY(!cursorRendered.isEmpty());
+
+    auto scene = kwinApp()->scene();
+    auto device = Compositor::self()->primaryDevice();
+    auto captureRenderer = std::make_unique<CursorCaptureRenderer>(device);
+    auto renderer = captureRenderer.get();
+    scene->attachRenderer(device, std::move(captureRenderer));
+    const auto restoreRenderer = qScopeGuard([scene, device]() {
+        scene->attachRenderer(device, std::make_unique<ItemRendererOpenGL>(device));
+    });
+
+    renderer->failBegin = true;
+    const auto refused = kwinApp()->cursorImage();
+    QCOMPARE(renderer->beginCount, 1);
+    QVERIFY(renderer->sawRenderTarget);
+    QCOMPARE(renderer->endCount, 0);
+    QVERIFY(refused.isNull());
+
+    renderer->failBegin = false;
+    const auto captured = kwinApp()->cursorImage();
+    QCOMPARE(renderer->beginCount, 2);
+    QCOMPARE(renderer->endCount, 1);
+    QCOMPARE(captured.image(), cursor);
+    QCOMPARE(captured.hotSpot(), QPointF(hotspot));
+}
 
 void OffscreenQuickViewTest::testRendererRefusesToStart()
 {

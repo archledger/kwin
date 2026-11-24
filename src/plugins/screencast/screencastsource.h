@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "core/region.h"
+
 #include <QObject>
 
 class QImage;
@@ -17,7 +19,6 @@ class Cursor;
 class GLFramebuffer;
 class GLTexture;
 class RectF;
-class Region;
 class RenderDevice;
 class EglContext;
 
@@ -26,6 +27,17 @@ class ScreenCastSource : public QObject
     Q_OBJECT
 
 public:
+    struct RenderResult
+    {
+        enum class Status {
+            NotStarted,
+            Finished,
+            FailedAfterStart,
+        };
+        Status status = Status::NotStarted;
+        Region damage = {};
+    };
+
     explicit ScreenCastSource();
     ~ScreenCastSource() override;
 
@@ -36,8 +48,9 @@ public:
 
     virtual void setRenderCursor(bool enable) = 0;
     virtual void setNextPresentationTimestamp(std::chrono::nanoseconds timestamp, uint32_t refreshRate) = 0;
-    virtual Region render(GLFramebuffer *target, const Region &bufferRepair) = 0;
-    virtual Region render(QImage *target, const Region &bufferRepair) = 0;
+    // Finished can have empty damage. Only NotStarted rules out video writes.
+    virtual RenderResult render(GLFramebuffer *target, const Region &bufferRepair) = 0;
+    virtual RenderResult render(QImage *target, const Region &bufferRepair) = 0;
 
     virtual void resume() = 0;
     virtual void pause() = 0;

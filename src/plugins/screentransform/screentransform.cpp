@@ -112,8 +112,11 @@ void ScreenTransformEffect::addScreen(LogicalOutput *screen)
         delegate.setViewport(screen->geometryF());
         delegate.setScale(screen->scale());
         scene->prePaint(&delegate);
-        scene->paint(renderTarget, QPoint(), delegate.deviceRect());
+        const auto result = scene->paint(renderTarget, QPoint(), delegate.deviceRect());
         scene->postPaint();
+        if (result == PaintResult::NotStarted) {
+            m_states.remove(screen);
+        }
     });
 }
 
