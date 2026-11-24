@@ -144,14 +144,17 @@ std::shared_ptr<EglContext> RenderDevice::eglContext()
     auto ret = m_eglContext.lock();
     if (!ret || ret->isFailed()) {
         const auto share = eglShareContext();
-        if (!share) {
-            return nullptr;
-        }
-        ret = EglContext::create(m_display.get(), EGL_NO_CONFIG_KHR, share);
+        ret = share ? EglContext::create(m_display.get(), EGL_NO_CONFIG_KHR, share) : nullptr;
         if (!ret) {
-            Q_EMIT resetDetected();
+            // A persistent initialization failure must not trigger a new
+            // compositor restart on every attempt to create the context.
+            if (!m_eglContextCreationFailed) {
+                m_eglContextCreationFailed = true;
+                Q_EMIT resetDetected();
+            }
             return nullptr;
         }
+        m_eglContextCreationFailed = false;
         connect(ret.get(), &EglContext::resetDetected, this, &RenderDevice::resetDetected);
         m_eglContext = ret;
     }

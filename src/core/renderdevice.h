@@ -121,6 +121,7 @@ private:
     FormatModifierMap m_allImportableFormats;
     std::weak_ptr<EglContext> m_shareContext;
     std::weak_ptr<EglContext> m_eglContext;
+    bool m_eglContextCreationFailed = false;
     bool m_inReset = false;
     const QString m_path;
     const dev_t m_deviceId;

@@ -382,8 +382,8 @@ void Compositor::start()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
-        kwinApp()->scene()->attachRenderer(device.get(), std::make_unique<ItemRendererOpenGL>(device.get()));
         connect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
+        kwinApp()->scene()->attachRenderer(device.get(), std::make_unique<ItemRendererOpenGL>(device.get()));
     }
 
     handleOutputsChanged();
@@ -404,6 +404,7 @@ void Compositor::stop()
         return;
     }
     m_state = State::Stopping;
+    m_resetTimer->stop();
     Q_EMIT aboutToToggleCompositing();
     Q_EMIT aboutToStop();
 
@@ -430,8 +431,8 @@ void Compositor::stop()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
-        kwinApp()->scene()->detachRenderer(device.get());
         disconnect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
+        kwinApp()->scene()->detachRenderer(device.get());
     }
 
     m_backend.reset();
@@ -442,7 +443,9 @@ void Compositor::stop()
 
 void Compositor::gpuResetDetected()
 {
-    m_resetTimer->start();
+    if (m_state == State::Starting || m_state == State::On) {
+        m_resetTimer->start();
+    }
 }
 
 static bool isTearingRequested(const Item *item)

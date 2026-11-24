@@ -118,9 +118,12 @@ Region WindowScreenCastSource::render(QImage *target, const Region &bufferDamage
     offscreenTexture->setContentTransform(OutputTransform::FlipY);
 
     GLFramebuffer offscreenTarget(offscreenTexture.get());
-    render(&offscreenTarget, Region::infinite());
+    const Region damage = render(&offscreenTarget, Region::infinite());
+    if (damage.isEmpty()) {
+        return {};
+    }
     grabTexture(offscreenTexture.get(), target);
-    return Rect(QPoint(), target->size());
+    return damage;
 }
 
 Region WindowScreenCastSource::render(GLFramebuffer *target, const Region &bufferDamage)
