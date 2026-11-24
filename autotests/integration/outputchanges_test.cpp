@@ -13,6 +13,7 @@
 #include "core/session.h"
 #include "outputconfigurationstore.h"
 #include "pointer_input.h"
+#include "scene/windowitem.h"
 #include "scripting/scripting.h"
 #include "scripting/transienttilingapi.h"
 #include "scripting/workspace_wrapper.h"
@@ -119,6 +120,8 @@ private Q_SLOTS:
     void cleanup();
 
     void testWindowSticksToOutputAfterOutputIsDisabled();
+    void testOffscreenFramesFollowWindowToEnabledOutput();
+    void testOffscreenFramesPauseOnBackendDisable();
     void testWindowSticksToOutputAfterAnotherOutputIsDisabled();
     void testWindowSticksToOutputAfterOutputIsMoved_data();
     void testWindowSticksToOutputAfterOutputIsMoved();
@@ -234,6 +237,90 @@ void OutputChangesTest::testWindowSticksToOutputAfterOutputIsDisabled()
 
     // The window will be sent to the second output, which is at (0, 0).
     QCOMPARE(window->frameGeometry(), RectF(0 + 42, 0 + 67, 100, 50));
+}
+
+void OutputChangesTest::testOffscreenFramesFollowWindowToEnabledOutput()
+{
+    const auto outputs = kwinApp()->outputBackend()->outputs();
+    const auto surface = Test::createSurface();
+    const auto shellSurface = Test::createXdgToplevelSurface(surface.get());
+    auto *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    window->move(QPoint(1280 + 42, 67));
+    QCOMPARE(window->output(), workspace()->findOutput(outputs[1]));
+    window->setMinimized(true);
+    QTRY_VERIFY(!window->windowItem()->isVisible());
+    window->refOffscreenRendering();
+    const auto stopRendering = qScopeGuard([window] {
+        window->unrefOffscreenRendering();
+    });
+
+    QSignalSpy frameCallback(surface.get(), &KWayland::Client::Surface::frameRendered);
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QTRY_COMPARE(frameCallback.count(), 1);
+
+    OutputConfiguration config;
+    config.changeSet(outputs[1])->enabled = false;
+    QVERIFY(workspace()->applyOutputConfiguration(config));
+    QCOMPARE(window->output(), workspace()->findOutput(outputs[0]));
+    QVERIFY(!window->windowItem()->isVisible());
+
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QTRY_COMPARE(frameCallback.count(), 2);
+}
+
+void OutputChangesTest::testOffscreenFramesPauseOnBackendDisable()
+{
+    const auto surface = Test::createSurface();
+    const auto shellSurface = Test::createXdgToplevelSurface(surface.get());
+    auto *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
+    QVERIFY(window);
+    window->setMinimized(true);
+    QTRY_VERIFY(!window->windowItem()->isVisible());
+    auto *logicalOutput = window->output();
+    QVERIFY(logicalOutput);
+    auto *backend = logicalOutput->backendOutput();
+    QVERIFY(backend->isEnabled());
+    QVERIFY(backend->refreshRate() > 0);
+
+    window->refOffscreenRendering();
+    const auto stopRendering = qScopeGuard([window] {
+        window->unrefOffscreenRendering();
+    });
+    QSignalSpy frameCallback(surface.get(), &KWayland::Client::Surface::frameRendered);
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QTRY_COMPARE(frameCallback.count(), 1);
+
+    // Keep the same live output and mode, but toggle its backend eligibility
+    // without asking the workspace to rearrange windows.
+    QSignalSpy outputsChanged(workspace(), &Workspace::outputsChanged);
+    OutputConfiguration enable;
+    enable.changeSet(backend)->enabled = true;
+    const auto restoreOutput = qScopeGuard([backend, &enable] {
+        if (!backend->isEnabled()) {
+            backend->applyChanges(enable);
+        }
+    });
+    OutputConfiguration disable;
+    disable.changeSet(backend)->enabled = false;
+    backend->applyChanges(disable);
+    QVERIFY(!backend->isEnabled());
+    QCOMPARE(window->output(), logicalOutput);
+    QCOMPARE(outputsChanged.count(), 0);
+
+    surface->setupFrameCallback();
+    surface->commit(KWayland::Client::Surface::CommitFlag::None);
+    QVERIFY(Test::waylandSync());
+    QVERIFY(!frameCallback.wait(100ms));
+    QCOMPARE(frameCallback.count(), 1);
+
+    backend->applyChanges(enable);
+    QTRY_COMPARE(frameCallback.count(), 2);
+    QCOMPARE(window->output(), logicalOutput);
+    QCOMPARE(outputsChanged.count(), 0);
 }
 
 void OutputChangesTest::testWindowSticksToOutputAfterAnotherOutputIsDisabled()

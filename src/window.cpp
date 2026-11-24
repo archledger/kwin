@@ -18,10 +18,12 @@
 #include "client_machine.h"
 #include "compositor.h"
 #include "core/output.h"
+#include "core/outputbackend.h"
 #include "decorations/decoratedwindow.h"
 #include "decorations/decorationpalette.h"
 #include "focuschain.h"
 #include "input.h"
+#include "main.h"
 #include "outline.h"
 #include "placement.h"
 #include "pointer_input.h"
@@ -49,6 +51,7 @@
 #include <QHash>
 #include <QJSEngine>
 #include <QMouseEvent>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QStyleHints>
 
@@ -62,6 +65,17 @@ namespace
 
 // Keep the same-version backport ABI-compatible with consumers built against stock headers.
 QHash<const Window *, RectF> s_notifiedRequestedGeometry;
+
+struct OffscreenFrameBackendObservation
+{
+    QPointer<BackendOutput> backend;
+    QMetaObject::Connection modeChanged;
+    QMetaObject::Connection enabledChanged;
+};
+
+// Only windows observing an offscreen backend need this state. Keep it out
+// of Window so it does not change the layout in the installed header.
+QHash<const Window *, OffscreenFrameBackendObservation> s_offscreenFrameBackends;
 
 bool exactFrameGeometry(const RectF &left, const RectF &right)
 {
@@ -131,10 +145,21 @@ Window::Window()
         Q_EMIT hasApplicationMenuChanged(hasApplicationMenu());
     });
     connect(&m_offscreenFramecallbackTimer, &QTimer::timeout, this, &Window::maybeSendFrameCallback);
+    connect(this, &Window::outputChanged, this, [this]() {
+        if (isOffscreenRendering()) {
+            updateOffscreenFrameCallbackTimer();
+        }
+    });
+    connect(workspace(), &Workspace::outputsChanged, this, [this]() {
+        if (isOffscreenRendering()) {
+            updateOffscreenFrameCallbackTimer();
+        }
+    });
 }
 
 Window::~Window()
 {
+    observeOffscreenFrameCallbackBackend(nullptr);
     s_notifiedRequestedGeometry.remove(this);
 }
 
@@ -551,6 +576,8 @@ void Window::markAsDeleted()
     Q_ASSERT(!m_deleted);
     invalidateTransientRestoreAttempt();
     m_deleted = true;
+    observeOffscreenFrameCallbackBackend(nullptr);
+    m_offscreenFramecallbackTimer.stop();
     workspace()->addDeleted(this);
 }
 
@@ -6732,7 +6759,7 @@ void Window::refOffscreenRendering()
 {
     m_offscreenRenderCount++;
     if (m_offscreenRenderCount == 1) {
-        m_offscreenFramecallbackTimer.start(1'000'000 / output()->refreshRate());
+        updateOffscreenFrameCallbackTimer();
         Q_EMIT offscreenRenderingChanged();
     }
 }
@@ -6742,6 +6769,7 @@ void Window::unrefOffscreenRendering()
     Q_ASSERT(m_offscreenRenderCount);
     m_offscreenRenderCount--;
     if (m_offscreenRenderCount == 0) {
+        observeOffscreenFrameCallbackBackend(nullptr);
         m_offscreenFramecallbackTimer.stop();
         Q_EMIT offscreenRenderingChanged();
     }
@@ -6752,16 +6780,80 @@ bool Window::isOffscreenRendering() const
     return m_offscreenRenderCount > 0;
 }
 
+void Window::observeOffscreenFrameCallbackBackend(BackendOutput *backend)
+{
+    auto it = s_offscreenFrameBackends.find(this);
+    if (it != s_offscreenFrameBackends.end()) {
+        if (backend && it->backend == backend) {
+            return;
+        }
+        disconnect(it->modeChanged);
+        disconnect(it->enabledChanged);
+        s_offscreenFrameBackends.erase(it);
+    }
+    if (!backend) {
+        return;
+    }
+
+    // The mode or enabled state can change without a workspace reassignment.
+    const auto update = [this]() {
+        updateOffscreenFrameCallbackTimer();
+    };
+    s_offscreenFrameBackends.insert(this, OffscreenFrameBackendObservation{
+                                              backend,
+                                              connect(backend, &BackendOutput::currentModeChanged, this, update),
+                                              connect(backend, &BackendOutput::enabledChanged, this, update),
+                                          });
+}
+
+LogicalOutput *Window::updateOffscreenFrameCallbackTimer()
+{
+    // Workspace reconciliation can lag backend retirement. The workspace owns the
+    // placeholder itself, so it never appears in the output backend's list.
+    LogicalOutput *frameOutput = nullptr;
+    if (isOffscreenRendering() && !isDeleted() && workspace()->outputs().contains(output())) {
+        frameOutput = output();
+    }
+    BackendOutput *backend = frameOutput ? frameOutput->backendOutput() : nullptr;
+    if (backend && !backend->isPlaceholder() && !kwinApp()->outputBackend()->outputs().contains(backend)) {
+        backend = nullptr;
+    }
+    observeOffscreenFrameCallbackBackend(backend);
+    const auto refreshRate = backend && backend->isEnabled() ? backend->refreshRate() : 0;
+    if (refreshRate == 0) {
+        m_offscreenFramecallbackTimer.stop();
+        return nullptr;
+    }
+
+    const int interval = std::max(1u, 1'000'000u / refreshRate);
+    if (!m_offscreenFramecallbackTimer.isActive() || m_offscreenFramecallbackTimer.interval() != interval) {
+        m_offscreenFramecallbackTimer.start(interval);
+    }
+    return frameOutput;
+}
+
 void Window::maybeSendFrameCallback()
 {
-    if (m_windowItem && !m_windowItem->isVisible()) {
-        ref();
-        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch());
-        m_windowItem->framePainted(nullptr, output(), nullptr, timestamp);
-        // update refresh rate, it might have changed
-        m_offscreenFramecallbackTimer.start(1'000'000 / output()->refreshRate());
-        unref();
+    if (!m_windowItem || m_windowItem->isVisible()) {
+        return;
     }
+    LogicalOutput *frameOutput = updateOffscreenFrameCallbackTimer();
+    if (!frameOutput) {
+        return;
+    }
+
+    // Painting can synchronously change window and output state.
+    BackendOutput *backend = frameOutput->backendOutput();
+    ref();
+    frameOutput->ref();
+    backend->ref();
+    const auto lifetime = qScopeGuard([this, frameOutput, backend]() {
+        unref();
+        frameOutput->unref();
+        backend->unref();
+    });
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch());
+    m_windowItem->framePainted(nullptr, frameOutput, nullptr, timestamp);
 }
 
 qreal Window::targetScale() const

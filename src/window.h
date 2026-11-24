@@ -51,6 +51,7 @@ namespace KWin
 
 class PlasmaWindowInterface;
 class SurfaceInterface;
+class BackendOutput;
 class Group;
 class LogicalOutput;
 class ClientMachine;
@@ -2674,6 +2675,8 @@ protected:
     RectF moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea) const;
     RectF ensureSpecialStateGeometry(const RectF &geometry);
 
+    void observeOffscreenFrameCallbackBackend(BackendOutput *backend);
+    LogicalOutput *updateOffscreenFrameCallbackTimer();
     void maybeSendFrameCallback();
 
     void updateNextTargetScale();
