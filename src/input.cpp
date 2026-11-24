@@ -2936,8 +2936,6 @@ InputRedirection::InputRedirection(QObject *parent)
     , m_shortcuts(new GlobalShortcutsManager(this))
 #endif
 {
-    setupInputBackends();
-
     connect(kwinApp(), &Application::workspaceCreated, this, &InputRedirection::setupWorkspace);
 }
 
@@ -2984,6 +2982,7 @@ void InputRedirection::init()
 #if KWIN_BUILD_GLOBALSHORTCUTS
     m_shortcuts->init();
 #endif
+    setupInputBackends();
 }
 
 void InputRedirection::setupWorkspace()

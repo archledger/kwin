@@ -2671,7 +2671,7 @@ protected:
     RectF keyboardGeometryRestore() const;
     void setKeyboardGeometryRestore(const RectF &geom);
 
-    RectF moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea);
+    RectF moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea) const;
     RectF ensureSpecialStateGeometry(const RectF &geometry);
 
     void maybeSendFrameCallback();

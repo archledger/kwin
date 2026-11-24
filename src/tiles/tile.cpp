@@ -15,6 +15,8 @@
 #include "window.h"
 #include "workspace.h"
 
+#include <QJSEngine>
+
 #include <cmath>
 
 namespace KWin
@@ -32,6 +34,8 @@ Tile::Tile(TileManager *tiling, Tile *parent, Type type)
     , m_quickTileMode(type == Type::Transient ? QuickTileFlag::Custom : QuickTileFlag::None)
     , m_type(type)
 {
+    QJSEngine::setObjectOwnership(this, QJSEngine::CppOwnership);
+
     if (m_parentTile) {
         m_padding = m_parentTile->padding();
         m_minimumSize = m_parentTile->m_minimumSize;
