@@ -354,8 +354,8 @@ void RenderDevice::createVulkanDevice()
     }
     m_vulkanDevice = openVulkanDevice(m_vulkanInstance, m_device.get(), m_path);
     if (m_vulkanDevice) {
-        connect(m_vulkanDevice.get(), &VulkanDevice::deviceLost, this, &RenderDevice::handleVulkanDeviceLoss);
-        connect(m_vulkanDevice.get(), &VulkanDevice::deviceLost, this, &RenderDevice::resetDetected);
+        connect(m_vulkanDevice.get(), &VulkanDevice::deviceResetRequired, this, &RenderDevice::handleVulkanDeviceLoss);
+        connect(m_vulkanDevice.get(), &VulkanDevice::deviceResetRequired, this, &RenderDevice::resetDetected);
     }
     m_inReset = false;
 }

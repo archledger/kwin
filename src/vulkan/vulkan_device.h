@@ -98,6 +98,11 @@ Q_SIGNALS:
      */
     void deviceLost();
 
+    /**
+     * Emitted only on reported device loss, before deviceLost().
+     */
+    void deviceResetRequired();
+
 private:
     void getQueues();
     FormatModifierMap queryFormats(VkImageUsageFlags flags) const;
