@@ -7,6 +7,7 @@
 #include "backends/virtual/virtual_egl_backend.h"
 #include "compositor.h"
 #include "core/renderbackend.h"
+#include "core/renderloop_p.h"
 #include "effect/effectframe.h"
 #include "effect/effecthandler.h"
 #include "effect/effectloader.h"
@@ -17,9 +18,11 @@
 #include "opengl/glframebuffer.h"
 #include "opengl/gltexture.h"
 #include "scene/item.h"
+#include "scene/itemrenderer_opengl.h"
 #include "scene/surfaceitem.h"
 #include "scene/windowitem.h"
 #include "scene/workspacescene.h"
+#include "wayland/surface.h"
 #include "wayland_server.h"
 #include "window.h"
 
@@ -167,7 +170,91 @@ private Q_SLOTS:
     void testRepaint();
     void testComposition();
     void testEffectFrame();
+    void testRendererRefusesToStart();
 };
+
+class FailingItemRenderer : public ItemRendererOpenGL
+{
+public:
+    using ItemRendererOpenGL::ItemRendererOpenGL;
+
+    bool beginFrame(const RenderTarget &target, const RenderViewport &viewport) override
+    {
+        ++beginCount;
+        sawRenderTarget = target.framebuffer() && target.framebuffer()->valid();
+        return !failBegin && ItemRendererOpenGL::beginFrame(target, viewport);
+    }
+
+    void endFrame() override
+    {
+        ++endCount;
+        ItemRendererOpenGL::endFrame();
+    }
+
+    int beginCount = 0;
+    int endCount = 0;
+    bool failBegin = false;
+    bool sawRenderTarget = false;
+};
+
+void OffscreenQuickViewTest::testRendererRefusesToStart()
+{
+    QVERIFY(Test::setupWaylandConnection());
+    auto surface = Test::createSurface();
+    auto toplevel = Test::createXdgToplevelSurface(surface.get());
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(window);
+
+    auto scene = kwinApp()->scene();
+    auto device = Compositor::self()->primaryDevice();
+    auto output = window->output();
+    auto loop = output->backendOutput()->renderLoop();
+    auto loopState = RenderLoopPrivate::get(loop);
+    auto layer = Compositor::self()->backend()->compatibleOutputLayers(output->backendOutput()).front();
+    const auto sample = window->clientGeometry().center().toPoint();
+    QTRY_COMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::blue));
+    QTRY_COMPARE(loopState->pendingFrameCount, 0);
+
+    auto failingRenderer = std::make_unique<FailingItemRenderer>(device);
+    auto renderer = failingRenderer.get();
+    scene->attachRenderer(device, std::move(failingRenderer));
+    const auto restoreRenderer = qScopeGuard([scene, device]() {
+        scene->attachRenderer(device, std::make_unique<ItemRendererOpenGL>(device));
+    });
+    loop->inhibit();
+    auto resumeLoop = qScopeGuard([loop]() {
+        loop->uninhibit();
+    });
+
+    // Queue ordinary client damage, then drive just one attempt with the virtual output.
+    QSignalSpy committed(window->surface(), &SurfaceInterface::committed);
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QTRY_COMPARE(committed.count(), 1);
+    QVERIFY(layer->needsRepaint());
+    loopState->pendingReschedule.reset();
+    const auto previousFramebuffer = renderer->context()->currentFramebuffer();
+    renderer->failBegin = true;
+    loopState->dispatch();
+    QCOMPARE(renderer->beginCount, 1);
+    QVERIFY(renderer->sawRenderTarget);
+    // The virtual backend would hold a submitted frame until synthetic vblank.
+    // A dropped frame decrements this synchronously, without waiting for a timer.
+    QCOMPARE(loopState->pendingFrameCount, 0);
+    QCOMPARE(renderer->endCount, 0);
+    QCOMPARE(renderer->context()->currentFramebuffer(), previousFramebuffer);
+    QCOMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::blue));
+    QCOMPARE(layer->deviceRepaints(), Region::infinite());
+    QVERIFY(loopState->pendingReschedule.has_value());
+
+    renderer->failBegin = false;
+    QSignalSpy presented(loop, &RenderLoop::framePresented);
+    resumeLoop.dismiss();
+    loop->uninhibit();
+    QVERIFY(presented.wait());
+    QCOMPARE(renderer->beginCount, 2);
+    QCOMPARE(renderer->endCount, 1);
+    QCOMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::red));
+}
 
 void OffscreenQuickViewTest::initTestCase()
 {

@@ -550,16 +550,29 @@ static bool prepareRendering(RenderView *view, LogicalOutput *logicalOutput, Bac
     return layer->preparePresentationTest();
 }
 
-static bool renderLayer(RenderView *view, LogicalOutput *logicalOutput, BackendOutput *backendOutput, const std::shared_ptr<OutputFrame> &frame, const Region &surfaceDamage)
+enum class LayerRenderResult {
+    Finished,
+    RendererNotStarted,
+    OutputLayerFailed,
+};
+
+static LayerRenderResult renderLayer(RenderView *view, OutputFrame *frame, const Region &surfaceDamage)
 {
-    auto beginInfo = view->layer()->beginFrame(frame.get());
+    auto layer = view->layer();
+    auto beginInfo = layer->beginFrame(frame);
     if (!beginInfo) {
-        return false;
+        return LayerRenderResult::OutputLayerFailed;
     }
     auto &[renderTarget, repaint] = beginInfo.value();
-    const Region bufferDamage = surfaceDamage.united(repaint).intersected(renderTarget.transformedRect());
-    view->paint(renderTarget, view->renderOffset(), bufferDamage);
-    return view->layer()->endFrame(bufferDamage, surfaceDamage, frame.get());
+    const Rect targetRect = renderTarget.transformedRect();
+    const Region bufferDamage = surfaceDamage.united(repaint).intersected(targetRect);
+    if (view->paint(renderTarget, view->renderOffset(), bufferDamage) == PaintResult::NotStarted) {
+        layer->discardUnpaintedFrame();
+        return LayerRenderResult::RendererNotStarted;
+    }
+    return layer->endFrame(bufferDamage, surfaceDamage == Region::infinite() ? Region(targetRect) : surfaceDamage, frame)
+        ? LayerRenderResult::Finished
+        : LayerRenderResult::OutputLayerFailed;
 }
 
 static OutputLayer *findLayer(std::span<OutputLayer *const> layers, OutputLayerType type)
@@ -742,7 +755,12 @@ std::pair<QList<Compositor::LayerData>, std::expected<void, OutputError>> Compos
                         if (!prepareRendering(cursorView, logicalOutput, backendOutput, 8)) {
                             return;
                         }
-                        if (!renderLayer(cursorView, logicalOutput, backendOutput, nullptr, cursorView->collectDamage())) {
+                        const auto rendered = renderLayer(cursorView, nullptr, cursorView->collectDamage());
+                        if (rendered == LayerRenderResult::RendererNotStarted) {
+                            // Pass the retry to normal compositing, not another async update.
+                            outputLayer->addDeviceRepaint(Region::infinite());
+                        }
+                        if (rendered != LayerRenderResult::Finished) {
                             return;
                         }
                     }
@@ -964,6 +982,7 @@ void Compositor::composite(RenderLoop *renderLoop)
         }
     }
 
+    bool rendererNotStarted = false;
     const auto renderLayers = [&]() -> std::expected<void, OutputError> {
         for (auto &layer : layers) {
             if (!layer.view->layer()->needsRepaint()) {
@@ -974,7 +993,9 @@ void Compositor::composite(RenderLoop *renderLoop)
             layer.surfaceDamage |= layer.view->layer()->deviceRepaints();
             layer.view->layer()->resetRepaints();
             if (layer.view->layer()->isEnabled() && !layer.directScanout) {
-                if (!renderLayer(layer.view, logicalOutput, output, frame, layer.surfaceDamage)) {
+                const auto rendered = renderLayer(layer.view, frame.get(), layer.surfaceDamage);
+                if (rendered != LayerRenderResult::Finished) {
+                    rendererNotStarted = rendered == LayerRenderResult::RendererNotStarted;
                     return std::unexpected(OutputError{
                         .code = OutputErrorCode::Other,
                         .message = QStringLiteral("Rendering a layer failed"),
@@ -1009,7 +1030,7 @@ void Compositor::composite(RenderLoop *renderLoop)
     totalTimeQuery->end();
     frame->addRenderTimeQuery(std::move(totalTimeQuery));
     result = result.and_then(present);
-    if (!result) {
+    if (!result && !rendererNotStarted) {
         // legacy modesetting can't do (useful) presentation tests
         // and even with atomic modesetting, drivers are buggy and atomic tests
         // sometimes have false positives
@@ -1027,7 +1048,7 @@ void Compositor::composite(RenderLoop *renderLoop)
 
         // if this still doesn't work, fall back to primary only
         const bool fallback2 = layers.size() == 1 && layers.front().view == primaryView;
-        if (!result && !fallback2) {
+        if (!result && !rendererNotStarted && !fallback2) {
             idealLayerAssignments = assignLayers(primaryView, sceneOnly, allowedOutputLayers);
             std::tie(layers, result) = setupLayers(primaryView, logicalOutput, output, allowedOutputLayers, *idealLayerAssignments, frame, toUpdate);
             result = result.and_then(renderLayers).and_then(present);
@@ -1043,11 +1064,21 @@ void Compositor::composite(RenderLoop *renderLoop)
         }
     }
 
-    scene->frame(primaryView, frame.get());
+    if (!rendererNotStarted) {
+        scene->frame(primaryView, frame.get());
+    }
     primaryView->postPaint();
 
     // the layers have to stay valid until after postPaint, so this needs to happen after it
-    if (!result) {
+    if (rendererNotStarted) {
+        // The presentation was skipped, including any layers already staged
+        // before this layer refused to paint. Restore the damage we consumed.
+        for (OutputLayer *layer : toUpdate) {
+            if (layer->isEnabled()) {
+                layer->addDeviceRepaint(Region::infinite());
+            }
+        }
+    } else if (!result) {
         qCWarning(KWIN_CORE, "Failed to find a working output layer configuration: %s", qPrintable(result.error().message));
         qCWarning(KWIN_CORE, "Enabled layers:");
         for (const auto &layer : layers) {

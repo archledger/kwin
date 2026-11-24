@@ -74,6 +74,11 @@ bool EglGbmLayer::endFrame(const Region &renderedDeviceRegion, const Region &dam
     return m_surface.endRendering(damagedDeviceRegion, frame);
 }
 
+void EglGbmLayer::discardUnpaintedFrame()
+{
+    m_surface.discardUnpaintedFrame();
+}
+
 bool EglGbmLayer::preparePresentationTest()
 {
     if (m_type != OutputLayerType::Primary && drmOutput()->shouldDisableNonPrimaryPlanes()) {

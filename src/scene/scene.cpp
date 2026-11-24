@@ -226,9 +226,9 @@ void SceneView::postPaint()
     m_scene->postPaint();
 }
 
-void SceneView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &deviceRegion)
+PaintResult SceneView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &deviceRegion)
 {
-    m_scene->paint(renderTarget, deviceOffset, deviceRegion);
+    return m_scene->paint(renderTarget, deviceOffset, deviceRegion);
 }
 
 double SceneView::desiredHdrHeadroom() const
@@ -444,14 +444,14 @@ Region ItemView::collectDamage()
         | m_layer->deviceRepaints();
 }
 
-void ItemView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &region)
+PaintResult ItemView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &region)
 {
     const Region globalRegion = region == Region::infinite() ? Region::infinite() : region.translated(viewport().topLeft().toPoint());
     RenderViewport renderViewport(viewport(), m_logicalOutput->scale(), renderTarget, deviceOffset);
 
     auto renderer = m_item->scene()->renderer(renderDevice());
     if (!renderer->beginFrame(renderTarget, renderViewport)) {
-        return;
+        return PaintResult::NotStarted;
     }
     renderer->renderBackground(renderTarget, renderViewport, globalRegion);
     WindowPaintData data;
@@ -459,9 +459,10 @@ void ItemView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffse
         return toRender != m_item;
     }, {});
     if (!success) {
-        return;
+        return PaintResult::Started;
     }
     renderer->endFrame();
+    return PaintResult::Started;
 }
 
 bool ItemView::shouldRenderItem(Item *item) const
@@ -582,20 +583,21 @@ Region ItemTreeView::collectDamage()
     return ret;
 }
 
-void ItemTreeView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &deviceRegion)
+PaintResult ItemTreeView::paint(const RenderTarget &renderTarget, const QPoint &deviceOffset, const Region &deviceRegion)
 {
     RenderViewport renderViewport(viewport(), m_logicalOutput->scale(), renderTarget, deviceOffset);
 
     auto renderer = m_item->scene()->renderer(renderDevice());
     if (!renderer->beginFrame(renderTarget, renderViewport)) {
-        return;
+        return PaintResult::NotStarted;
     }
     renderer->renderBackground(renderTarget, renderViewport, deviceRegion);
     WindowPaintData data;
     if (!renderer->renderItem(renderTarget, renderViewport, m_item, 0, deviceRegion, data, {}, {})) {
-        return;
+        return PaintResult::Started;
     }
     renderer->endFrame();
+    return PaintResult::Started;
 }
 
 bool ItemTreeView::shouldRenderItem(Item *item) const

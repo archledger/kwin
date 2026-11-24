@@ -108,6 +108,10 @@ bool OutputLayer::needsRepaint() const
     return m_repaintScheduled || !m_repaints.isEmpty();
 }
 
+void OutputLayer::discardUnpaintedFrame()
+{
+}
+
 bool OutputLayer::earlyScanoutChecks()
 {
     return false;

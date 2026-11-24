@@ -60,6 +60,7 @@ public:
                                                             double scale, BackendOutput::ColorPowerTradeoff tradeoff,
                                                             bool useShadowBuffer, uint32_t requiredAlphaBits);
     bool endRendering(const Region &damagedDeviceRegion, OutputFrame *frame);
+    void discardUnpaintedFrame();
 
     void destroyResources();
     EglGbmBackend *eglBackend() const;
