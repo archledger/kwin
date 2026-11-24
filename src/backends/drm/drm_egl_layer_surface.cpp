@@ -284,6 +284,13 @@ bool EglGbmLayerSurface::endRendering(const Region &damagedDeviceRegion, OutputF
     }
 }
 
+void EglGbmLayerSurface::discardUnpaintedFrame()
+{
+    m_surface->compositingTimeQuery.reset();
+    m_surface->currentShadowSlot.reset();
+    m_surface->currentSlot.reset();
+}
+
 EglGbmBackend *EglGbmLayerSurface::eglBackend() const
 {
     return m_eglBackend;

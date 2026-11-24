@@ -95,6 +95,12 @@ bool VirtualEglGbmLayer::endFrame(const Region &renderedDeviceRegion, const Regi
     return true;
 }
 
+void VirtualEglGbmLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
+    m_currentSlot.reset();
+}
+
 std::shared_ptr<EglSwapchain> VirtualEglGbmLayer::createGbmSwapchain() const
 {
     static bool modifiersEnvSet = false;

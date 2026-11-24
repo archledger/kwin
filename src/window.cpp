@@ -6129,7 +6129,7 @@ void Window::doSetHiddenByShowDesktop()
 {
 }
 
-RectF Window::moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea)
+RectF Window::moveToArea(const RectF &geometry, const RectF &oldArea, const RectF &newArea) const
 {
     RectF ret = geometry;
     // move the window to have the same relative position to the center of the screen
@@ -6301,7 +6301,7 @@ Window::WorkspacePositionDecision Window::workspacePositionDecision(RectF oldGeo
             oldScreenArea = newOutput->geometry();
         }
         screenArea = newOutput->geometry();
-        newGeom.translate(screenArea.topLeft() - oldScreenArea.topLeft());
+        newGeom = moveToArea(newGeom, oldScreenArea, screenArea);
     } else {
         oldScreenArea = workspace()->clientArea(ScreenArea, workspace()->outputAt(oldGeometry.center()));
         screenArea = workspace()->clientArea(ScreenArea, this, newGeom.center());

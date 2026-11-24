@@ -17,6 +17,8 @@
 #include <sys/types.h>
 #include <vulkan/vulkan_raii.hpp>
 
+Q_MOC_INCLUDE("opengl/eglcontext.h")
+
 namespace KWin
 {
 
@@ -100,6 +102,16 @@ public:
      */
     static std::unique_ptr<RenderDevice> createSoftwareDevice(dev_t deviceId);
 
+Q_SIGNALS:
+    // Forwarded synchronously from the reporting EGL context, never from Vulkan or allocation failures.
+    void eglGraphicsResetReported(EglContext *context);
+
+    /**
+     * Emitted when either Vulkan or EGL have detected a graphics reset
+     * and graphics resources need to be re-created
+     */
+    void resetDetected();
+
 private:
     void handleVulkanDeviceLoss();
     void createVulkanDevice();
@@ -114,6 +126,7 @@ private:
     FormatModifierMap m_allImportableFormats;
     std::weak_ptr<EglContext> m_shareContext;
     std::weak_ptr<EglContext> m_eglContext;
+    bool m_eglContextCreationFailed = false;
     bool m_inReset = false;
     const QString m_path;
     const dev_t m_deviceId;

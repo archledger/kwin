@@ -152,6 +152,7 @@ X11WindowedOutput::X11WindowedOutput(X11WindowedBackend *backend)
 
 X11WindowedOutput::~X11WindowedOutput()
 {
+    m_stagedBuffer.reset();
     m_buffers.clear();
 
     xcb_present_select_input(m_backend->connection(), m_presentEvent, m_window, 0);
@@ -416,7 +417,7 @@ xcb_pixmap_t X11WindowedOutput::importShmBuffer(const ShmAttributes *attributes)
     return pixmap;
 }
 
-xcb_pixmap_t X11WindowedOutput::importBuffer(GraphicsBuffer *graphicsBuffer)
+X11WindowedBuffer *X11WindowedOutput::importBuffer(GraphicsBuffer *graphicsBuffer)
 {
     std::unique_ptr<X11WindowedBuffer> &x11Buffer = m_buffers[graphicsBuffer];
     if (!x11Buffer) {
@@ -427,7 +428,8 @@ xcb_pixmap_t X11WindowedOutput::importBuffer(GraphicsBuffer *graphicsBuffer)
             pixmap = importShmBuffer(attributes);
         }
         if (pixmap == XCB_PIXMAP_NONE) {
-            return XCB_PIXMAP_NONE;
+            m_buffers.erase(graphicsBuffer);
+            return nullptr;
         }
 
         x11Buffer = std::make_unique<X11WindowedBuffer>(this, pixmap, graphicsBuffer);
@@ -436,13 +438,13 @@ xcb_pixmap_t X11WindowedOutput::importBuffer(GraphicsBuffer *graphicsBuffer)
         });
     }
 
-    x11Buffer->lock();
-    return x11Buffer->pixmap();
+    return x11Buffer.get();
 }
 
 void X11WindowedOutput::setPrimaryBuffer(GraphicsBuffer *buffer)
 {
-    m_pendingBuffer = importBuffer(buffer);
+    m_primaryBuffer = importBuffer(buffer);
+    m_stagedBuffer = m_primaryBuffer ? buffer : nullptr;
 }
 
 std::expected<void, OutputError> X11WindowedOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
@@ -465,7 +467,7 @@ std::expected<void, OutputError> X11WindowedOutput::present(const QList<OutputLa
     }
     // we still present the window, even if the primary layer isn't in the list
     // in order to get presentation feedback
-    if (!m_pendingBuffer) {
+    if (!m_primaryBuffer) {
         return std::unexpected(OutputError{
             .code = OutputErrorCode::InvalidApiUsage,
             .message = QStringLiteral("Can't present without a buffer"),
@@ -478,9 +480,12 @@ std::expected<void, OutputError> X11WindowedOutput::present(const QList<OutputLa
     uint32_t options = 0;
     uint64_t targetMsc = 0;
 
+    // Only a submitted pixmap can get an idle notification. Replacing an
+    // unsubmitted primary buffer only drops its staging reference.
+    m_primaryBuffer->lock();
     xcb_present_pixmap(backend()->connection(),
                        window(),
-                       m_pendingBuffer,
+                       m_primaryBuffer->pixmap(),
                        serial,
                        valid,
                        update,
@@ -495,6 +500,7 @@ std::expected<void, OutputError> X11WindowedOutput::present(const QList<OutputLa
                        0,
                        0,
                        nullptr);
+    m_stagedBuffer.reset();
 
     Q_ASSERT(!m_frame);
     m_frame = frame;

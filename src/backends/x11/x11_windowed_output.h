@@ -9,9 +9,11 @@
 #pragma once
 
 #include "core/backendoutput.h"
+#include "core/graphicsbuffer.h"
 #include <kwin_export.h>
 
 #include <QObject>
+#include <QPointer>
 #include <QSize>
 #include <QString>
 
@@ -89,8 +91,6 @@ public:
     xcb_window_t window() const;
     int depth() const;
 
-    xcb_pixmap_t importBuffer(GraphicsBuffer *buffer);
-
     QPoint internalPosition() const;
     QPoint hostPosition() const;
     void setHostPosition(const QPoint &pos);
@@ -121,16 +121,18 @@ public:
 private:
     void initXInputForWindow();
 
+    X11WindowedBuffer *importBuffer(GraphicsBuffer *buffer);
     xcb_pixmap_t importDmaBufBuffer(const DmaBufAttributes *attributes);
     xcb_pixmap_t importShmBuffer(const ShmAttributes *attributes);
 
     std::vector<std::unique_ptr<OutputLayer>> m_layers;
     xcb_window_t m_window = XCB_WINDOW_NONE;
     xcb_present_event_t m_presentEvent = XCB_NONE;
-    xcb_pixmap_t m_pendingBuffer = XCB_PIXMAP_NONE;
+    QPointer<X11WindowedBuffer> m_primaryBuffer;
     std::unique_ptr<NETWinInfo> m_winInfo;
     std::unique_ptr<X11WindowedCursor> m_cursor;
     std::unordered_map<GraphicsBuffer *, std::unique_ptr<X11WindowedBuffer>> m_buffers;
+    GraphicsBufferRef m_stagedBuffer;
     QPoint m_hostPosition;
     Region m_exposedArea;
     std::shared_ptr<OutputFrame> m_frame;

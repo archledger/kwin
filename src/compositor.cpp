@@ -43,6 +43,7 @@
 
 #include <KCrash>
 #include <QQuickWindow>
+#include <QThread>
 #include <optional>
 #include <ranges>
 #include <sys/stat.h>
@@ -68,6 +69,7 @@ Compositor::Compositor(QObject *workspace)
     : QObject(workspace)
     , m_allowOverlaysEnv(environmentVariableBoolValue("KWIN_USE_OVERLAYS"))
     , m_renderLoopDrivenAnimationDriver(new RenderLoopDrivenQAnimationDriver(this))
+    , m_resetTimer(std::make_unique<QTimer>())
 {
     // register DBus
     new CompositorDBusInterface(this);
@@ -85,6 +87,7 @@ Compositor::Compositor(QObject *workspace)
 
     connect(GpuManager::self(), &GpuManager::renderDeviceRemoved, this, [this](RenderDevice *device) {
         if (m_primaryDevice != device) {
+            kwinApp()->scene()->detachRenderer(device);
             return;
         }
         if (GpuManager::self()->renderDevices().empty()) {
@@ -99,6 +102,10 @@ Compositor::Compositor(QObject *workspace)
         qCWarning(KWIN_CORE, "Switched primary GPU to %s", qPrintable(m_primaryDevice->path()));
         Q_EMIT primaryGpuChanged();
     });
+
+    m_resetTimer->setSingleShot(true);
+    m_resetTimer->setInterval(0);
+    connect(m_resetTimer.get(), &QTimer::timeout, this, &Compositor::reinitialize);
 }
 
 Compositor::~Compositor()
@@ -328,9 +335,12 @@ void Compositor::createRenderer()
         if (stop) {
             break;
         } else if (qEnvironmentVariableIsSet("KWIN_COMPOSE")) {
-            qCCritical(KWIN_CORE) << "Could not fulfill the requested compositing mode in KWIN_COMPOSE:" << type << ". Exiting.";
-            qApp->quit();
+            qCFatal(KWIN_CORE) << "Could not fulfill the requested compositing mode in KWIN_COMPOSE:" << type << ". Exiting.";
         }
+    }
+
+    if (!m_backend) {
+        qCFatal(KWIN_CORE) << "Couldn't create a renderer. We are going to quit KWin now as it is broken";
     }
 }
 
@@ -350,15 +360,6 @@ void Compositor::start()
         createRenderer();
     }
 
-    if (!m_backend) {
-        m_state = State::Off;
-
-        qCCritical(KWIN_CORE) << "The used windowing system requires compositing";
-        qCCritical(KWIN_CORE) << "We are going to quit KWin now as it is broken";
-        qApp->quit();
-        return;
-    }
-
     if (m_selectedCompositor == NoCompositing) {
         m_selectedCompositor = m_backend->compositingType();
 
@@ -376,6 +377,8 @@ void Compositor::start()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
+        connect(device.get(), &RenderDevice::eglGraphicsResetReported, this, &Compositor::waitForEglGraphicsReset, Qt::DirectConnection);
+        connect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
         kwinApp()->scene()->attachRenderer(device.get(), std::make_unique<ItemRendererOpenGL>(device.get()));
     }
 
@@ -397,6 +400,8 @@ void Compositor::stop()
         return;
     }
     m_state = State::Stopping;
+    m_resetTimer->stop();
+    m_glResetDeadline.reset();
     Q_EMIT aboutToToggleCompositing();
     Q_EMIT aboutToStop();
 
@@ -423,6 +428,8 @@ void Compositor::stop()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
+        disconnect(device.get(), &RenderDevice::eglGraphicsResetReported, this, &Compositor::waitForEglGraphicsReset);
+        disconnect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
         kwinApp()->scene()->detachRenderer(device.get());
     }
 
@@ -430,6 +437,28 @@ void Compositor::stop()
 
     m_state = State::Off;
     Q_EMIT compositingToggled(false);
+}
+
+void Compositor::gpuResetDetected()
+{
+    if (m_state == State::Starting || m_state == State::On) {
+        m_resetTimer->start();
+    }
+}
+
+void Compositor::waitForEglGraphicsReset(EglContext *context)
+{
+    // No polling on compositor teardown or startup, and never move this query
+    // to a different thread. Devices share one budget before the deferred restart.
+    if (QThread::currentThread() != thread() || m_state != State::On) {
+        return;
+    }
+    if (!m_glResetDeadline) {
+        m_glResetDeadline.emplace(10000, Qt::PreciseTimer);
+    }
+    if (!m_glResetDeadline->hasExpired()) {
+        context->waitForGraphicsReset(*m_glResetDeadline);
+    }
 }
 
 static bool isTearingRequested(const Item *item)
@@ -540,16 +569,29 @@ static bool prepareRendering(RenderView *view, LogicalOutput *logicalOutput, Bac
     return layer->preparePresentationTest();
 }
 
-static bool renderLayer(RenderView *view, LogicalOutput *logicalOutput, BackendOutput *backendOutput, const std::shared_ptr<OutputFrame> &frame, const Region &surfaceDamage)
+enum class LayerRenderResult {
+    Finished,
+    RendererNotStarted,
+    OutputLayerFailed,
+};
+
+static LayerRenderResult renderLayer(RenderView *view, OutputFrame *frame, const Region &surfaceDamage)
 {
-    auto beginInfo = view->layer()->beginFrame(frame.get());
+    auto layer = view->layer();
+    auto beginInfo = layer->beginFrame(frame);
     if (!beginInfo) {
-        return false;
+        return LayerRenderResult::OutputLayerFailed;
     }
     auto &[renderTarget, repaint] = beginInfo.value();
-    const Region bufferDamage = surfaceDamage.united(repaint).intersected(renderTarget.transformedRect());
-    view->paint(renderTarget, view->renderOffset(), bufferDamage);
-    return view->layer()->endFrame(bufferDamage, surfaceDamage, frame.get());
+    const Rect targetRect = renderTarget.transformedRect();
+    const Region bufferDamage = surfaceDamage.united(repaint).intersected(targetRect);
+    if (view->paint(renderTarget, view->renderOffset(), bufferDamage) == PaintResult::NotStarted) {
+        layer->discardUnpaintedFrame();
+        return LayerRenderResult::RendererNotStarted;
+    }
+    return layer->endFrame(bufferDamage, surfaceDamage == Region::infinite() ? Region(targetRect) : surfaceDamage, frame)
+        ? LayerRenderResult::Finished
+        : LayerRenderResult::OutputLayerFailed;
 }
 
 static OutputLayer *findLayer(std::span<OutputLayer *const> layers, OutputLayerType type)
@@ -732,7 +774,12 @@ std::pair<QList<Compositor::LayerData>, std::expected<void, OutputError>> Compos
                         if (!prepareRendering(cursorView, logicalOutput, backendOutput, 8)) {
                             return;
                         }
-                        if (!renderLayer(cursorView, logicalOutput, backendOutput, nullptr, cursorView->collectDamage())) {
+                        const auto rendered = renderLayer(cursorView, nullptr, cursorView->collectDamage());
+                        if (rendered == LayerRenderResult::RendererNotStarted) {
+                            // Pass the retry to normal compositing, not another async update.
+                            outputLayer->addDeviceRepaint(Region::infinite());
+                        }
+                        if (rendered != LayerRenderResult::Finished) {
                             return;
                         }
                     }
@@ -819,12 +866,6 @@ std::pair<QList<Compositor::LayerData>, std::expected<void, OutputError>> Compos
 
 void Compositor::composite(RenderLoop *renderLoop)
 {
-    if (m_backend->checkGraphicsReset()) {
-        qCDebug(KWIN_CORE) << "Graphics reset occurred";
-        reinitialize();
-        return;
-    }
-
     WorkspaceScene *scene = kwinApp()->scene();
     BackendOutput *output = findOutput(renderLoop);
     LogicalOutput *logicalOutput = workspace()->findOutput(output);
@@ -960,6 +1001,7 @@ void Compositor::composite(RenderLoop *renderLoop)
         }
     }
 
+    bool rendererNotStarted = false;
     const auto renderLayers = [&]() -> std::expected<void, OutputError> {
         for (auto &layer : layers) {
             if (!layer.view->layer()->needsRepaint()) {
@@ -970,7 +1012,9 @@ void Compositor::composite(RenderLoop *renderLoop)
             layer.surfaceDamage |= layer.view->layer()->deviceRepaints();
             layer.view->layer()->resetRepaints();
             if (layer.view->layer()->isEnabled() && !layer.directScanout) {
-                if (!renderLayer(layer.view, logicalOutput, output, frame, layer.surfaceDamage)) {
+                const auto rendered = renderLayer(layer.view, frame.get(), layer.surfaceDamage);
+                if (rendered != LayerRenderResult::Finished) {
+                    rendererNotStarted = rendered == LayerRenderResult::RendererNotStarted;
                     return std::unexpected(OutputError{
                         .code = OutputErrorCode::Other,
                         .message = QStringLiteral("Rendering a layer failed"),
@@ -1005,7 +1049,7 @@ void Compositor::composite(RenderLoop *renderLoop)
     totalTimeQuery->end();
     frame->addRenderTimeQuery(std::move(totalTimeQuery));
     result = result.and_then(present);
-    if (!result) {
+    if (!result && !rendererNotStarted) {
         // legacy modesetting can't do (useful) presentation tests
         // and even with atomic modesetting, drivers are buggy and atomic tests
         // sometimes have false positives
@@ -1023,7 +1067,7 @@ void Compositor::composite(RenderLoop *renderLoop)
 
         // if this still doesn't work, fall back to primary only
         const bool fallback2 = layers.size() == 1 && layers.front().view == primaryView;
-        if (!result && !fallback2) {
+        if (!result && !rendererNotStarted && !fallback2) {
             idealLayerAssignments = assignLayers(primaryView, sceneOnly, allowedOutputLayers);
             std::tie(layers, result) = setupLayers(primaryView, logicalOutput, output, allowedOutputLayers, *idealLayerAssignments, frame, toUpdate);
             result = result.and_then(renderLayers).and_then(present);
@@ -1039,11 +1083,21 @@ void Compositor::composite(RenderLoop *renderLoop)
         }
     }
 
-    scene->frame(primaryView, frame.get());
+    if (!rendererNotStarted) {
+        scene->frame(primaryView, frame.get());
+    }
     primaryView->postPaint();
 
     // the layers have to stay valid until after postPaint, so this needs to happen after it
-    if (!result) {
+    if (rendererNotStarted) {
+        // The presentation was skipped, including any layers already staged
+        // before this layer refused to paint. Restore the damage we consumed.
+        for (OutputLayer *layer : toUpdate) {
+            if (layer->isEnabled()) {
+                layer->addDeviceRepaint(Region::infinite());
+            }
+        }
+    } else if (!result) {
         qCWarning(KWIN_CORE, "Failed to find a working output layer configuration: %s", qPrintable(result.error().message));
         qCWarning(KWIN_CORE, "Enabled layers:");
         for (const auto &layer : layers) {

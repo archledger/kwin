@@ -129,8 +129,12 @@ QColor ColorPickerEffect::pick()
             const Rect pixelDamage = Rect(QPoint(), QSize(1, 1));
             sceneView.setViewport(RectF(p, QSizeF(1, 1)));
             sceneView.prePaint();
-            sceneView.paint(beginInfo->renderTarget, QPoint(), pixelDamage);
+            const auto result = sceneView.paint(beginInfo->renderTarget, QPoint(), pixelDamage);
             sceneView.postPaint();
+            if (result == PaintResult::NotStarted) {
+                QDBusConnection::sessionBus().send(m_replyMessage.createErrorReply(QDBusError::Failed, QStringLiteral("Could not render the requested pixel")));
+                return;
+            }
             if (!layer.endFrame(pixelDamage, pixelDamage, nullptr)) {
                 return;
             }

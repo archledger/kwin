@@ -7,27 +7,36 @@
 #include "backends/virtual/virtual_egl_backend.h"
 #include "compositor.h"
 #include "core/renderbackend.h"
+#include "core/renderloop_p.h"
 #include "effect/effectframe.h"
 #include "effect/effecthandler.h"
 #include "effect/effectloader.h"
 #include "effect/offscreenquickview.h"
 #include "effect/quickeffect.h"
+#include "input.h"
 #include "opengl/eglbackend.h"
 #include "opengl/eglcontext.h"
 #include "opengl/glframebuffer.h"
 #include "opengl/gltexture.h"
+#include "pointer_input.h"
 #include "scene/item.h"
+#include "scene/itemrenderer_opengl.h"
 #include "scene/surfaceitem.h"
 #include "scene/windowitem.h"
 #include "scene/workspacescene.h"
+#include "wayland/surface.h"
 #include "wayland_server.h"
 #include "window.h"
 
 #include <KConfigGroup>
+#include <KWayland/Client/pointer.h>
+#include <KWayland/Client/seat.h>
+#include <KWayland/Client/shm_pool.h>
 #include <KWayland/Client/surface.h>
 #include <QDir>
 #include <QFile>
 #include <QQuickWindow>
+#include <QScopeGuard>
 #include <QStandardPaths>
 
 #include <optional>
@@ -61,6 +70,61 @@ static QImage grabOutput(LogicalOutput *output)
     // The virtual output target already flips the scene into OpenGL's buffer coordinates.
     return layer->texture()->toImage();
 }
+
+// The layer selector reads buffer metadata only. This buffer is never imported
+// or sent to an output; its item exists only for synchronous candidate selection.
+class LayerCandidateBuffer : public GraphicsBuffer
+{
+public:
+    explicit LayerCandidateBuffer(const QSize &size)
+        : m_attributes{.planeCount = 1, .width = size.width(), .height = size.height(), .format = DRM_FORMAT_XRGB8888}
+    {
+    }
+
+    QSize size() const override
+    {
+        return QSize(m_attributes.width, m_attributes.height);
+    }
+    bool hasAlphaChannel() const override
+    {
+        return false;
+    }
+    const DmaBufAttributes *dmabufAttributes() const override
+    {
+        return &m_attributes;
+    }
+    uint32_t format() const override
+    {
+        return m_attributes.format;
+    }
+    uint64_t modifier() const override
+    {
+        return m_attributes.modifier;
+    }
+    uint32_t pitch() const override
+    {
+        return uint32_t(m_attributes.width) * 4;
+    }
+
+private:
+    const DmaBufAttributes m_attributes;
+};
+
+class LayerCandidateSurface : public SurfaceItem
+{
+public:
+    LayerCandidateSurface(Item *parent, GraphicsBuffer *buffer)
+        : SurfaceItem(parent)
+    {
+        setBuffer(buffer, FileDescriptor{});
+        setDestinationSize(buffer->size());
+    }
+
+    RegionF opaque() const override
+    {
+        return RegionF(rect());
+    }
+};
 
 // Plasma/6.8 constructs a RenderTarget from a QImage; master only wraps
 // framebuffers. Detect once which shape this build provides.
@@ -102,6 +166,8 @@ private Q_SLOTS:
     void cleanup();
     void testOpacity_data();
     void testOpacity();
+    void testLayerCandidatesWithParentOpacity_data();
+    void testLayerCandidatesWithParentOpacity();
     void testResynchronizeOpacity();
     void testOpacityCapabilityVersion();
     void testOpaqueRegion_data();
@@ -109,7 +175,168 @@ private Q_SLOTS:
     void testRepaint();
     void testComposition();
     void testEffectFrame();
+    void testRendererRefusesToStart();
+    void testCursorCaptureRendererRefusesToStart();
 };
+
+class FailingItemRenderer : public ItemRendererOpenGL
+{
+public:
+    using ItemRendererOpenGL::ItemRendererOpenGL;
+
+    bool beginFrame(const RenderTarget &target, const RenderViewport &viewport) override
+    {
+        ++beginCount;
+        sawRenderTarget = target.framebuffer() && target.framebuffer()->valid();
+        return !failBegin && ItemRendererOpenGL::beginFrame(target, viewport);
+    }
+
+    void endFrame() override
+    {
+        ++endCount;
+        ItemRendererOpenGL::endFrame();
+    }
+
+    int beginCount = 0;
+    int endCount = 0;
+    bool failBegin = false;
+    bool sawRenderTarget = false;
+};
+
+class CursorCaptureRenderer : public FailingItemRenderer
+{
+public:
+    using FailingItemRenderer::FailingItemRenderer;
+
+    bool beginFrame(const RenderTarget &target, const RenderViewport &viewport) override
+    {
+        const bool started = FailingItemRenderer::beginFrame(target, viewport);
+        if (failBegin) {
+            // Define every pixel of the private test target even on the refusal path.
+            // A baseline build that reads it back can only see this synthetic color.
+            if (!sawRenderTarget || !target.texture()) {
+                qFatal("Missing synthetic cursor render target");
+            }
+            QImage sentinel(target.texture()->size(), QImage::Format_RGBA8888_Premultiplied);
+            sentinel.fill(Qt::magenta);
+            target.texture()->update(sentinel, Region(Rect(sentinel.rect())));
+            if (glGetError() != GL_NO_ERROR) {
+                qFatal("Could not initialize the synthetic cursor render target");
+            }
+        }
+        return started;
+    }
+};
+
+void OffscreenQuickViewTest::testCursorCaptureRendererRefusesToStart()
+{
+    QVERIFY(Test::setupWaylandConnection(Test::AdditionalWaylandInterface::Seat));
+    QVERIFY(Test::waitForWaylandPointer());
+    std::unique_ptr<KWayland::Client::Pointer> pointer(Test::waylandSeat()->createPointer());
+    QVERIFY(pointer && pointer->isValid());
+    QSignalSpy entered(pointer.get(), &KWayland::Client::Pointer::entered);
+
+    input()->pointer()->warp(QPointF(0, 0));
+    auto surface = Test::createSurface();
+    auto toplevel = Test::createXdgToplevelSurface(surface.get());
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(window);
+    input()->pointer()->warp(window->clientGeometry().center());
+    QTRY_VERIFY(!entered.isEmpty());
+
+    auto cursorSurface = Test::createSurface();
+    QSignalSpy cursorRendered(cursorSurface.get(), &KWayland::Client::Surface::frameRendered);
+    QImage cursor(QSize(10, 10), QImage::Format_RGBA8888_Premultiplied);
+    cursor.fill(Qt::red);
+    cursorSurface->attachBuffer(Test::waylandShmPool()->createBuffer(cursor));
+    cursorSurface->damage(cursor.rect());
+    cursorSurface->commit();
+    const QPoint hotspot(4, 5);
+    pointer->setCursor(cursorSurface.get(), hotspot);
+    QTRY_VERIFY(!cursorRendered.isEmpty());
+
+    auto scene = kwinApp()->scene();
+    auto device = Compositor::self()->primaryDevice();
+    auto captureRenderer = std::make_unique<CursorCaptureRenderer>(device);
+    auto renderer = captureRenderer.get();
+    scene->attachRenderer(device, std::move(captureRenderer));
+    const auto restoreRenderer = qScopeGuard([scene, device]() {
+        scene->attachRenderer(device, std::make_unique<ItemRendererOpenGL>(device));
+    });
+
+    renderer->failBegin = true;
+    const auto refused = kwinApp()->cursorImage();
+    QCOMPARE(renderer->beginCount, 1);
+    QVERIFY(renderer->sawRenderTarget);
+    QCOMPARE(renderer->endCount, 0);
+    QVERIFY(refused.isNull());
+
+    renderer->failBegin = false;
+    const auto captured = kwinApp()->cursorImage();
+    QCOMPARE(renderer->beginCount, 2);
+    QCOMPARE(renderer->endCount, 1);
+    QCOMPARE(captured.image(), cursor);
+    QCOMPARE(captured.hotSpot(), QPointF(hotspot));
+}
+
+void OffscreenQuickViewTest::testRendererRefusesToStart()
+{
+    QVERIFY(Test::setupWaylandConnection());
+    auto surface = Test::createSurface();
+    auto toplevel = Test::createXdgToplevelSurface(surface.get());
+    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(200, 100), Qt::blue);
+    QVERIFY(window);
+
+    auto scene = kwinApp()->scene();
+    auto device = Compositor::self()->primaryDevice();
+    auto output = window->output();
+    auto loop = output->backendOutput()->renderLoop();
+    auto loopState = RenderLoopPrivate::get(loop);
+    auto layer = Compositor::self()->backend()->compatibleOutputLayers(output->backendOutput()).front();
+    const auto sample = window->clientGeometry().center().toPoint();
+    QTRY_COMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::blue));
+    QTRY_COMPARE(loopState->pendingFrameCount, 0);
+
+    auto failingRenderer = std::make_unique<FailingItemRenderer>(device);
+    auto renderer = failingRenderer.get();
+    scene->attachRenderer(device, std::move(failingRenderer));
+    const auto restoreRenderer = qScopeGuard([scene, device]() {
+        scene->attachRenderer(device, std::make_unique<ItemRendererOpenGL>(device));
+    });
+    loop->inhibit();
+    auto resumeLoop = qScopeGuard([loop]() {
+        loop->uninhibit();
+    });
+
+    // Queue ordinary client damage, then drive just one attempt with the virtual output.
+    QSignalSpy committed(window->surface(), &SurfaceInterface::committed);
+    Test::render(surface.get(), QSize(200, 100), Qt::red);
+    QTRY_COMPARE(committed.count(), 1);
+    QVERIFY(layer->needsRepaint());
+    loopState->pendingReschedule.reset();
+    const auto previousFramebuffer = renderer->context()->currentFramebuffer();
+    renderer->failBegin = true;
+    loopState->dispatch();
+    QCOMPARE(renderer->beginCount, 1);
+    QVERIFY(renderer->sawRenderTarget);
+    // The virtual backend would hold a submitted frame until synthetic vblank.
+    // A dropped frame decrements this synchronously, without waiting for a timer.
+    QCOMPARE(loopState->pendingFrameCount, 0);
+    QCOMPARE(renderer->endCount, 0);
+    QCOMPARE(renderer->context()->currentFramebuffer(), previousFramebuffer);
+    QCOMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::blue));
+    QCOMPARE(layer->deviceRepaints(), Region::infinite());
+    QVERIFY(loopState->pendingReschedule.has_value());
+
+    renderer->failBegin = false;
+    QSignalSpy presented(loop, &RenderLoop::framePresented);
+    resumeLoop.dismiss();
+    loop->uninhibit();
+    QVERIFY(presented.wait());
+    QCOMPARE(renderer->beginCount, 2);
+    QCOMPARE(renderer->endCount, 1);
+    QCOMPARE(grabOutput(output).pixelColor(sample), QColor(Qt::red));
+}
 
 void OffscreenQuickViewTest::initTestCase()
 {
@@ -157,6 +384,51 @@ void OffscreenQuickViewTest::testOpacity()
     QCOMPARE(view.window()->opacity(), 1.0);
     QVERIFY(view.isVisible());
     QVERIFY(item->isVisible());
+}
+
+void OffscreenQuickViewTest::testLayerCandidatesWithParentOpacity_data()
+{
+    QTest::addColumn<qreal>("opacity");
+    QTest::newRow("invisible") << qreal(0);
+    QTest::newRow("translucent") << qreal(0.5);
+    QTest::newRow("opaque") << qreal(1);
+}
+
+void OffscreenQuickViewTest::testLayerCandidatesWithParentOpacity()
+{
+    QFETCH(qreal, opacity);
+    auto scene = effects->scene();
+    QTRY_VERIFY(!scene->sceneViews().empty());
+    auto view = scene->sceneViews().front();
+    QVERIFY(!effects->blocksDirectScanout());
+
+    Item *cursor = scene->cursorItem();
+    const bool cursorWasVisible = cursor->isVisible();
+    cursor->setVisible(false);
+    const auto restoreCursor = qScopeGuard([cursor, cursorWasVisible] {
+        cursor->setVisible(cursorWasVisible);
+    });
+
+    auto buffer = new LayerCandidateBuffer(view->viewport().size().toSize());
+    // containerItem's children must be WindowItems. Both synthetic surfaces
+    // belong to the overlay tree; z orders the translucent one above scanout.
+    LayerCandidateSurface background(scene->overlayItem(), buffer);
+    Item foreground(scene->overlayItem());
+    foreground.setZ(1);
+    foreground.setOpacity(opacity);
+    LayerCandidateSurface foregroundSurface(&foreground, buffer);
+    buffer->drop(); // The two SurfaceItems now own its references.
+
+    view->prePaint();
+    const auto layers = scene->layerCandidates(1);
+    view->postPaint();
+    Item *expected = scene->containerItem();
+    if (opacity == 0) {
+        expected = &background;
+    } else if (opacity == 1) {
+        expected = &foregroundSurface;
+    }
+    QCOMPARE(layers, QList<Item *>{expected});
 }
 
 void OffscreenQuickViewTest::testResynchronizeOpacity()

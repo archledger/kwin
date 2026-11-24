@@ -30,6 +30,7 @@ public:
 
     std::optional<OutputLayerBeginFrameInfo> beginFrame(OutputFrame *frame) override;
     bool endFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame) override;
+    void discardUnpaintedFrame() override;
     FormatModifierMap supportedDrmFormats() const override;
     void releaseBuffers() override;
 
@@ -51,6 +52,7 @@ public:
 
     std::optional<OutputLayerBeginFrameInfo> beginFrame(OutputFrame *frame) override;
     bool endFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame) override;
+    void discardUnpaintedFrame() override;
     FormatModifierMap supportedDrmFormats() const override;
     void releaseBuffers() override;
 

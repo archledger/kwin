@@ -546,7 +546,9 @@ static PlatformCursorImage grabCursorOpenGL(WorkspaceScene *scene)
 
     SceneView sceneView(scene, output, nullptr, nullptr, Compositor::self()->primaryDevice());
     ItemTreeView cursorView(&sceneView, scene->cursorItem(), output, nullptr, nullptr);
-    cursorView.paint(renderTarget, QPoint(), Region::infinite());
+    if (cursorView.paint(renderTarget, QPoint(), Region::infinite()) == PaintResult::NotStarted) {
+        return PlatformCursorImage{};
+    }
 
     QImage image = texture->toImage();
     image.setDevicePixelRatio(output->scale());
