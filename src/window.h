@@ -2849,9 +2849,6 @@ protected:
     bool m_lockScreenOverlay = false;
     uint32_t m_offscreenRenderCount = 0;
     QTimer m_offscreenFramecallbackTimer;
-    QPointer<BackendOutput> m_offscreenFrameCallbackBackend;
-    QMetaObject::Connection m_offscreenFrameModeConnection;
-    QMetaObject::Connection m_offscreenFrameEnabledConnection;
 
     QString m_tag;
     QString m_description;

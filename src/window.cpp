@@ -51,6 +51,7 @@
 #include <QHash>
 #include <QJSEngine>
 #include <QMouseEvent>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QStyleHints>
 
@@ -64,6 +65,17 @@ namespace
 
 // Keep the same-version backport ABI-compatible with consumers built against stock headers.
 QHash<const Window *, RectF> s_notifiedRequestedGeometry;
+
+struct OffscreenFrameBackendObservation
+{
+    QPointer<BackendOutput> backend;
+    QMetaObject::Connection modeChanged;
+    QMetaObject::Connection enabledChanged;
+};
+
+// Only windows observing an offscreen backend need this state. Keep it out
+// of Window so it does not change the layout in the installed header.
+QHash<const Window *, OffscreenFrameBackendObservation> s_offscreenFrameBackends;
 
 bool exactFrameGeometry(const RectF &left, const RectF &right)
 {
@@ -147,6 +159,7 @@ Window::Window()
 
 Window::~Window()
 {
+    observeOffscreenFrameCallbackBackend(nullptr);
     s_notifiedRequestedGeometry.remove(this);
 }
 
@@ -6769,20 +6782,28 @@ bool Window::isOffscreenRendering() const
 
 void Window::observeOffscreenFrameCallbackBackend(BackendOutput *backend)
 {
-    if (m_offscreenFrameCallbackBackend == backend) {
+    auto it = s_offscreenFrameBackends.find(this);
+    if (it != s_offscreenFrameBackends.end()) {
+        if (backend && it->backend == backend) {
+            return;
+        }
+        disconnect(it->modeChanged);
+        disconnect(it->enabledChanged);
+        s_offscreenFrameBackends.erase(it);
+    }
+    if (!backend) {
         return;
     }
-    disconnect(m_offscreenFrameModeConnection);
-    disconnect(m_offscreenFrameEnabledConnection);
-    m_offscreenFrameCallbackBackend = backend;
-    if (backend) {
-        // The mode or enabled state can change without a workspace reassignment.
-        const auto update = [this]() {
-            updateOffscreenFrameCallbackTimer();
-        };
-        m_offscreenFrameModeConnection = connect(backend, &BackendOutput::currentModeChanged, this, update);
-        m_offscreenFrameEnabledConnection = connect(backend, &BackendOutput::enabledChanged, this, update);
-    }
+
+    // The mode or enabled state can change without a workspace reassignment.
+    const auto update = [this]() {
+        updateOffscreenFrameCallbackTimer();
+    };
+    s_offscreenFrameBackends.insert(this, OffscreenFrameBackendObservation{
+                                              backend,
+                                              connect(backend, &BackendOutput::currentModeChanged, this, update),
+                                              connect(backend, &BackendOutput::enabledChanged, this, update),
+                                          });
 }
 
 LogicalOutput *Window::updateOffscreenFrameCallbackTimer()
