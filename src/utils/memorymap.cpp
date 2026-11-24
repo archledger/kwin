@@ -13,9 +13,12 @@ namespace KWin
 
 void asyncMunmap(void *addr, size_t length)
 {
-    QThreadPool::globalInstance()->start([addr, length]() {
+    const auto unmap = [addr, length]() {
         munmap(addr, length);
-    });
+    };
+    if (auto *pool = QThreadPool::globalInstance(); !pool || !pool->tryStart(unmap)) {
+        unmap();
+    }
 }
 
 }

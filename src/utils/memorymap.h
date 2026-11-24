@@ -15,12 +15,11 @@ namespace KWin
 {
 
 /*!
- * Asynchronously unmaps a part of the address space starting at \a addr and continuing for
- * \a length bytes.
+ * Unmaps a part of the address space starting at \a addr and continuing for \a length bytes.
  *
  * Plain munmap() can take a significant amount of time to complete sometimes, for example, it
- * can take 10ms or so. This function schedules munmap() to be called from a worker thread
- * to keep the caller thread unblocked.
+ * can take 10ms or so. This function uses a worker thread when one is available. Otherwise,
+ * it unmaps in the caller to avoid keeping the mapping alive while waiting for a worker.
  */
 KWIN_EXPORT void asyncMunmap(void *addr, size_t length);
 
