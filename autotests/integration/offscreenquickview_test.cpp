@@ -28,6 +28,7 @@
 #include <QDir>
 #include <QFile>
 #include <QQuickWindow>
+#include <QScopeGuard>
 #include <QStandardPaths>
 
 #include <optional>
@@ -61,6 +62,61 @@ static QImage grabOutput(LogicalOutput *output)
     // The virtual output target already flips the scene into OpenGL's buffer coordinates.
     return layer->texture()->toImage();
 }
+
+// The layer selector reads buffer metadata only. This buffer is never imported
+// or sent to an output; its item exists only for synchronous candidate selection.
+class LayerCandidateBuffer : public GraphicsBuffer
+{
+public:
+    explicit LayerCandidateBuffer(const QSize &size)
+        : m_attributes{.planeCount = 1, .width = size.width(), .height = size.height(), .format = DRM_FORMAT_XRGB8888}
+    {
+    }
+
+    QSize size() const override
+    {
+        return QSize(m_attributes.width, m_attributes.height);
+    }
+    bool hasAlphaChannel() const override
+    {
+        return false;
+    }
+    const DmaBufAttributes *dmabufAttributes() const override
+    {
+        return &m_attributes;
+    }
+    uint32_t format() const override
+    {
+        return m_attributes.format;
+    }
+    uint64_t modifier() const override
+    {
+        return m_attributes.modifier;
+    }
+    uint32_t pitch() const override
+    {
+        return uint32_t(m_attributes.width) * 4;
+    }
+
+private:
+    const DmaBufAttributes m_attributes;
+};
+
+class LayerCandidateSurface : public SurfaceItem
+{
+public:
+    LayerCandidateSurface(Item *parent, GraphicsBuffer *buffer)
+        : SurfaceItem(parent)
+    {
+        setBuffer(buffer, FileDescriptor{});
+        setDestinationSize(buffer->size());
+    }
+
+    RegionF opaque() const override
+    {
+        return RegionF(rect());
+    }
+};
 
 // Plasma/6.8 constructs a RenderTarget from a QImage; master only wraps
 // framebuffers. Detect once which shape this build provides.
@@ -102,6 +158,8 @@ private Q_SLOTS:
     void cleanup();
     void testOpacity_data();
     void testOpacity();
+    void testLayerCandidatesWithParentOpacity_data();
+    void testLayerCandidatesWithParentOpacity();
     void testResynchronizeOpacity();
     void testOpacityCapabilityVersion();
     void testOpaqueRegion_data();
@@ -157,6 +215,51 @@ void OffscreenQuickViewTest::testOpacity()
     QCOMPARE(view.window()->opacity(), 1.0);
     QVERIFY(view.isVisible());
     QVERIFY(item->isVisible());
+}
+
+void OffscreenQuickViewTest::testLayerCandidatesWithParentOpacity_data()
+{
+    QTest::addColumn<qreal>("opacity");
+    QTest::newRow("invisible") << qreal(0);
+    QTest::newRow("translucent") << qreal(0.5);
+    QTest::newRow("opaque") << qreal(1);
+}
+
+void OffscreenQuickViewTest::testLayerCandidatesWithParentOpacity()
+{
+    QFETCH(qreal, opacity);
+    auto scene = effects->scene();
+    QTRY_VERIFY(!scene->sceneViews().empty());
+    auto view = scene->sceneViews().front();
+    QVERIFY(!effects->blocksDirectScanout());
+
+    Item *cursor = scene->cursorItem();
+    const bool cursorWasVisible = cursor->isVisible();
+    cursor->setVisible(false);
+    const auto restoreCursor = qScopeGuard([cursor, cursorWasVisible] {
+        cursor->setVisible(cursorWasVisible);
+    });
+
+    auto buffer = new LayerCandidateBuffer(view->viewport().size().toSize());
+    // containerItem's children must be WindowItems. Both synthetic surfaces
+    // belong to the overlay tree; z orders the translucent one above scanout.
+    LayerCandidateSurface background(scene->overlayItem(), buffer);
+    Item foreground(scene->overlayItem());
+    foreground.setZ(1);
+    foreground.setOpacity(opacity);
+    LayerCandidateSurface foregroundSurface(&foreground, buffer);
+    buffer->drop(); // The two SurfaceItems now own its references.
+
+    view->prePaint();
+    const auto layers = scene->layerCandidates(1);
+    view->postPaint();
+    Item *expected = scene->containerItem();
+    if (opacity == 0) {
+        expected = &background;
+    } else if (opacity == 1) {
+        expected = &foregroundSurface;
+    }
+    QCOMPARE(layers, QList<Item *>{expected});
 }
 
 void OffscreenQuickViewTest::testResynchronizeOpacity()

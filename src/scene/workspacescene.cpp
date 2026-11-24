@@ -308,8 +308,9 @@ static std::optional<bool> findOverlayCandidates(SceneView *view, Item *item, ss
     }
     opacity *= item->opacity();
     if (opacity < 1.0) {
-        // TODO make the compositor handle this
-        return std::nullopt;
+        // A lower scanout candidate cannot represent this translucent subtree.
+        // Fall back to compositing instead of omitting the subtree.
+        return false;
     }
     maybePushCorners(item, corners);
     auto cleanupCorners = qScopeGuard([&corners]() {
