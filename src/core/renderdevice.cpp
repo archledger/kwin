@@ -155,6 +155,7 @@ std::shared_ptr<EglContext> RenderDevice::eglContext()
             return nullptr;
         }
         m_eglContextCreationFailed = false;
+        connect(ret.get(), &EglContext::graphicsResetReported, this, &RenderDevice::eglGraphicsResetReported, Qt::DirectConnection);
         connect(ret.get(), &EglContext::resetDetected, this, &RenderDevice::resetDetected);
         m_eglContext = ret;
     }

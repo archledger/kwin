@@ -22,7 +22,9 @@
 #include "opengl/glutils.h"
 #include "utils/common.h"
 
+#include <QDeadlineTimer>
 #include <QOpenGLContext>
+#include <QThread>
 #include <drm_fourcc.h>
 
 namespace KWin
@@ -543,10 +545,27 @@ bool EglContext::checkGraphicsReset()
         break;
     default:
         qCWarning(KWIN_OPENGL) << "Received unexpected return value" << status << "from glGetGraphicsResetStatus";
-        break;
+        setFailed();
+        return true;
     }
+    Q_EMIT graphicsResetReported(this);
     setFailed();
     return true;
+}
+
+void EglContext::waitForGraphicsReset(const QDeadlineTimer &deadline)
+{
+    // ARB_robustness §2.6: a subsequent GL_NO_ERROR means the reset has
+    // completed, not that this context can be used for rendering again.
+    while (!deadline.hasExpired() && eglGetCurrentContext() == m_handle) {
+        if (m_glGetGraphicsResetStatus() == GL_NO_ERROR) {
+            return;
+        }
+        QThread::usleep(50);
+    }
+    if (deadline.hasExpired()) {
+        qCWarning(KWIN_OPENGL) << "Waiting for glGetGraphicsResetStatus to return GL_NO_ERROR timed out!";
+    }
 }
 
 void EglContext::glReadnPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, GLvoid *data)

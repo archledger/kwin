@@ -43,6 +43,7 @@
 
 #include <KCrash>
 #include <QQuickWindow>
+#include <QThread>
 #include <optional>
 #include <ranges>
 #include <sys/stat.h>
@@ -376,6 +377,7 @@ void Compositor::start()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
+        connect(device.get(), &RenderDevice::eglGraphicsResetReported, this, &Compositor::waitForEglGraphicsReset, Qt::DirectConnection);
         connect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
         kwinApp()->scene()->attachRenderer(device.get(), std::make_unique<ItemRendererOpenGL>(device.get()));
     }
@@ -399,6 +401,7 @@ void Compositor::stop()
     }
     m_state = State::Stopping;
     m_resetTimer->stop();
+    m_glResetDeadline.reset();
     Q_EMIT aboutToToggleCompositing();
     Q_EMIT aboutToStop();
 
@@ -425,6 +428,7 @@ void Compositor::stop()
 
     const auto &devices = GpuManager::self()->renderDevices();
     for (const auto &device : devices) {
+        disconnect(device.get(), &RenderDevice::eglGraphicsResetReported, this, &Compositor::waitForEglGraphicsReset);
         disconnect(device.get(), &RenderDevice::resetDetected, this, &Compositor::gpuResetDetected);
         kwinApp()->scene()->detachRenderer(device.get());
     }
@@ -439,6 +443,21 @@ void Compositor::gpuResetDetected()
 {
     if (m_state == State::Starting || m_state == State::On) {
         m_resetTimer->start();
+    }
+}
+
+void Compositor::waitForEglGraphicsReset(EglContext *context)
+{
+    // No polling on compositor teardown or startup, and never move this query
+    // to a different thread. Devices share one budget before the deferred restart.
+    if (QThread::currentThread() != thread() || m_state != State::On) {
+        return;
+    }
+    if (!m_glResetDeadline) {
+        m_glResetDeadline.emplace(10000, Qt::PreciseTimer);
+    }
+    if (!m_glResetDeadline->hasExpired()) {
+        context->waitForGraphicsReset(*m_glResetDeadline);
     }
 }
 

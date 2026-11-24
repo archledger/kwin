@@ -14,10 +14,12 @@
 #include "effect/globals.h"
 #include "kwin_export.h"
 
+#include <QDeadlineTimer>
 #include <QHash>
 #include <QObject>
 
 #include <memory>
+#include <optional>
 
 namespace KWin
 {
@@ -38,6 +40,7 @@ class RenderLoopDrivenQAnimationDriver;
 class RenderView;
 class Item;
 class RenderDevice;
+class EglContext;
 
 class KWIN_EXPORT Compositor : public QObject
 {
@@ -95,6 +98,9 @@ private Q_SLOTS:
     void handleFrameRequested(RenderLoop *renderLoop);
     void gpuResetDetected();
 
+private:
+    void waitForEglGraphicsReset(EglContext *context);
+
 protected:
     BackendOutput *findOutput(RenderLoop *loop) const;
 
@@ -134,6 +140,7 @@ protected:
     RenderDevice *m_primaryDevice = nullptr;
 
     std::unique_ptr<QTimer> m_resetTimer;
+    std::optional<QDeadlineTimer> m_glResetDeadline;
 };
 
 } // namespace KWin

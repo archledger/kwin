@@ -17,6 +17,8 @@
 #include <epoxy/egl.h>
 #include <memory>
 
+class QDeadlineTimer;
+
 namespace KWin
 {
 
@@ -97,6 +99,9 @@ public:
      */
     void setFailed();
 
+    // Only call synchronously from graphicsResetReported, while this context is current.
+    void waitForGraphicsReset(const QDeadlineTimer &deadline);
+
     void glReadnPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, GLvoid *data);
     void glGetnTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels);
     void glGetnUniformfv(GLuint program, GLint location, GLsizei bufSize, GLfloat *params);
@@ -115,6 +120,8 @@ public:
     static std::shared_ptr<EglContext> create(EglDisplay *display, EGLConfig config, const std::shared_ptr<EglContext> &shareContext);
 
 Q_SIGNALS:
+    // Emitted after an observed GL reset, before the ordinary failure signal.
+    void graphicsResetReported(EglContext *context);
     void resetDetected();
 
 private:
