@@ -566,6 +566,7 @@ void VulkanDevice::handleDeviceLoss()
     }
     qCWarning(KWIN_VULKAN, "Vulkan device lost!");
     m_lost = true;
+    Q_EMIT deviceResetRequired();
     Q_EMIT deviceLost();
 }
 

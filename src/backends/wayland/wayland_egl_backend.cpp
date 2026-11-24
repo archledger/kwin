@@ -50,7 +50,7 @@ WaylandEglLayer::~WaylandEglLayer()
 
 GLFramebuffer *WaylandEglLayer::fbo() const
 {
-    return m_buffer->framebuffer();
+    return m_buffer ? m_buffer->framebuffer() : nullptr;
 }
 
 std::optional<OutputLayerBeginFrameInfo> WaylandEglLayer::beginFrame(OutputFrame *frame)
@@ -136,6 +136,12 @@ bool WaylandEglLayer::endFrame(const Region &renderedDeviceRegion, const Region 
 
     m_damageJournal.add(damagedDeviceRegion);
     return true;
+}
+
+void WaylandEglLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
+    m_buffer.reset();
 }
 
 bool WaylandEglLayer::earlyScanoutChecks()
@@ -237,6 +243,12 @@ bool WaylandEglCursorLayer::endFrame(const Region &renderedDeviceRegion, const R
     EGLNativeFence releaseFence{m_backend->eglDisplayObject()};
     m_swapchain->release(m_buffer, releaseFence.takeFileDescriptor());
     return true;
+}
+
+void WaylandEglCursorLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
+    m_buffer.reset();
 }
 
 FormatModifierMap WaylandEglCursorLayer::supportedDrmFormats() const

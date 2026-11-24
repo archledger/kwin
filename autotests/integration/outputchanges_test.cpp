@@ -137,6 +137,7 @@ private Q_SLOTS:
     void testCustomTiledWindowRestoredAfterEnablingOutput_data();
     void testCustomTiledWindowRestoredAfterEnablingOutput();
     void testWindowRestoredAfterChangingScale();
+    void testLargeWindowRestoredAfterChangingScale();
     void testMaximizeStateRestoredAfterEnablingOutput_data();
     void testMaximizeStateRestoredAfterEnablingOutput();
     void testInvalidGeometryRestoreAfterEnablingOutput();
@@ -1364,6 +1365,48 @@ void OutputChangesTest::testWindowRestoredAfterChangingScale()
     // The window will be moved back to where it was before
     QCOMPARE(window->pos(), originalPosition);
     QCOMPARE(window->output()->backendOutput(), output);
+}
+
+void OutputChangesTest::testLargeWindowRestoredAfterChangingScale()
+{
+    const auto output = kwinApp()->outputBackend()->outputs().front();
+    auto surface = Test::createSurface();
+    auto shellSurface = Test::createXdgToplevelSurface(surface.get());
+    auto window = Test::renderAndWaitForShown(surface.get(), QSize(900, 700), Qt::blue);
+    QVERIFY(window);
+    window->move(QPointF(200, 160));
+    const RectF original = window->frameGeometry();
+    QCOMPARE(window->output()->backendOutput(), output);
+    QVERIFY(window->output()->geometryF().contains(original));
+
+    QSignalSpy configureRequested(shellSurface.get(), &Test::XdgToplevel::configureRequested);
+    QSignalSpy surfaceConfigureRequested(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
+    OutputConfiguration smaller;
+    smaller.changeSet(output)->scaleSetting = 2;
+    QVERIFY(workspace()->applyOutputConfiguration(smaller));
+    const RectF reduced = window->moveResizeGeometry();
+    QVERIFY(reduced.width() < original.width());
+    QVERIFY(reduced.height() < original.height());
+    QVERIFY(window->output()->geometryF().contains(reduced));
+    QTRY_VERIFY(!surfaceConfigureRequested.isEmpty());
+    QVERIFY(!configureRequested.isEmpty());
+    QCOMPARE(configureRequested.last().at(0).value<QSize>(), reduced.size().toSize());
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequested.last().at(0).value<quint32>());
+    Test::render(surface.get(), reduced.size().toSize(), Qt::blue);
+    QTRY_COMPARE(window->frameGeometry(), reduced);
+
+    configureRequested.clear();
+    surfaceConfigureRequested.clear();
+    OutputConfiguration restored;
+    restored.changeSet(output)->scaleSetting = 1;
+    QVERIFY(workspace()->applyOutputConfiguration(restored));
+    QCOMPARE(window->moveResizeGeometry(), original);
+    QTRY_VERIFY(!surfaceConfigureRequested.isEmpty());
+    QVERIFY(!configureRequested.isEmpty());
+    QCOMPARE(configureRequested.last().at(0).value<QSize>(), original.size().toSize());
+    shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequested.last().at(0).value<quint32>());
+    Test::render(surface.get(), original.size().toSize(), Qt::blue);
+    QTRY_COMPARE(window->frameGeometry(), original);
 }
 
 void OutputChangesTest::testMaximizeStateRestoredAfterEnablingOutput_data()

@@ -478,11 +478,7 @@ KWin::TileManager *WorkspaceWrapper::tilingForScreen(const QString &screenName) 
 
     LogicalOutput *output = workspace()->findOutput(screenName);
     if (output) {
-        auto tileManager = workspace()->tileManager(output);
-        if (tileManager) {
-            QJSEngine::setObjectOwnership(tileManager, QJSEngine::CppOwnership);
-        }
-        return tileManager;
+        return workspace()->tileManager(output);
     }
     return nullptr;
 }
@@ -491,12 +487,7 @@ KWin::TileManager *WorkspaceWrapper::tilingForScreen(LogicalOutput *output) cons
 {
     qCWarning(KWIN_CORE) << "workspace.tilingForScreen() is deprecated: use workspace.rootTile() instead";
 
-    auto tileManager = workspace()->tileManager(output);
-    if (tileManager) {
-        QJSEngine::setObjectOwnership(tileManager, QJSEngine::CppOwnership);
-    }
-
-    return tileManager;
+    return workspace()->tileManager(output);
 }
 
 TransientPlacementWriter *WorkspaceWrapper::placementWriter() const

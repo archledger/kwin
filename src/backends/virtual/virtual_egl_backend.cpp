@@ -57,18 +57,18 @@ std::optional<OutputLayerBeginFrameInfo> VirtualEglLayer::beginFrame(OutputFrame
         }
     }
 
-    m_current = m_swapchain->acquire();
-    if (!m_current) {
+    m_pending = m_swapchain->acquire();
+    if (!m_pending) {
         return std::nullopt;
     }
 
-    m_current->framebuffer()->colorAttachment()->setContentTransform(bufferTransform().combine(OutputTransform::FlipY));
+    m_pending->framebuffer()->colorAttachment()->setContentTransform(bufferTransform().combine(OutputTransform::FlipY));
 
     m_query = GLRenderTimeQuery::begin(m_backend->openglContextRef());
 
     return OutputLayerBeginFrameInfo{
-        .renderTarget = RenderTarget(m_current->framebuffer()),
-        .repaint = s_bufferAgeEnabled ? m_damageJournal.accumulate(m_current->age(), Region::infinite()) : Region::infinite(),
+        .renderTarget = RenderTarget(m_pending->framebuffer()),
+        .repaint = s_bufferAgeEnabled ? m_damageJournal.accumulate(m_pending->age(), Region::infinite()) : Region::infinite(),
     };
 }
 
@@ -79,9 +79,16 @@ bool VirtualEglLayer::endFrame(const Region &renderedDeviceRegion, const Region 
         frame->addRenderTimeQuery(std::move(m_query));
     }
     glFlush(); // flush pending rendering commands.
-    m_swapchain->release(m_current, FileDescriptor{});
+    m_swapchain->release(m_pending, FileDescriptor{});
+    m_current = std::move(m_pending);
     m_damageJournal.add(damagedDeviceRegion);
     return true;
+}
+
+void VirtualEglLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
+    m_pending.reset();
 }
 
 FormatModifierMap VirtualEglLayer::supportedDrmFormats() const
@@ -91,6 +98,7 @@ FormatModifierMap VirtualEglLayer::supportedDrmFormats() const
 
 void VirtualEglLayer::releaseBuffers()
 {
+    m_pending.reset();
     m_current.reset();
     m_swapchain.reset();
 }

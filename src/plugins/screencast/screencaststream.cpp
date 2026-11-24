@@ -347,7 +347,7 @@ ScreenCastStream::ScreenCastStream(ScreenCastSource *source, std::shared_ptr<Pip
     });
     connect(source, &ScreenCastSource::closed, this, &ScreenCastStream::close);
     connect(GpuManager::self(), &GpuManager::renderDeviceRemoved, this, [this](RenderDevice *removed) {
-        if (removed == m_source->renderDevice()) {
+        if (!m_closed && removed == m_source->renderDevice()) {
             close();
         }
     });
@@ -495,6 +495,7 @@ void ScreenCastStream::close()
 
     m_closed = true;
     m_vsync->disarm();
+    m_pendingContents = Contents();
 
     disconnect(m_cursor.changedConnection);
     m_cursor.changedConnection = {};
@@ -603,9 +604,7 @@ void ScreenCastStream::record(std::chrono::nanoseconds timestamp, Contents conte
     case ScreencastV1Interface::Metadata:
         effectiveContents |= Content::Cursor;
         m_source->setRenderCursor(false);
-        if (effectiveContents & Content::Cursor) {
-            addCursorMetadata(spa_buffer, Cursors::self()->currentCursor());
-        }
+        addCursorMetadata(spa_buffer, Cursors::self()->currentCursor());
         break;
     case ScreencastV1Interface::Embedded:
         effectiveContents |= Content::Cursor | Content::Video;
@@ -613,6 +612,7 @@ void ScreenCastStream::record(std::chrono::nanoseconds timestamp, Contents conte
         break;
     }
 
+    // Capturing a client-rendered cursor above can change the current context.
     const auto &context = m_source->eglContext();
     if (!context || !context->makeCurrent()) {
         pw_stream_return_buffer(m_pwStream, pwBuffer);
@@ -624,9 +624,11 @@ void ScreenCastStream::record(std::chrono::nanoseconds timestamp, Contents conte
     spa_meta_sync_timeline *synctmeta = nullptr;
     Region damage;
     if (effectiveContents & Content::Video) {
+        const Region bufferRepair = m_damageJournal.accumulate(buffer->m_age, Region::infinite());
+        using RenderResult = ScreenCastSource::RenderResult;
+        RenderResult result;
         if (auto memfd = dynamic_cast<MemFdScreenCastBuffer *>(buffer)) {
-            damage = m_source->render(memfd->view.image(), m_damageJournal.accumulate(memfd->m_age, Region::infinite()));
-            bumpBufferAge(memfd);
+            result = m_source->render(memfd->view.image(), bufferRepair);
         } else if (auto dmabuf = dynamic_cast<DmaBufScreenCastBuffer *>(buffer)) {
             if (dmabuf->synctimeline) {
                 synctmeta = static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spa_buffer,
@@ -639,9 +641,22 @@ void ScreenCastStream::record(std::chrono::nanoseconds timestamp, Contents conte
                 }
             }
 
-            damage = m_source->render(dmabuf->framebuffer.get(), m_damageJournal.accumulate(dmabuf->m_age, Region::infinite()));
-            bumpBufferAge(dmabuf);
+            result = m_source->render(dmabuf->framebuffer.get(), bufferRepair);
         }
+        if (result.status == RenderResult::Status::NotStarted) {
+            pw_stream_return_buffer(m_pwStream, pwBuffer);
+            // Rendering may already have consumed the scene's pending damage.
+            // Stop rather than retry with incomplete damage.
+            qCWarning(KWIN_SCREENCAST) << objectName() << "Failed to render frame, closing stream";
+            close();
+            return;
+        }
+        if (result.status == RenderResult::Status::Finished) {
+            damage = std::move(result.damage);
+        }
+        // Keep the existing empty-damage handoff if painting had already started.
+        // Returning that buffer unused could bypass synchronization for GPU writes.
+        bumpBufferAge(buffer);
         m_damageJournal.add(damage);
     }
 

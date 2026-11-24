@@ -43,6 +43,7 @@ public:
     GLFramebuffer *fbo() const;
     std::optional<OutputLayerBeginFrameInfo> beginFrame(OutputFrame *frame) override;
     bool endFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame) override;
+    void discardUnpaintedFrame() override;
     bool earlyScanoutChecks() override;
     bool importScanoutBuffer(GraphicsBuffer *buffer, const std::shared_ptr<OutputFrame> &frame) override;
     FormatModifierMap supportedDrmFormats() const override;
@@ -68,6 +69,7 @@ public:
 
     std::optional<OutputLayerBeginFrameInfo> beginFrame(OutputFrame *frame) override;
     bool endFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame) override;
+    void discardUnpaintedFrame() override;
     FormatModifierMap supportedDrmFormats() const override;
     void releaseBuffers() override;
 

@@ -158,6 +158,10 @@ public:
 
     virtual void releaseBuffers() = 0;
 
+    // Discard staging after a successful beginFrame() only when the renderer
+    // did not start. No scene drawing must have taken place on the target.
+    virtual void discardUnpaintedFrame();
+
 Q_SIGNALS:
     void repaintScheduled();
 

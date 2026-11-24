@@ -32,8 +32,8 @@ public:
 
     void setRenderCursor(bool enable) override;
     void setNextPresentationTimestamp(std::chrono::nanoseconds timestamp, uint32_t refreshRate) override;
-    Region render(GLFramebuffer *target, const Region &bufferRepair) override;
-    Region render(QImage *target, const Region &bufferRepair) override;
+    RenderResult render(GLFramebuffer *target, const Region &bufferRepair) override;
+    RenderResult render(QImage *target, const Region &bufferRepair) override;
 
     void close();
     void pause() override;

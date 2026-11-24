@@ -70,20 +70,22 @@ void OutputScreenCastSource::setNextPresentationTimestamp(std::chrono::nanosecon
     m_sceneView->setNextPresentationTimestamp(timestamp, refreshRate, nullptr);
 }
 
-Region OutputScreenCastSource::render(QImage *target, const Region &bufferRepair)
+ScreenCastSource::RenderResult OutputScreenCastSource::render(QImage *target, const Region &bufferRepair)
 {
     auto texture = GLTexture::allocate(GL_RGBA8, target->size());
     if (!texture) {
-        return Region{};
+        return {};
     }
     texture->setContentTransform(OutputTransform::FlipY);
     GLFramebuffer buffer(texture.get());
-    const Region ret = render(&buffer, Region::infinite());
-    grabTexture(texture.get(), target);
-    return ret;
+    const auto result = render(&buffer, Region::infinite());
+    if (result.status == RenderResult::Status::Finished) {
+        grabTexture(texture.get(), target);
+    }
+    return result;
 }
 
-Region OutputScreenCastSource::render(GLFramebuffer *target, const Region &bufferRepair)
+ScreenCastSource::RenderResult OutputScreenCastSource::render(GLFramebuffer *target, const Region &bufferRepair)
 {
     m_sceneView->prePaint();
     const auto _ = qScopeGuard([this]() {
@@ -92,21 +94,24 @@ Region OutputScreenCastSource::render(GLFramebuffer *target, const Region &buffe
 
     m_layer->setFramebuffer(target, bufferRepair & Rect(QPoint(), target->size()));
     if (!m_layer->preparePresentationTest()) {
-        return Region{};
+        return {};
     }
     const auto beginInfo = m_layer->beginFrame();
     if (!beginInfo) {
-        return Region{};
+        return {};
     }
     const auto bufferDamage = m_sceneView->collectDamage() & Rect(QPoint(), target->size());
     const auto repaints = beginInfo->repaint | bufferDamage;
     m_layer->resetRepaints();
-    m_sceneView->paint(beginInfo->renderTarget, QPoint(), repaints);
+    if (m_sceneView->paint(beginInfo->renderTarget, QPoint(), repaints) == PaintResult::NotStarted) {
+        m_layer->discardUnpaintedFrame();
+        return {};
+    }
     if (!m_layer->endFrame(repaints, bufferDamage, nullptr)) {
-        return Region{};
+        return {RenderResult::Status::FailedAfterStart};
     }
 
-    return bufferDamage;
+    return {RenderResult::Status::Finished, bufferDamage};
 }
 
 uint OutputScreenCastSource::refreshRate() const

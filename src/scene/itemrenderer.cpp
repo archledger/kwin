@@ -18,14 +18,6 @@ ItemRenderer::~ItemRenderer()
 {
 }
 
-void ItemRenderer::beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport)
-{
-}
-
-void ItemRenderer::endFrame()
-{
-}
-
 void ItemRenderer::setLayerDebugging(bool enable)
 {
 }
@@ -33,6 +25,11 @@ void ItemRenderer::setLayerDebugging(bool enable)
 RenderDevice *ItemRenderer::renderDevice() const
 {
     return m_renderDevice;
+}
+
+EglContext *ItemRenderer::context() const
+{
+    return nullptr;
 }
 
 } // namespace KWin

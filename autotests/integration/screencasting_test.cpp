@@ -8,6 +8,7 @@
 */
 #include "compositor.h"
 #include "core/output.h"
+#include "core/renderloop.h"
 #include "generic_scene_opengl_test.h"
 #include "opengl/glplatform.h"
 #include "pointer_input.h"
@@ -21,7 +22,11 @@
 #include <KWayland/Client/surface.h>
 #include <PipeWireSourceStream>
 #include <QPainter>
+#include <QPointer>
+#include <QProcess>
+#include <QScopeGuard>
 #include <QScreen>
+#include <QTemporaryDir>
 
 #define QCOMPAREIMG(actual, expected, id)                                                        \
     {                                                                                            \
@@ -81,6 +86,7 @@ private Q_SLOTS:
     void testWindowWithPopup();
     void testWindowWithPopupDynamic();
     void testOutputCasting();
+    void testOutputSkipsRequesterWindow();
 
 private:
     std::optional<QImage> oneFrameAndClose(Test::ScreencastingStreamV1 *stream);
@@ -235,33 +241,145 @@ void ScreencastingTest::testWindowWithPopupDynamic()
     QCOMPAREIMG(image, expectedImage, "dynamic_popup_closed");
 }
 
-void ScreencastingTest::testOutputCasting()
+static QImage outputCastingImage(const QSize &size)
 {
-    auto theOutput = KWin::Test::waylandOutputs().constFirst();
-
-    Test::XdgToplevelWindow window{[theOutput](Test::XdgToplevel *toplevel) {
-        toplevel->set_fullscreen(theOutput->output());
-    }};
-
-    QImage sourceImage(theOutput->pixelSize(), QImage::Format_RGBA8888_Premultiplied);
+    QImage sourceImage(size, QImage::Format_RGBA8888_Premultiplied);
     sourceImage.fill(Qt::green);
     {
         QPainter p(&sourceImage);
         p.drawRect(100, 100, 100, 100);
     }
+    return sourceImage;
+}
+
+void ScreencastingTest::testOutputCasting()
+{
+    const QPointer<KWayland::Client::Output> theOutput = Test::waylandOutputs().value(0);
+    QTRY_VERIFY(theOutput && !theOutput->pixelSize().isEmpty() && !theOutput->name().isEmpty());
+    const QString outputName = theOutput->name();
+    const QPointer<LogicalOutput> output = workspace()->findOutput(outputName);
+    QVERIFY(output);
+    const QImage sourceImage = outputCastingImage(theOutput->pixelSize());
+    const QTemporaryDir fixtures;
+    QVERIFY(fixtures.isValid());
+    const QString imagePath = fixtures.filePath(QStringLiteral("output.png"));
+    QVERIFY(sourceImage.save(imagePath));
+
+    // Output casts omit the requesting client's windows. Map the image from a
+    // separate, display-only client, connected directly to this test compositor.
+    QPointer<Window> window;
+    bool windowClosed = false;
+    QProcess client;
+    const auto stopClient = [&client] {
+        if (client.state() == QProcess::NotRunning) {
+            return true;
+        }
+        client.terminate();
+        if (client.waitForFinished(1000)) {
+            return true;
+        }
+        client.kill();
+        return client.waitForFinished(5000);
+    };
+    const auto cleanup = qScopeGuard([&] {
+        stopClient();
+        QTest::qWaitFor([&] {
+            return !window || windowClosed;
+        });
+    });
+
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.remove(QStringLiteral("WAYLAND_SOCKET"));
+    environment.insert(QStringLiteral("WAYLAND_DISPLAY"), waylandServer()->socketName());
+    environment.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("wayland"));
+    environment.insert(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"), QStringLiteral("xdg-shell"));
+    client.setProcessEnvironment(environment);
+    client.setProcessChannelMode(QProcess::ForwardedChannels);
+
+    const auto watchWindow = [&](Window *candidate) {
+        const auto pid = client.processId();
+        if (window || windowClosed || !pid || candidate->pid() != pid || candidate->isDeleted()) {
+            return;
+        }
+        window = candidate;
+        connect(candidate, &Window::closed, &client, [&windowClosed] {
+            windowClosed = true;
+        });
+    };
+    connect(workspace(), &Workspace::windowAdded, &client, watchWindow);
+    client.start(QCoreApplication::applicationDirPath() + QStringLiteral("/screencast-output-client"), {imagePath, outputName});
+    QVERIFY2(client.waitForStarted(5000), qPrintable(client.errorString()));
+    // Also check windows already mapped when QProcess reports the started PID.
+    for (Window *candidate : workspace()->windows()) {
+        watchWindow(candidate);
+    }
+    QTRY_VERIFY(window || windowClosed || client.state() == QProcess::NotRunning);
+    const auto clientWindowIsOnOutput = [&] {
+        return window && !windowClosed && client.state() == QProcess::Running && output && theOutput && window->output() == output.data();
+    };
+    QVERIFY2(clientWindowIsOnOutput(), "The display client did not stay mapped on the requested output");
+    QVERIFY(window->isFullScreen());
+    QCOMPARE(window->frameGeometry(), RectF(output->geometry()));
+
+    auto backendOutput = output->backendOutput();
+    QVERIFY(backendOutput);
+    QSignalSpy presented(backendOutput->renderLoop(), &RenderLoop::framePresented);
+    kwinApp()->scene()->addRepaintFull();
+    QVERIFY(presented.wait());
+    QVERIFY2(clientWindowIsOnOutput(), "The display client disappeared or left the requested output before capture");
+
+    {
+        std::unique_ptr<Test::ScreencastingStreamV1> stream(Test::screencasting()->createOutputStream(theOutput->output(), Test::ScreencastingV1::pointer_hidden));
+        std::optional<QImage> img = oneFrameAndClose(stream.get());
+        QVERIFY2(clientWindowIsOnOutput(), "The display client disappeared or left the requested output during capture");
+        QVERIFY(img);
+        img->convertTo(sourceImage.format());
+        QCOMPAREIMG(*img, sourceImage, QLatin1StringView("output_cast"));
+    }
+
+    QVERIFY2(stopClient(), "The display client did not terminate");
+    QTRY_VERIFY(windowClosed);
+}
+
+void ScreencastingTest::testOutputSkipsRequesterWindow()
+{
+    const QPointer<KWayland::Client::Output> theOutput = Test::waylandOutputs().value(0);
+    QTRY_VERIFY(theOutput && !theOutput->pixelSize().isEmpty() && !theOutput->name().isEmpty());
+    const QPointer<LogicalOutput> output = workspace()->findOutput(theOutput->name());
+    QVERIFY(output);
+    const QImage sourceImage = outputCastingImage(theOutput->pixelSize());
+    Test::XdgToplevelWindow window{[theOutput](Test::XdgToplevel *toplevel) {
+        if (theOutput) {
+            toplevel->set_fullscreen(theOutput->output());
+        }
+    }};
 
     QVERIFY(window.show(sourceImage));
-    QVERIFY(window.m_window->isFullScreen());
-    QCOMPARE(window.m_window->frameGeometry(), RectF(window.m_window->output()->geometry()));
+    const QPointer<Window> mappedWindow = window.m_window;
+    const auto clearDeletedWindow = qScopeGuard([&] {
+        if (!mappedWindow) {
+            window.m_window = nullptr;
+        }
+    });
+    QVERIFY(mappedWindow && output && theOutput);
+    QCOMPARE(mappedWindow->pid(), QCoreApplication::applicationPid());
+    QVERIFY(mappedWindow->isFullScreen());
+    QCOMPARE(mappedWindow->output(), output.data());
+    QCOMPARE(mappedWindow->frameGeometry(), RectF(output->geometry()));
 
     QVERIFY(window.presentWait());
+    QVERIFY(mappedWindow && output && theOutput);
+    QCOMPARE(mappedWindow->output(), output.data());
 
-    auto stream = KWin::Test::screencasting()->createOutputStream(theOutput->output(), QtWayland::zkde_screencast_unstable_v1::pointer_hidden);
-
-    std::optional<QImage> img = oneFrameAndClose(stream);
+    const std::unique_ptr<Test::ScreencastingStreamV1> stream(Test::screencasting()->createOutputStream(theOutput->output(), Test::ScreencastingV1::pointer_hidden));
+    std::optional<QImage> img = oneFrameAndClose(stream.get());
+    QVERIFY(mappedWindow && output && theOutput);
+    QCOMPARE(mappedWindow->output(), output.data());
     QVERIFY(img);
-    img->convertTo(sourceImage.format());
-    QCOMPAREIMG(*img, sourceImage, QLatin1StringView("output_cast"));
+    QImage expectedImage(sourceImage.size(), sourceImage.format());
+    expectedImage.fill(Qt::transparent);
+    img->convertTo(expectedImage.format());
+    QCOMPAREIMG(*img, expectedImage, QLatin1StringView("output_skip_requester"));
 }
 
 }

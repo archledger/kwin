@@ -2674,11 +2674,11 @@ XdgToplevelWindow::OwnedFullScreenOutcome XdgToplevelWindow::setFullScreenOwned(
 
 void XdgToplevelWindow::setFullScreen(bool set)
 {
-    if (!isFullScreenable()) {
+    set = rules()->checkFullScreen(set);
+    if (set && !isFullScreenable()) {
         return;
     }
 
-    set = rules()->checkFullScreen(set);
     if (m_isRequestedFullScreen == set) {
         return;
     }

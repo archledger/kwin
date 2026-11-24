@@ -63,13 +63,10 @@ std::optional<OutputLayerBeginFrameInfo> X11WindowedEglPrimaryLayer::beginFrame(
         return std::nullopt;
     }
 
-    Region repaint = Region::infinite();
-    m_output->clearExposedArea();
-
     m_query = GLRenderTimeQuery::begin(m_backend->openglContextRef());
     return OutputLayerBeginFrameInfo{
         .renderTarget = RenderTarget(m_buffer->framebuffer()),
-        .repaint = repaint,
+        .repaint = Region::infinite(),
     };
 }
 
@@ -82,7 +79,14 @@ bool X11WindowedEglPrimaryLayer::endFrame(const Region &renderedDeviceRegion, co
     EGLNativeFence releaseFence{m_backend->eglDisplayObject()};
     m_swapchain->release(m_buffer, releaseFence.fileDescriptor().duplicate());
     m_output->setPrimaryBuffer(m_buffer->buffer());
+    m_output->clearExposedArea();
     return true;
+}
+
+void X11WindowedEglPrimaryLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
+    m_buffer.reset();
 }
 
 FormatModifierMap X11WindowedEglPrimaryLayer::supportedDrmFormats() const
@@ -146,6 +150,11 @@ bool X11WindowedEglCursorLayer::endFrame(const Region &renderedDeviceRegion, con
     }
 
     return true;
+}
+
+void X11WindowedEglCursorLayer::discardUnpaintedFrame()
+{
+    m_query.reset();
 }
 
 FormatModifierMap X11WindowedEglCursorLayer::supportedDrmFormats() const
